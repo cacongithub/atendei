@@ -552,10 +552,10 @@ a{color:var(--accent2);text-decoration:none}
 a:hover{color:#5eead4}
 
 .nav-main{background:rgba(10,14,20,0.9);border-bottom:1px solid rgba(255,255,255,0.06);position:sticky;top:0;z-index:100;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
-.nav-inner{max-width:1200px;margin:0 auto;padding:0 24px;height:72px;display:flex;align-items:center;justify-content:space-between}
+.nav-inner{max-width:1200px;margin:0 auto;padding:0 24px;height:100px;display:flex;align-items:center;justify-content:space-between}
 .logo{font-size:22px;font-weight:700;color:var(--text);letter-spacing:-0.5px}
 .logo span{color:var(--accent)}
-.nav-logo-img{height:50px;width:auto;display:block;transition:transform 0.2s}
+.nav-logo-img{height:90px;width:auto;display:block;transition:transform 0.2s}
 .nav-logo-img:hover{transform:scale(1.03)}
 .nav-links{display:flex;gap:4px}
 .nav-link{padding:8px 16px;border-radius:var(--radius-sm);color:var(--text2);font-size:14px;font-weight:500;transition:all 0.2s}

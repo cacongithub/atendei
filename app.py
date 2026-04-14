@@ -14,7 +14,7 @@ Configuração (variáveis de ambiente):
   ANTHROPIC_API_KEY=sua_chave_anthropic
   OPENAI_API_KEY=sua_chave_openai (fallback para transcrição de áudio)
   GROQ_API_KEY=sua_chave_groq (transcrição de áudio — mais barato)
-  BASE_URL = https://atendente.online
+  BASE_URL=https://seudominio.com
   ADMIN_EMAIL=admin@atende.ai
   ADMIN_PASSWORD=admin123
 
@@ -22,7 +22,9 @@ Rodar:
   python app.py
 """
 
-import os, json, sqlite3, hashlib, secrets, time, re, base64, tempfile, io
+import os, json, sqlite3, hashlib, secrets, time, re, base64, tempfile, io, smtplib, random
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import (
@@ -85,7 +87,7 @@ def reset_login_attempts(ip):
         del login_attempts[ip]
 
 # ─── LOGO (base64 inline) ─────────────────────────────────────
-LOGO_NAV_B64 = "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"
+LOGO_NAV_B64 = "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"
 
 # Planos
 PLANS = {
@@ -216,11 +218,20 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS verification_codes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        code TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
     """)
     # ── MIGRAÇÃO AUTOMÁTICA ──
     migrations = [
         ("users", "is_active", "INTEGER DEFAULT 1"),
         ("users", "last_login", "TEXT DEFAULT ''"),
+        ("users", "email_verified", "INTEGER DEFAULT 0"),
         ("conversations", "satisfaction_rating", "INTEGER DEFAULT 0"),
         ("conversations", "tags", "TEXT DEFAULT ''"),
         ("conversations", "notes", "TEXT DEFAULT ''"),
@@ -254,6 +265,88 @@ def set_setting(key, value):
     db_conn.execute("INSERT OR REPLACE INTO system_settings (key, value) VALUES (?, ?)", (key, value))
     db_conn.commit()
     db_conn.close()
+
+
+# ─── EMAIL ─────────────────────────────────────────────────────
+def send_email(to_email, subject, html_body):
+    """Envia email via SMTP Hostinger"""
+    smtp_host = get_setting("SMTP_HOST", "smtp.hostinger.com")
+    smtp_port = int(get_setting("SMTP_PORT", "465"))
+    smtp_email = get_setting("SMTP_EMAIL", "contato@atendente.online")
+    smtp_password = get_setting("SMTP_PASSWORD", "")
+
+    if not smtp_password:
+        print(f"[EMAIL] SMTP_PASSWORD não configurada. Email para {to_email} não enviado.")
+        return False
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["From"] = f"atendente.online <{smtp_email}>"
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        if smtp_port == 465:
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15)
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port, timeout=15)
+            server.starttls()
+
+        server.login(smtp_email, smtp_password)
+        server.sendmail(smtp_email, to_email, msg.as_string())
+        server.quit()
+        print(f"[EMAIL] Enviado para {to_email}: {subject}")
+        return True
+    except Exception as e:
+        print(f"[EMAIL] Erro ao enviar para {to_email}: {e}")
+        return False
+
+
+def send_verification_code(email):
+    """Gera e envia código de verificação"""
+    code = str(random.randint(100000, 999999))
+    expires = (datetime.now() + timedelta(minutes=30)).isoformat()
+
+    db_conn = sqlite3.connect(DATABASE)
+    db_conn.execute("DELETE FROM verification_codes WHERE email=?", (email,))
+    db_conn.execute("INSERT INTO verification_codes (email, code, expires_at) VALUES (?,?,?)", (email, code, expires))
+    db_conn.commit()
+    db_conn.close()
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto;padding:32px;background:#111827;border-radius:12px;color:#f0f4f8">
+        <div style="text-align:center;margin-bottom:24px">
+            <h2 style="color:#34d399;margin:0">atendente.online</h2>
+        </div>
+        <p>Olá! Seu código de verificação é:</p>
+        <div style="text-align:center;margin:24px 0">
+            <span style="font-size:36px;font-weight:700;letter-spacing:8px;color:#00c896;background:#1a2235;padding:16px 32px;border-radius:8px;display:inline-block">{code}</span>
+        </div>
+        <p style="color:#94a3b8;font-size:14px">Este código expira em <strong>30 minutos</strong>.</p>
+        <p style="color:#94a3b8;font-size:14px">Se você não solicitou este código, ignore este email.</p>
+        <hr style="border:none;border-top:1px solid #243049;margin:24px 0">
+        <p style="color:#64748b;font-size:12px;text-align:center">© 2026 atendente.online</p>
+    </div>"""
+
+    return send_email(email, f"Seu código de verificação: {code}", html)
+
+
+def verify_code(email, code):
+    """Verifica se o código é válido"""
+    db_conn = sqlite3.connect(DATABASE)
+    db_conn.row_factory = sqlite3.Row
+    row = db_conn.execute("SELECT * FROM verification_codes WHERE email=? AND code=? AND used=0 ORDER BY created_at DESC LIMIT 1", (email, code)).fetchone()
+    if not row:
+        db_conn.close()
+        return False
+    if datetime.fromisoformat(row["expires_at"]) < datetime.now():
+        db_conn.close()
+        return False
+    db_conn.execute("UPDATE verification_codes SET used=1 WHERE id=?", (row["id"],))
+    db_conn.execute("UPDATE users SET email_verified=1 WHERE email=?", (email,))
+    db_conn.commit()
+    db_conn.close()
+    return True
 
 # ─── AUTH ──────────────────────────────────────────────────────
 def hash_password(pw):
@@ -552,10 +645,10 @@ a{color:var(--accent2);text-decoration:none}
 a:hover{color:#5eead4}
 
 .nav-main{background:rgba(10,14,20,0.9);border-bottom:1px solid rgba(255,255,255,0.06);position:sticky;top:0;z-index:100;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
-.nav-inner{max-width:1200px;margin:0 auto;padding:0 24px;height:100px;display:flex;align-items:center;justify-content:space-between}
+.nav-inner{max-width:1200px;margin:0 auto;padding:0 24px;height:76px;display:flex;align-items:center;justify-content:space-between}
 .logo{font-size:22px;font-weight:700;color:var(--text);letter-spacing:-0.5px}
 .logo span{color:var(--accent)}
-.nav-logo-img{height:90px;width:auto;display:block;transition:transform 0.2s}
+.nav-logo-img{height:56px;width:auto;display:block;transition:transform 0.2s}
 .nav-logo-img:hover{transform:scale(1.03)}
 .nav-links{display:flex;gap:4px}
 .nav-link{padding:8px 16px;border-radius:var(--radius-sm);color:var(--text2);font-size:14px;font-weight:500;transition:all 0.2s}
@@ -1015,21 +1108,24 @@ def register():
             error = "Senha deve ter pelo menos 6 caracteres."
         else:
             db = get_db()
-            if db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone():
+            existing = db.execute("SELECT id, email_verified FROM users WHERE email=?", (email,)).fetchone()
+            if existing and existing["email_verified"]:
                 error = "Este email já está cadastrado."
             else:
+                if existing and not existing["email_verified"]:
+                    db.execute("DELETE FROM users WHERE id=?", (existing["id"],))
                 trial_end = (datetime.now() + timedelta(days=7)).isoformat()
                 msgs_limit = PLANS.get(plan, PLANS["starter"])["msgs"]
-                db.execute("INSERT INTO users (email,password_hash,name,company,plan,plan_status,msgs_limit,trial_ends_at) VALUES (?,?,?,?,?,?,?,?)",
+                db.execute("INSERT INTO users (email,password_hash,name,company,plan,plan_status,msgs_limit,trial_ends_at,email_verified) VALUES (?,?,?,?,?,?,?,?,0)",
                     (email, hash_password(password), name, company, plan, "trial", msgs_limit, trial_end))
                 db.commit()
-                user = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
-                session["user_id"] = user["id"]
-                return redirect("/dashboard")
+                send_verification_code(email)
+                session["pending_email"] = email
+                return redirect("/verify-email")
     plan = request.args.get("plan","starter")
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     content = f"""<div class="auth-container"><div class="auth-card">
-        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:50px"></a><h2>Criar conta grátis</h2>{alert}
+        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"></a><h2>Criar conta grátis</h2>{alert}
         <form method="POST"><input type="hidden" name="plan" value="{plan}">
         <div class="form-group"><label class="form-label">Seu nome *</label><input type="text" name="name" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Email *</label><input type="email" name="email" class="form-input" required></div>
@@ -1038,6 +1134,55 @@ def register():
         <button type="submit" class="btn btn-primary btn-block btn-lg">Criar conta →</button></form>
         <div class="auth-divider">Já tem conta? <a href="/login">Entrar</a></div></div></div>"""
     return base_html("Criar Conta", content)
+
+
+@app.route("/verify-email", methods=["GET","POST"])
+def verify_email():
+    email = session.get("pending_email", "")
+    if not email:
+        return redirect("/register")
+
+    error = ""
+    success = ""
+    if request.method == "POST":
+        code = request.form.get("code","").strip()
+        if not code or len(code) != 6:
+            error = "Digite o código de 6 dígitos."
+        elif verify_code(email, code):
+            db = get_db()
+            user = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+            if user:
+                session.pop("pending_email", None)
+                session["user_id"] = user["id"]
+                return redirect("/dashboard")
+            error = "Erro ao ativar conta. Tente novamente."
+        else:
+            error = "Código inválido ou expirado."
+
+    alert = f'<div class="alert alert-error">{error}</div>' if error else ""
+    masked = email[:3] + "***" + email[email.index("@"):] if "@" in email else email
+    content = f"""<div class="auth-container"><div class="auth-card" style="text-align:center">
+        <a href="/" style="display:block;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"></a>
+        <div style="font-size:48px;margin-bottom:16px">📧</div>
+        <h2>Verifique seu email</h2>
+        <p style="color:var(--text2);margin-bottom:24px">Enviamos um código de 6 dígitos para<br><strong style="color:var(--accent2)">{masked}</strong></p>
+        {alert}
+        <form method="POST">
+        <div class="form-group"><input type="text" name="code" class="form-input" placeholder="000000" maxlength="6"
+            style="text-align:center;font-size:28px;letter-spacing:8px;font-weight:700" required autofocus></div>
+        <button type="submit" class="btn btn-primary btn-block btn-lg">Verificar →</button></form>
+        <div style="margin-top:20px">
+            <a href="/resend-code" style="color:var(--text2);font-size:13px">Não recebeu? Reenviar código</a>
+        </div></div></div>"""
+    return base_html("Verificar Email", content)
+
+
+@app.route("/resend-code")
+def resend_code():
+    email = session.get("pending_email", "")
+    if email:
+        send_verification_code(email)
+    return redirect("/verify-email")
 
 
 @app.route("/login", methods=["GET","POST"])
@@ -1053,6 +1198,10 @@ def login():
             db = get_db()
             user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
             if user and check_password(password, user["password_hash"]):
+                if not dict(user).get("email_verified", 0):
+                    session["pending_email"] = email
+                    send_verification_code(email)
+                    return redirect("/verify-email")
                 reset_login_attempts(client_ip)
                 session["user_id"] = user["id"]
                 db.execute("UPDATE users SET last_login=datetime('now') WHERE id=?", (user["id"],))
@@ -1063,7 +1212,7 @@ def login():
                 error = "Email ou senha incorretos."
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     content = f"""<div class="auth-container"><div class="auth-card">
-        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:50px"></a><h2>Entrar</h2>{alert}
+        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"></a><h2>Entrar</h2>{alert}
         <form method="POST">
         <div class="form-group"><label class="form-label">Email</label><input type="email" name="email" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Senha</label><input type="password" name="password" class="form-input" required></div>
@@ -1645,7 +1794,7 @@ def admin_login():
 <title>Admin — atendente.online</title><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>{GLOBAL_CSS}</style></head><body>
 <div class="auth-container"><div class="auth-card" style="border-top:3px solid var(--red)">
-    <div style="text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:50px"><span class="admin-badge" style="margin-left:8px;vertical-align:middle">ADMIN</span></div>
+    <div style="text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"><span class="admin-badge" style="margin-left:8px;vertical-align:middle">ADMIN</span></div>
     <h2>Painel Administrativo</h2>{alert}
     <form method="POST">
     <div class="form-group"><label class="form-label">Email admin</label><input type="email" name="email" class="form-input" required></div>
@@ -1874,6 +2023,14 @@ def admin_api_settings():
         base_url = request.form.get("BASE_URL", "").strip()
         if base_url:
             set_setting("BASE_URL", base_url)
+        smtp_email = request.form.get("SMTP_EMAIL", "").strip()
+        smtp_password = request.form.get("SMTP_PASSWORD", "").strip()
+        smtp_host = request.form.get("SMTP_HOST", "").strip()
+        smtp_port = request.form.get("SMTP_PORT", "").strip()
+        if smtp_email: set_setting("SMTP_EMAIL", smtp_email)
+        if smtp_password: set_setting("SMTP_PASSWORD", smtp_password)
+        if smtp_host: set_setting("SMTP_HOST", smtp_host)
+        if smtp_port: set_setting("SMTP_PORT", smtp_port)
         msg = '<div class="alert alert-success">Configurações de API salvas!</div>'
 
     anthropic_key = get_setting("ANTHROPIC_API_KEY")
@@ -1882,6 +2039,10 @@ def admin_api_settings():
     mp_token = get_setting("MERCADOPAGO_ACCESS_TOKEN")
     wa_verify = get_setting("WHATSAPP_VERIFY_TOKEN", "meu_token_verificacao")
     base_url = get_setting("BASE_URL", "http://localhost:8080")
+    smtp_email = get_setting("SMTP_EMAIL", "contato@atendente.online")
+    smtp_password = get_setting("SMTP_PASSWORD")
+    smtp_host = get_setting("SMTP_HOST", "smtp.hostinger.com")
+    smtp_port = get_setting("SMTP_PORT", "465")
 
     def mask(key):
         if not key: return ""
@@ -1939,6 +2100,37 @@ def admin_api_settings():
         </form>
 
         <div class="card fade-in fade-in-3" style="margin-top:32px">
+            <div class="card-header"><span class="card-title">Email (SMTP) — Verificação de conta</span></div>
+            <form method="POST">
+            <div class="grid-2">
+                <div class="form-group">
+                    <label class="form-label">Email remetente</label>
+                    <input type="text" name="SMTP_EMAIL" class="form-input" value="{smtp_email}" autocomplete="off"
+                        style="background:#2a2a3a;border:2px solid {'var(--green)' if smtp_email else 'var(--red)'}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Senha do email</label>
+                    <input type="password" name="SMTP_PASSWORD" class="form-input" placeholder="{'••••••••' if smtp_password else 'Senha do email SMTP'}" autocomplete="off"
+                        style="background:#2a2a3a;border:2px solid {'var(--green)' if smtp_password else 'var(--red)'}">
+                    <small style="color:var(--text3)">{'✅ Configurada' if smtp_password else '❌ Não configurada — emails não serão enviados'}</small>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Servidor SMTP</label>
+                    <input type="text" name="SMTP_HOST" class="form-input" value="{smtp_host}" autocomplete="off"
+                        style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Porta SMTP</label>
+                    <input type="text" name="SMTP_PORT" class="form-input" value="{smtp_port}" autocomplete="off"
+                        style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                    <small style="color:var(--text3)">465 (SSL) ou 587 (TLS)</small>
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary">Salvar configurações de email</button>
+            </form>
+        </div>
+
+        <div class="card fade-in fade-in-4" style="margin-top:32px">
             <div class="card-header"><span class="card-title">Onde conseguir as chaves</span></div>
             <div style="color:var(--text2);font-size:14px;line-height:2">
                 <p><strong style="color:var(--text)">Anthropic (Claude):</strong> <a href="https://console.anthropic.com/settings/keys" target="_blank">console.anthropic.com/settings/keys</a></p>

@@ -14,7 +14,7 @@ Configuração (variáveis de ambiente):
   ANTHROPIC_API_KEY=sua_chave_anthropic
   OPENAI_API_KEY=sua_chave_openai (fallback para transcrição de áudio)
   GROQ_API_KEY=sua_chave_groq (transcrição de áudio — mais barato)
-  BASE_URL=https://seudominio.com
+  BASE_URL = https://atendente.online
   ADMIN_EMAIL=admin@atende.ai
   ADMIN_PASSWORD=admin123
 

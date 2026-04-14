@@ -47,6 +47,47 @@ MEDIA_FOLDER = "media_files"
 
 os.makedirs(MEDIA_FOLDER, exist_ok=True)
 
+# ─── SECURITY ──────────────────────────────────────────────────
+login_attempts = {}  # {ip: {"count": n, "last": timestamp}}
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    if request.is_secure:
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+
+def check_rate_limit(ip, max_attempts=5, window=300):
+    """Bloqueia login após 5 tentativas em 5 minutos"""
+    now = time.time()
+    if ip in login_attempts:
+        data = login_attempts[ip]
+        if now - data["last"] > window:
+            login_attempts[ip] = {"count": 0, "last": now}
+            return True
+        if data["count"] >= max_attempts:
+            return False
+    return True
+
+def record_login_attempt(ip):
+    now = time.time()
+    if ip not in login_attempts:
+        login_attempts[ip] = {"count": 0, "last": now}
+    login_attempts[ip]["count"] += 1
+    login_attempts[ip]["last"] = now
+
+def reset_login_attempts(ip):
+    if ip in login_attempts:
+        del login_attempts[ip]
+
+# ─── LOGO (base64 inline) ─────────────────────────────────────
+LOGO_NAV_B64 = "iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAIAAAAt2Q6oAAABCGlDQ1BJQ0MgUHJvZmlsZQAAeJxjYGA8wQAELAYMDLl5JUVB7k4KEZFRCuwPGBiBEAwSk4sLGHADoKpv1yBqL+viUYcLcKakFicD6Q9ArFIEtBxopAiQLZIOYWuA2EkQtg2IXV5SUAJkB4DYRSFBzkB2CpCtkY7ETkJiJxcUgdT3ANk2uTmlyQh3M/Ck5oUGA2kOIJZhKGYIYnBncAL5H6IkfxEDg8VXBgbmCQixpJkMDNtbGRgkbiHEVBYwMPC3MDBsO48QQ4RJQWJRIliIBYiZ0tIYGD4tZ2DgjWRgEL7AwMAVDQsIHG5TALvNnSEfCNMZchhSgSKeDHkMyQx6QJYRgwGDIYMZAKbWPz9HbOBQAAAEU0lEQVR42u2XS2wVVRjHv3PmdWfu3Mf0cbmlLbUUCA95WENqVMRYNUYTQgyJKzEa3WmIa1cmGhcmLlgYViZGNib4SDCkiwaUBo3BxlDAUqUtxfY+ep8z9869c8/MOZ8LWgjRYEEEmsxvcTKZR77v/M//nO8bgJCQkJCQkBAAcvtfkBsjIgFAxNU3byotTeEBVZooimwYcns7xBJIqD87nbT80hX3HsskrVhPKquKZuhyIkETlmQYspXQ9j4PCWv7lkUErV5s3TO95ZUpTEEIaO/2Hz8QJAaA6kAR/IJy4XSkdHbT6Av04x+zkzZQAhwfDHsQCijkweeCxw7C9Pg69Xy6vc4Cbcbd5PS9KM+flq98Tfv3Nr/9EgMGQAggAhAABCCELG9TAojLD6/tY7w5Oi69cxeSJhRQSAOD/Im3euaOvPZOZceeGBWCCGHPud8c8b/TP5TOjUgaYCXvT4z9SygESgkCoMD/09OEEAqw6+WO3FdvHCY2M0ePOvEtVoWpzLKG9hn+qRNTOEzPnaA9m/ncZHStEbHkRK/R81SHPdOIPWRwV+hpPdIZYRVmDCS7D6xnxaacjKDH1XRMimnRwW65IyocT+mKc9v7z0pfM8bG3Ty1bfilH3a8uu2zZ8eqU/YrXzyyfrfRcgIwImY19+lHD5dygVqdY/Mz6UGlezhNiPAKnt8AvUsTRGo1RKsuhBFp/VmT0yZNGtxmGDf8kscZKj2WdzFLk1HJMuunfvcm5oESuOVS0FsVERQ0mcLXD8tJoW3uLdkasSKqqbCe9oWGWlLNnCvPqp2xtQL3vwexdipzeWdvqaaVHbWQk5hpFrNYXIDFy0H2Zxs2dNcKWHOUIGnV80Ez79enqu5kueUgc4QwY96czcuNJXvf6elBABCMJCqmaFTtIO5UlI6DO6uHTp795I+Bd7dXxstaX1zrVGtODYjMfU803OLJq0RCf7GppdTyT0Lta2PzVeG6SNX590eV/lQwka2PXJJ7LV5uYJMhAs851NTqkxkplQhy9rVCe8eeRgACbpUGPji1Zsp343GlTVc3pDKf/5Y5NpM9Plu+zMhQf+mMLsqOGDuKiIFr+E0TPc5Yh4h2ichGXrIxskaUSmB0BTMZXnDQ83neEU4TmwybTDhNXqyh2+KLNgi8axWREEnas1V7e9jwikpU8vNe/fgkL7ja/kfJ5Uvuhc2YOy/mJ0k0KQ/tR+aRzn6sZkCNQuCBqoPnQjRJjZj4dSSY/mXp4MPrPiBw/QBcWdIrKC6ShJxjf18jLzEvoqQjcocpvfk0dZvB9xPsTJSkVJ6ZAkKktnUivwABw8wMVhbImg0QMAAUhau0a6NQDZGfW04Lb1rSv9+7C0qrivzkLn5uCgOkO/ohoetxpbXYJrKUxKJ8/Bj67DZi3hckgG0fPKPvO0TSW/+pcSU3RnL9mt6XBnQ5A0qBUqKrN7XXq+f/gay2jENCQkJCQkJC7oS/ANriGJhDIa1oAAAAAElFTkSuQmCC"
+LOGO_HERO_B64 = "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"
+
 # Planos
 PLANS = {
     "starter":  {"name": "Starter",       "price": 97.00,  "msgs": 500,   "desc": "Ideal para começar"},
@@ -499,21 +540,24 @@ def process_whatsapp_media(msg, token):
 
 GLOBAL_CSS = """
 :root {
-    --bg:#0a0a0f; --bg2:#12121a; --bg3:#1a1a26; --bg4:#22222e;
-    --text:#e8e6e3; --text2:#9b97a0; --text3:#6b6770;
-    --accent:#6c5ce7; --accent2:#a29bfe; --accent-glow:rgba(108,92,231,0.15);
-    --green:#00b894; --green2:#00e6b0; --red:#e74c3c; --orange:#f39c12; --blue:#0984e3;
+    --bg:#0a0e14; --bg2:#111827; --bg3:#1a2235; --bg4:#243049;
+    --text:#f0f4f8; --text2:#94a3b8; --text3:#64748b;
+    --accent:#00c896; --accent2:#34d399; --accent-glow:rgba(0,200,150,0.12);
+    --green:#00b894; --green2:#00e6b0; --red:#ef4444; --orange:#f59e0b; --blue:#0ea5e9;
     --radius:12px; --radius-sm:8px;
     --font:'DM Sans',-apple-system,sans-serif; --mono:'JetBrains Mono',monospace;
 }
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
 a{color:var(--accent2);text-decoration:none}
+a:hover{color:#5eead4}
 
-.nav-main{background:var(--bg2);border-bottom:1px solid rgba(255,255,255,0.06);position:sticky;top:0;z-index:100;backdrop-filter:blur(20px)}
+.nav-main{background:rgba(10,14,20,0.9);border-bottom:1px solid rgba(255,255,255,0.06);position:sticky;top:0;z-index:100;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
 .nav-inner{max-width:1200px;margin:0 auto;padding:0 24px;height:64px;display:flex;align-items:center;justify-content:space-between}
 .logo{font-size:22px;font-weight:700;color:var(--text);letter-spacing:-0.5px}
 .logo span{color:var(--accent)}
+.nav-logo-img{height:36px;width:auto;display:block;transition:transform 0.2s}
+.nav-logo-img:hover{transform:scale(1.03)}
 .nav-links{display:flex;gap:4px}
 .nav-link{padding:8px 16px;border-radius:var(--radius-sm);color:var(--text2);font-size:14px;font-weight:500;transition:all 0.2s}
 .nav-link:hover{color:var(--text);background:var(--bg3)}
@@ -549,7 +593,7 @@ a{color:var(--accent2);text-decoration:none}
 
 .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:var(--radius-sm);font-size:14px;font-weight:500;border:none;cursor:pointer;transition:all 0.2s;font-family:var(--font)}
 .btn-primary{background:var(--accent);color:white}
-.btn-primary:hover{background:#5b4bd6;transform:translateY(-1px);box-shadow:0 4px 16px rgba(108,92,231,0.3)}
+.btn-primary:hover{background:#00a87d;transform:translateY(-1px);box-shadow:0 4px 20px rgba(0,200,150,0.3)}
 .btn-secondary{background:var(--bg3);color:var(--text);border:1px solid rgba(255,255,255,0.08)}
 .btn-secondary:hover{background:var(--bg4)}
 .btn-success{background:var(--green);color:white}
@@ -578,7 +622,7 @@ tr:hover td{background:rgba(255,255,255,0.02)}
 .badge-blue{background:rgba(9,132,227,0.15);color:var(--blue)}
 
 .plan-card{background:var(--bg2);border:1px solid rgba(255,255,255,0.06);border-radius:var(--radius);padding:32px;text-align:center;transition:all 0.3s;position:relative}
-.plan-card:hover{border-color:var(--accent);transform:translateY(-4px);box-shadow:0 8px 32px rgba(108,92,231,0.15)}
+.plan-card:hover{border-color:var(--accent);transform:translateY(-4px);box-shadow:0 8px 32px rgba(0,200,150,0.12)}
 .plan-card.popular{border-color:var(--accent)}
 .plan-card.popular::before{content:'MAIS POPULAR';position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:var(--accent);color:white;padding:4px 16px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:1px}
 .plan-name{font-size:20px;font-weight:700;margin-bottom:8px}
@@ -613,14 +657,19 @@ tr:hover td{background:rgba(255,255,255,0.02)}
 .auth-card h2{font-size:22px;margin-bottom:24px;text-align:center}
 .auth-divider{text-align:center;color:var(--text3);font-size:13px;margin:20px 0}
 
-.hero{text-align:center;padding:80px 24px;max-width:800px;margin:0 auto}
-.hero h1{font-size:52px;font-weight:700;letter-spacing:-1.5px;line-height:1.1;margin-bottom:20px}
-.hero h1 .gradient{background:linear-gradient(135deg,var(--accent2),var(--green2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hero{text-align:center;padding:60px 24px 40px;max-width:800px;margin:0 auto}
+.hero-logo{width:200px;height:auto;margin:0 auto 32px;display:block;filter:drop-shadow(0 8px 32px rgba(0,200,150,0.2))}
+.hero h1{font-size:48px;font-weight:700;letter-spacing:-1.5px;line-height:1.1;margin-bottom:20px}
+.hero h1 .gradient{background:linear-gradient(135deg,#00c896,#0ea5e9);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .hero p{font-size:18px;color:var(--text2);max-width:560px;margin:0 auto 32px;line-height:1.6}
-.features-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;max-width:1000px;margin:0 auto 80px;padding:0 24px}
-.feature-card{background:var(--bg2);border:1px solid rgba(255,255,255,0.06);border-radius:var(--radius);padding:32px;transition:all 0.3s}
-.feature-card:hover{border-color:var(--accent);transform:translateY(-2px)}
-.feature-icon{font-size:32px;margin-bottom:16px}
+.hero-badges{display:flex;gap:12px;justify-content:center;margin-bottom:40px;flex-wrap:wrap}
+.hero-badge{display:flex;align-items:center;gap:6px;padding:6px 14px;background:rgba(0,200,150,0.08);border:1px solid rgba(0,200,150,0.15);border-radius:20px;font-size:13px;color:var(--accent2);font-weight:500}
+.features-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;max-width:1000px;margin:0 auto 80px;padding:0 24px}
+.feature-card{background:var(--bg2);border:1px solid rgba(255,255,255,0.06);border-radius:var(--radius);padding:28px;transition:all 0.3s;position:relative;overflow:hidden}
+.feature-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:0;transition:opacity 0.3s}
+.feature-card:hover{border-color:rgba(0,200,150,0.2);transform:translateY(-3px);box-shadow:0 8px 32px rgba(0,0,0,0.2)}
+.feature-card:hover::before{opacity:1}
+.feature-icon{font-size:28px;margin-bottom:14px;width:48px;height:48px;display:flex;align-items:center;justify-content:center;background:rgba(0,200,150,0.08);border-radius:12px}
 .feature-card h3{font-size:17px;font-weight:600;margin-bottom:8px}
 .feature-card p{font-size:14px;color:var(--text2);line-height:1.6}
 
@@ -637,7 +686,7 @@ tr:hover td{background:rgba(255,255,255,0.02)}
 .usage-bar-fill{height:100%;border-radius:20px;transition:width 0.5s ease}
 
 /* ADMIN SPECIFIC */
-.admin-nav{background:linear-gradient(135deg,#1a1028,#12121a);border-bottom:2px solid var(--accent)}
+.admin-nav{background:linear-gradient(135deg,#0a1628,#0a0e14);border-bottom:2px solid var(--accent)}
 .admin-badge{background:var(--red);color:white;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:1px;margin-left:8px}
 .metric-card{background:var(--bg2);border:1px solid rgba(255,255,255,0.06);border-radius:var(--radius);padding:24px;text-align:center}
 .metric-value{font-size:32px;font-weight:700;margin:8px 0 4px}
@@ -669,7 +718,7 @@ def base_html(title, content, user=None):
     if user:
         plan_name = PLANS.get(user['plan'],{}).get('name','')
         nav = f"""<nav class="nav-main"><div class="nav-inner">
-            <a href="/dashboard" class="logo">⚡ atende<span>.ai</span></a>
+            <a href="/dashboard"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" class="nav-logo-img"></a>
             <div class="nav-links">
                 <a href="/dashboard" class="nav-link">Dashboard</a>
                 <a href="/dashboard/conversations" class="nav-link">Conversas</a>
@@ -685,14 +734,14 @@ def base_html(title, content, user=None):
             </div></div></nav>"""
     return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>{title} — Atende.AI</title>
+<title>{title} — atendente.online</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>{GLOBAL_CSS}</style></head><body>{nav}{content}</body></html>"""
 
 
 def admin_html(title, content):
-    nav = """<nav class="nav-main admin-nav"><div class="nav-inner">
-        <a href="/admin" class="logo">⚡ atende<span>.ai</span><span class="admin-badge">ADMIN</span></a>
+    nav = f"""<nav class="nav-main admin-nav"><div class="nav-inner">
+        <a href="/admin" style="display:flex;align-items:center;gap:10px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" class="nav-logo-img"><span class="admin-badge">ADMIN</span></a>
         <div class="nav-links">
             <a href="/admin" class="nav-link">Dashboard</a>
             <a href="/admin/users" class="nav-link">Clientes</a>
@@ -702,7 +751,7 @@ def admin_html(title, content):
             <a href="/admin/api-settings" class="nav-link nav-link-accent">APIs</a>
         </div>
         <div class="nav-user">
-            <span class="user-plan" style="background:rgba(231,76,60,0.2);color:var(--red)">ADMIN</span>
+            <span class="user-plan" style="background:rgba(239,68,68,0.15);color:var(--red)">ADMIN</span>
             <a href="/admin/logout" class="btn-logout">Sair</a>
         </div></div></nav>"""
     return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
@@ -875,26 +924,66 @@ def terms_of_service():
 @app.route("/")
 def landing():
     if "user_id" in session: return redirect("/dashboard")
-    content = """
+    hero_logo = LOGO_HERO_B64
+    nav_logo = LOGO_NAV_B64
+    content = f"""
+    <nav class="nav-main"><div class="nav-inner">
+        <a href="/"><img src="data:image/png;base64,{nav_logo}" alt="atendente.online" class="nav-logo-img"></a>
+        <div class="nav-links">
+            <a href="#features" class="nav-link">Recursos</a>
+            <a href="#pricing" class="nav-link">Planos</a>
+            <a href="/login" class="nav-link">Entrar</a>
+            <a href="/register" class="btn btn-primary btn-sm" style="margin-left:8px">Começar grátis</a>
+        </div>
+    </div></nav>
+
     <div class="hero fade-in">
+        <img src="data:image/png;base64,{hero_logo}" alt="atendente.online" class="hero-logo">
         <h1>Seu atendente de vendas<br><span class="gradient">com inteligência artificial</span></h1>
         <p>Automatize seu WhatsApp com IA treinável. Entende texto, áudio, imagens e documentos. Responda clientes 24/7.</p>
-        <div style="display:flex;gap:12px;justify-content:center">
+        <div class="hero-badges">
+            <span class="hero-badge">✓ WhatsApp Business API</span>
+            <span class="hero-badge">✓ IA Avançada</span>
+            <span class="hero-badge">✓ 7 dias grátis</span>
+        </div>
+        <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
             <a href="/register" class="btn btn-primary btn-lg">Começar grátis →</a>
-            <a href="/login" class="btn btn-secondary btn-lg">Entrar</a>
+            <a href="/login" class="btn btn-secondary btn-lg">Já tenho conta</a>
         </div>
     </div>
-    <div class="features-grid">
-        <div class="feature-card fade-in fade-in-1"><div class="feature-icon">🤖</div><h3>IA Treinável</h3><p>Ensine sobre seus produtos, preços e jeito de atender.</p></div>
-        <div class="feature-card fade-in fade-in-2"><div class="feature-icon">🎤</div><h3>Entende Áudio</h3><p>Transcreve e responde áudios automaticamente com Whisper.</p></div>
-        <div class="feature-card fade-in fade-in-3"><div class="feature-icon">📷</div><h3>Analisa Imagens</h3><p>Entende fotos de produtos, comprovantes e documentos.</p></div>
-        <div class="feature-card fade-in fade-in-1"><div class="feature-icon">📄</div><h3>Lê PDFs</h3><p>Extrai e processa texto de documentos enviados.</p></div>
-        <div class="feature-card fade-in fade-in-2"><div class="feature-icon">📊</div><h3>Painel Completo</h3><p>Conversas em tempo real, métricas e controle total.</p></div>
+
+    <div id="features" class="features-grid">
+        <div class="feature-card fade-in fade-in-1"><div class="feature-icon">🤖</div><h3>IA Treinável</h3><p>Ensine sobre seus produtos, preços e jeito de atender. A IA aprende o DNA do seu negócio.</p></div>
+        <div class="feature-card fade-in fade-in-2"><div class="feature-icon">🎤</div><h3>Entende Áudio</h3><p>Transcreve e responde áudios automaticamente. Seu cliente fala, a IA entende.</p></div>
+        <div class="feature-card fade-in fade-in-3"><div class="feature-icon">📷</div><h3>Analisa Imagens</h3><p>Entende fotos de produtos, comprovantes e documentos enviados.</p></div>
+        <div class="feature-card fade-in fade-in-1"><div class="feature-icon">📄</div><h3>Lê PDFs</h3><p>Extrai e processa texto de documentos. Orçamentos, contratos e mais.</p></div>
+        <div class="feature-card fade-in fade-in-2"><div class="feature-icon">📊</div><h3>Painel Completo</h3><p>Conversas em tempo real, métricas de atendimento e controle total.</p></div>
         <div class="feature-card fade-in fade-in-3"><div class="feature-icon">⚡</div><h3>Respostas Rápidas</h3><p>Atalhos para mensagens frequentes. Atenda em segundos.</p></div>
     </div>
-    <div style="text-align:center;padding:40px 24px 80px">
-        <h2 style="font-size:32px;margin-bottom:12px">Planos que cabem no seu bolso</h2>
-        <p style="color:var(--text2);margin-bottom:40px">7 dias grátis. Cancele quando quiser.</p>
+
+    <div style="text-align:center;padding:40px 24px 20px">
+        <p style="color:var(--accent2);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">Como funciona</p>
+        <h2 style="font-size:32px;margin-bottom:48px;letter-spacing:-0.5px">Simples como 1, 2, 3</h2>
+        <div class="grid-3" style="max-width:900px;margin:0 auto 60px;text-align:center">
+            <div class="card fade-in fade-in-1" style="text-align:center;padding:32px">
+                <div style="font-size:36px;font-weight:800;color:var(--accent);margin-bottom:12px">1</div>
+                <h3 style="margin-bottom:8px">Conecte seu WhatsApp</h3>
+                <p style="color:var(--text2);font-size:14px">Vincule seu número do WhatsApp Business em poucos cliques.</p></div>
+            <div class="card fade-in fade-in-2" style="text-align:center;padding:32px">
+                <div style="font-size:36px;font-weight:800;color:var(--accent);margin-bottom:12px">2</div>
+                <h3 style="margin-bottom:8px">Treine a IA</h3>
+                <p style="color:var(--text2);font-size:14px">Cadastre produtos, preços, FAQ e o tom de voz da sua empresa.</p></div>
+            <div class="card fade-in fade-in-3" style="text-align:center;padding:32px">
+                <div style="font-size:36px;font-weight:800;color:var(--accent);margin-bottom:12px">3</div>
+                <h3 style="margin-bottom:8px">Venda no automático</h3>
+                <p style="color:var(--text2);font-size:14px">A IA atende seus clientes 24/7 enquanto você foca no que importa.</p></div>
+        </div>
+    </div>
+
+    <div id="pricing" style="text-align:center;padding:20px 24px 80px">
+        <p style="color:var(--accent2);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">Planos</p>
+        <h2 style="font-size:32px;margin-bottom:12px;letter-spacing:-0.5px">Invista no crescimento do seu negócio</h2>
+        <p style="color:var(--text2);margin-bottom:40px">7 dias grátis em todos os planos. Cancele quando quiser.</p>
         <div class="grid-3" style="max-width:900px;margin:0 auto">
             <div class="plan-card fade-in fade-in-1"><div class="plan-name">Starter</div><div class="plan-price">R$ 97<small>/mês</small></div><div class="plan-desc">Ideal para começar</div>
                 <ul class="plan-features"><li>500 mensagens/mês</li><li>Áudio + Imagem + PDF</li><li>Base de conhecimento</li><li>Painel de conversas</li></ul>
@@ -906,7 +995,12 @@ def landing():
                 <ul class="plan-features"><li>10.000 mensagens/mês</li><li>Tudo do Pro</li><li>Múltiplos números</li><li>API personalizada</li><li>Gerente de conta</li></ul>
                 <a href="/register?plan=business" class="btn btn-secondary btn-block">Começar grátis</a></div>
         </div>
-    </div>"""
+    </div>
+
+    <footer style="text-align:center;padding:40px 24px;border-top:1px solid rgba(255,255,255,0.06);color:var(--text3);font-size:13px">
+        <p>© 2026 atendente.online — Todos os direitos reservados</p>
+        <p style="margin-top:8px"><a href="/privacy">Política de Privacidade</a> · <a href="/terms">Termos de Serviço</a></p>
+    </footer>"""
     return base_html("Atendente IA para WhatsApp", content)
 
 
@@ -939,7 +1033,7 @@ def register():
     plan = request.args.get("plan","starter")
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     content = f"""<div class="auth-container"><div class="auth-card">
-        <a href="/" class="logo">⚡ atende<span>.ai</span></a><h2>Criar conta grátis</h2>{alert}
+        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:40px"></a><h2>Criar conta grátis</h2>{alert}
         <form method="POST"><input type="hidden" name="plan" value="{plan}">
         <div class="form-group"><label class="form-label">Seu nome *</label><input type="text" name="name" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Email *</label><input type="email" name="email" class="form-input" required></div>
@@ -953,21 +1047,27 @@ def register():
 @app.route("/login", methods=["GET","POST"])
 def login():
     error = ""
+    client_ip = request.remote_addr or "unknown"
     if request.method == "POST":
-        email = request.form.get("email","").strip().lower()
-        password = request.form.get("password","")
-        db = get_db()
-        user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-        if user and check_password(password, user["password_hash"]):
-            session["user_id"] = user["id"]
-            db.execute("UPDATE users SET last_login=datetime('now') WHERE id=?", (user["id"],))
-            db.commit()
-            return redirect("/dashboard")
+        if not check_rate_limit(client_ip):
+            error = "Muitas tentativas de login. Aguarde 5 minutos."
         else:
-            error = "Email ou senha incorretos."
+            email = request.form.get("email","").strip().lower()
+            password = request.form.get("password","")
+            db = get_db()
+            user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+            if user and check_password(password, user["password_hash"]):
+                reset_login_attempts(client_ip)
+                session["user_id"] = user["id"]
+                db.execute("UPDATE users SET last_login=datetime('now') WHERE id=?", (user["id"],))
+                db.commit()
+                return redirect("/dashboard")
+            else:
+                record_login_attempt(client_ip)
+                error = "Email ou senha incorretos."
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     content = f"""<div class="auth-container"><div class="auth-card">
-        <a href="/" class="logo">⚡ atende<span>.ai</span></a><h2>Entrar</h2>{alert}
+        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:40px"></a><h2>Entrar</h2>{alert}
         <form method="POST">
         <div class="form-group"><label class="form-label">Email</label><input type="email" name="email" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Senha</label><input type="password" name="password" class="form-input" required></div>
@@ -1477,17 +1577,23 @@ def send_whatsapp_message(phone_id, token, to, message):
 @app.route("/admin/login", methods=["GET","POST"])
 def admin_login():
     error = ""
+    client_ip = request.remote_addr or "unknown"
     if request.method == "POST":
-        if request.form.get("email") == ADMIN_EMAIL and request.form.get("password") == ADMIN_PASSWORD:
+        if not check_rate_limit(client_ip):
+            error = "Muitas tentativas. Aguarde 5 minutos."
+        elif request.form.get("email") == ADMIN_EMAIL and request.form.get("password") == ADMIN_PASSWORD:
+            reset_login_attempts(client_ip)
             session["is_admin"] = True
             return redirect("/admin")
-        error = "Credenciais inválidas."
+        else:
+            record_login_attempt(client_ip)
+            error = "Credenciais inválidas."
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Admin — Atende.AI</title><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<title>Admin — atendente.online</title><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>{GLOBAL_CSS}</style></head><body>
 <div class="auth-container"><div class="auth-card" style="border-top:3px solid var(--red)">
-    <a href="/" class="logo">⚡ atende<span>.ai</span> <span class="admin-badge">ADMIN</span></a>
+    <div style="text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:40px"><span class="admin-badge" style="margin-left:8px;vertical-align:middle">ADMIN</span></div>
     <h2>Painel Administrativo</h2>{alert}
     <form method="POST">
     <div class="form-group"><label class="form-label">Email admin</label><input type="email" name="email" class="form-input" required></div>

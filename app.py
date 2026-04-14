@@ -85,8 +85,7 @@ def reset_login_attempts(ip):
         del login_attempts[ip]
 
 # ─── LOGO (base64 inline) ─────────────────────────────────────
-LOGO_NAV_B64 = "iVBORw0KGgoAAAANSUhEUgAAADwAAAAoCAIAAAAt2Q6oAAABCGlDQ1BJQ0MgUHJvZmlsZQAAeJxjYGA8wQAELAYMDLl5JUVB7k4KEZFRCuwPGBiBEAwSk4sLGHADoKpv1yBqL+viUYcLcKakFicD6Q9ArFIEtBxopAiQLZIOYWuA2EkQtg2IXV5SUAJkB4DYRSFBzkB2CpCtkY7ETkJiJxcUgdT3ANk2uTmlyQh3M/Ck5oUGA2kOIJZhKGYIYnBncAL5H6IkfxEDg8VXBgbmCQixpJkMDNtbGRgkbiHEVBYwMPC3MDBsO48QQ4RJQWJRIliIBYiZ0tIYGD4tZ2DgjWRgEL7AwMAVDQsIHG5TALvNnSEfCNMZchhSgSKeDHkMyQx6QJYRgwGDIYMZAKbWPz9HbOBQAAAEU0lEQVR42u2XS2wVVRjHv3PmdWfu3Mf0cbmlLbUUCA95WENqVMRYNUYTQgyJKzEa3WmIa1cmGhcmLlgYViZGNib4SDCkiwaUBo3BxlDAUqUtxfY+ep8z9869c8/MOZ8LWgjRYEEEmsxvcTKZR77v/M//nO8bgJCQkJCQkBAAcvtfkBsjIgFAxNU3byotTeEBVZooimwYcns7xBJIqD87nbT80hX3HsskrVhPKquKZuhyIkETlmQYspXQ9j4PCWv7lkUErV5s3TO95ZUpTEEIaO/2Hz8QJAaA6kAR/IJy4XSkdHbT6Av04x+zkzZQAhwfDHsQCijkweeCxw7C9Pg69Xy6vc4Cbcbd5PS9KM+flq98Tfv3Nr/9EgMGQAggAhAABCCELG9TAojLD6/tY7w5Oi69cxeSJhRQSAOD/Im3euaOvPZOZceeGBWCCGHPud8c8b/TP5TOjUgaYCXvT4z9SygESgkCoMD/09OEEAqw6+WO3FdvHCY2M0ePOvEtVoWpzLKG9hn+qRNTOEzPnaA9m/ncZHStEbHkRK/R81SHPdOIPWRwV+hpPdIZYRVmDCS7D6xnxaacjKDH1XRMimnRwW65IyocT+mKc9v7z0pfM8bG3Ty1bfilH3a8uu2zZ8eqU/YrXzyyfrfRcgIwImY19+lHD5dygVqdY/Mz6UGlezhNiPAKnt8AvUsTRGo1RKsuhBFp/VmT0yZNGtxmGDf8kscZKj2WdzFLk1HJMuunfvcm5oESuOVS0FsVERQ0mcLXD8tJoW3uLdkasSKqqbCe9oWGWlLNnCvPqp2xtQL3vwexdipzeWdvqaaVHbWQk5hpFrNYXIDFy0H2Zxs2dNcKWHOUIGnV80Ez79enqu5kueUgc4QwY96czcuNJXvf6elBABCMJCqmaFTtIO5UlI6DO6uHTp795I+Bd7dXxstaX1zrVGtODYjMfU803OLJq0RCf7GppdTyT0Lta2PzVeG6SNX590eV/lQwka2PXJJ7LV5uYJMhAs851NTqkxkplQhy9rVCe8eeRgACbpUGPji1Zsp343GlTVc3pDKf/5Y5NpM9Plu+zMhQf+mMLsqOGDuKiIFr+E0TPc5Yh4h2ichGXrIxskaUSmB0BTMZXnDQ83neEU4TmwybTDhNXqyh2+KLNgi8axWREEnas1V7e9jwikpU8vNe/fgkL7ja/kfJ5Uvuhc2YOy/mJ0k0KQ/tR+aRzn6sZkCNQuCBqoPnQjRJjZj4dSSY/mXp4MPrPiBw/QBcWdIrKC6ShJxjf18jLzEvoqQjcocpvfk0dZvB9xPsTJSkVJ6ZAkKktnUivwABw8wMVhbImg0QMAAUhau0a6NQDZGfW04Lb1rSv9+7C0qrivzkLn5uCgOkO/ohoetxpbXYJrKUxKJ8/Bj67DZi3hckgG0fPKPvO0TSW/+pcSU3RnL9mt6XBnQ5A0qBUqKrN7XXq+f/gay2jENCQkJCQkJC7oS/ANriGJhDIa1oAAAAAElFTkSuQmCC"
-LOGO_HERO_B64 = "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"
+LOGO_NAV_B64 = "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"
 
 # Planos
 PLANS = {
@@ -553,10 +552,10 @@ a{color:var(--accent2);text-decoration:none}
 a:hover{color:#5eead4}
 
 .nav-main{background:rgba(10,14,20,0.9);border-bottom:1px solid rgba(255,255,255,0.06);position:sticky;top:0;z-index:100;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
-.nav-inner{max-width:1200px;margin:0 auto;padding:0 24px;height:64px;display:flex;align-items:center;justify-content:space-between}
+.nav-inner{max-width:1200px;margin:0 auto;padding:0 24px;height:72px;display:flex;align-items:center;justify-content:space-between}
 .logo{font-size:22px;font-weight:700;color:var(--text);letter-spacing:-0.5px}
 .logo span{color:var(--accent)}
-.nav-logo-img{height:36px;width:auto;display:block;transition:transform 0.2s}
+.nav-logo-img{height:50px;width:auto;display:block;transition:transform 0.2s}
 .nav-logo-img:hover{transform:scale(1.03)}
 .nav-links{display:flex;gap:4px}
 .nav-link{padding:8px 16px;border-radius:var(--radius-sm);color:var(--text2);font-size:14px;font-weight:500;transition:all 0.2s}
@@ -657,8 +656,7 @@ tr:hover td{background:rgba(255,255,255,0.02)}
 .auth-card h2{font-size:22px;margin-bottom:24px;text-align:center}
 .auth-divider{text-align:center;color:var(--text3);font-size:13px;margin:20px 0}
 
-.hero{text-align:center;padding:60px 24px 40px;max-width:800px;margin:0 auto}
-.hero-logo{width:200px;height:auto;margin:0 auto 32px;display:block;filter:drop-shadow(0 8px 32px rgba(0,200,150,0.2))}
+.hero{text-align:center;padding:80px 24px 40px;max-width:800px;margin:0 auto}
 .hero h1{font-size:48px;font-weight:700;letter-spacing:-1.5px;line-height:1.1;margin-bottom:20px}
 .hero h1 .gradient{background:linear-gradient(135deg,#00c896,#0ea5e9);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .hero p{font-size:18px;color:var(--text2);max-width:560px;margin:0 auto 32px;line-height:1.6}
@@ -924,7 +922,6 @@ def terms_of_service():
 @app.route("/")
 def landing():
     if "user_id" in session: return redirect("/dashboard")
-    hero_logo = LOGO_HERO_B64
     nav_logo = LOGO_NAV_B64
     content = f"""
     <nav class="nav-main"><div class="nav-inner">
@@ -938,7 +935,6 @@ def landing():
     </div></nav>
 
     <div class="hero fade-in">
-        <img src="data:image/png;base64,{hero_logo}" alt="atendente.online" class="hero-logo">
         <h1>Seu atendente de vendas<br><span class="gradient">com inteligência artificial</span></h1>
         <p>Automatize seu WhatsApp com IA treinável. Entende texto, áudio, imagens e documentos. Responda clientes 24/7.</p>
         <div class="hero-badges">
@@ -1033,7 +1029,7 @@ def register():
     plan = request.args.get("plan","starter")
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     content = f"""<div class="auth-container"><div class="auth-card">
-        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:40px"></a><h2>Criar conta grátis</h2>{alert}
+        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:50px"></a><h2>Criar conta grátis</h2>{alert}
         <form method="POST"><input type="hidden" name="plan" value="{plan}">
         <div class="form-group"><label class="form-label">Seu nome *</label><input type="text" name="name" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Email *</label><input type="email" name="email" class="form-input" required></div>
@@ -1067,7 +1063,7 @@ def login():
                 error = "Email ou senha incorretos."
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     content = f"""<div class="auth-container"><div class="auth-card">
-        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:40px"></a><h2>Entrar</h2>{alert}
+        <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:50px"></a><h2>Entrar</h2>{alert}
         <form method="POST">
         <div class="form-group"><label class="form-label">Email</label><input type="email" name="email" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Senha</label><input type="password" name="password" class="form-input" required></div>
@@ -1144,7 +1140,8 @@ def conversations():
     if not convos:
         return base_html("Conversas", '<div class="container"><div class="card"><div class="empty-state"><div class="icon">💬</div><h3>Nenhuma conversa ainda</h3><p>As conversas aparecerão aqui quando clientes enviarem mensagens.</p></div></div></div>', dict(user))
 
-    content = f"""<div class="container"><div class="page-header"><h1>Conversas</h1><p>{len(convos)} conversas</p></div>
+    content = f"""<div class="container"><div class="page-header"><h1>Conversas <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--green2);font-weight:500;background:rgba(0,200,150,0.1);padding:4px 12px;border-radius:20px;vertical-align:middle"><span style="width:8px;height:8px;border-radius:50%;background:var(--green2);display:inline-block;animation:pulse 2s infinite"></span> ao vivo</span></h1><p>{len(convos)} conversas</p></div>
+    <style>@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:0.3}}}}</style>
         <div class="chat-container"><div class="chat-sidebar"><div class="chat-sidebar-header">
             <input type="text" class="form-input" placeholder="Buscar..." style="font-size:13px;padding:8px 12px" oninput="filterChats(this.value)">
             </div><div id="chat-list">{sidebar_items}</div></div>
@@ -1156,17 +1153,61 @@ def conversations():
                     <input type="text" class="form-input" id="msg-input" placeholder="Digite..." style="flex:1" onkeydown="if(event.key==='Enter')sendMsg()">
                     <button class="btn btn-primary" onclick="sendMsg()">Enviar</button></div></div></div></div>
     <script>
-    function loadConversation(id,el){{document.querySelectorAll('.chat-item').forEach(i=>i.classList.remove('active'));el.classList.add('active');
+    let activeConvId = {first_id or 0};
+    let lastMsgCount = 0;
+
+    function loadConversation(id,el){{
+        activeConvId = id;
+        document.querySelectorAll('.chat-item').forEach(i=>i.classList.remove('active'));
+        if(el) el.classList.add('active');
         fetch('/api/conversations/'+id+'/messages').then(r=>r.json()).then(data=>{{
             const box=document.getElementById('chat-messages');
             box.innerHTML=data.messages.map(m=>'<div class="msg '+(m.sender==='bot'?'msg-bot':'msg-customer')+'">'+m.content+'<div class="msg-time">'+((m.created_at||'').substring(11,16))+'</div></div>').join('');
             box.scrollTop=box.scrollHeight;
+            lastMsgCount = data.messages.length;
             document.getElementById('chat-name').textContent=data.customer_name||data.customer_phone;
-            document.getElementById('chat-phone').textContent=data.customer_phone}})}}
+            document.getElementById('chat-phone').textContent=data.customer_phone;
+        }});
+    }}
+
+    function refreshMessages(){{
+        if(!activeConvId) return;
+        fetch('/api/conversations/'+activeConvId+'/messages').then(r=>r.json()).then(data=>{{
+            if(data.messages.length !== lastMsgCount){{
+                const box=document.getElementById('chat-messages');
+                box.innerHTML=data.messages.map(m=>'<div class="msg '+(m.sender==='bot'?'msg-bot':'msg-customer')+'">'+m.content+'<div class="msg-time">'+((m.created_at||'').substring(11,16))+'</div></div>').join('');
+                box.scrollTop=box.scrollHeight;
+                lastMsgCount = data.messages.length;
+            }}
+        }}).catch(()=>{{}});
+    }}
+
+    function refreshSidebar(){{
+        fetch('/api/conversations').then(r=>r.json()).then(data=>{{
+            const list = document.getElementById('chat-list');
+            if(!data.conversations) return;
+            list.innerHTML = data.conversations.map(c=>{{
+                const isActive = c.id === activeConvId ? 'active' : '';
+                const name = c.customer_name || c.customer_phone;
+                const preview = (c.last_msg || 'Sem mensagens').substring(0,50);
+                const date = (c.last_message_at || '').substring(0,10);
+                return '<div class="chat-item '+isActive+'" onclick="loadConversation('+c.id+',this)"><span class="chat-item-time">'+date+'</span><div class="chat-item-name">'+name+'</div><div class="chat-item-preview">'+preview+'</div></div>';
+            }}).join('');
+        }}).catch(()=>{{}});
+    }}
+
+    // Auto-refresh: mensagens a cada 3s, sidebar a cada 10s
+    setInterval(refreshMessages, 3000);
+    setInterval(refreshSidebar, 10000);
+
     function sendMsg(){{const i=document.getElementById('msg-input');if(!i.value.trim())return;const b=document.getElementById('chat-messages');
         b.innerHTML+='<div class="msg msg-bot">'+i.value+'<div class="msg-time">agora</div></div>';b.scrollTop=b.scrollHeight;i.value=''}}
     function filterChats(q){{document.querySelectorAll('.chat-item').forEach(i=>{{i.style.display=i.textContent.toLowerCase().includes(q.toLowerCase())?'':'none'}})}}
     function toggleHuman(){{alert('Você assumiu o atendimento desta conversa!')}}
+
+    // Scroll inicial
+    const box=document.getElementById('chat-messages');
+    if(box) box.scrollTop=box.scrollHeight;
     </script>"""
     return base_html("Conversas", content, dict(user))
 
@@ -1432,6 +1473,17 @@ def api_conv_messages(conv_id):
     return jsonify({"customer_phone":conv["customer_phone"],"customer_name":conv["customer_name"],"messages":[dict(m) for m in messages]})
 
 
+@app.route("/api/conversations")
+@login_required
+def api_conversations_list():
+    db = get_db()
+    convos = db.execute("""SELECT c.id, c.customer_phone, c.customer_name, c.last_message_at,
+        (SELECT content FROM messages WHERE conversation_id=c.id ORDER BY created_at DESC LIMIT 1) as last_msg,
+        (SELECT COUNT(*) FROM messages WHERE conversation_id=c.id) as msg_count
+        FROM conversations c WHERE c.user_id=? ORDER BY c.last_message_at DESC""", (g.user["id"],)).fetchall()
+    return jsonify({"conversations": [dict(c) for c in convos]})
+
+
 # ─── WHATSAPP WEBHOOK ─────────────────────────────────────────
 @app.route("/webhook/whatsapp/<int:user_id>", methods=["GET","POST"])
 def whatsapp_webhook(user_id):
@@ -1593,7 +1645,7 @@ def admin_login():
 <title>Admin — atendente.online</title><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>{GLOBAL_CSS}</style></head><body>
 <div class="auth-container"><div class="auth-card" style="border-top:3px solid var(--red)">
-    <div style="text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:40px"><span class="admin-badge" style="margin-left:8px;vertical-align:middle">ADMIN</span></div>
+    <div style="text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:50px"><span class="admin-badge" style="margin-left:8px;vertical-align:middle">ADMIN</span></div>
     <h2>Painel Administrativo</h2>{alert}
     <form method="POST">
     <div class="form-group"><label class="form-label">Email admin</label><input type="email" name="email" class="form-input" required></div>

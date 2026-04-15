@@ -1077,14 +1077,10 @@ def landing():
     </div>
 
     <footer style="text-align:center;padding:40px 24px;border-top:1px solid rgba(255,255,255,0.06);color:var(--text3);font-size:13px">
-    <p>© 2026 atendente.online — Todos os direitos reservados</p>
-    <p style="margin-top:8px"><a href="/privacy">Política de Privacidade</a> · <a href="/terms">Termos de Serviço</a></p>
-    <p style="margin-top:12px;font-size:11px;color:#475569">Desenvolvido por Clériston Almeida Capistrano</p>
-    </footer>"""
-
-
-
-  
+        <p>© 2026 atendente.online — Todos os direitos reservados</p>
+        <p style="margin-top:8px"><a href="/privacy">Política de Privacidade</a> · <a href="/terms">Termos de Serviço</a></p>
+        <p style="margin-top:12px;font-size:11px;color:#475569">Desenvolvido por Clériston Almeida Capistrano</p>
+        </footer>"""
     return base_html("Atendente IA para WhatsApp", content)
 
 
@@ -1549,27 +1545,30 @@ def mp_create_preference():
     plan = PLANS.get(plan_key)
     if not plan: return jsonify({"error":"Plano inválido"}), 400
     user = g.user
+    mp_token = get_setting("MERCADOPAGO_ACCESS_TOKEN", MERCADOPAGO_ACCESS_TOKEN)
+    base = get_setting("BASE_URL", BASE_URL)
     try:
         import mercadopago
-        sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
-        pref = sdk.preference().create({"items":[{"title":f"Atende.AI — {plan['name']}","quantity":1,"unit_price":plan["price"],"currency_id":"BRL"}],
+        sdk = mercadopago.SDK(mp_token)
+        pref = sdk.preference().create({"items":[{"title":f"atendente.online — {plan['name']}","quantity":1,"unit_price":plan["price"],"currency_id":"BRL"}],
             "payer":{"email":user["email"],"name":user["name"]},
-            "back_urls":{"success":f"{BASE_URL}/api/mercadopago/callback?status=success&plan={plan_key}","failure":f"{BASE_URL}/api/mercadopago/callback?status=failure&plan={plan_key}","pending":f"{BASE_URL}/api/mercadopago/callback?status=pending&plan={plan_key}"},
-            "auto_return":"approved","notification_url":f"{BASE_URL}/api/mercadopago/webhook","external_reference":f"user_{user['id']}_plan_{plan_key}_{int(time.time())}","statement_descriptor":"ATENDE.AI"})
-        checkout_url = pref["response"].get("sandbox_init_point", pref["response"].get("init_point",""))
+            "back_urls":{"success":f"{base}/api/mercadopago/callback?status=success&plan={plan_key}","failure":f"{base}/api/mercadopago/callback?status=failure&plan={plan_key}","pending":f"{base}/api/mercadopago/callback?status=pending&plan={plan_key}"},
+            "auto_return":"approved","notification_url":f"{base}/api/mercadopago/webhook","external_reference":f"user_{user['id']}_plan_{plan_key}_{int(time.time())}","statement_descriptor":"ATENDENTE.ONLINE"})
+        checkout_url = pref["response"].get("init_point", pref["response"].get("sandbox_init_point",""))
         if checkout_url: return redirect(checkout_url)
         return redirect("/dashboard/billing?error=Erro ao criar pagamento")
     except ImportError:
         return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Checkout Simulado</title>
-        <style>body{{font-family:'DM Sans',sans-serif;background:#0a0a0f;color:#e8e6e3;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
-        .box{{background:#12121a;padding:40px;border-radius:16px;max-width:400px;text-align:center;border:1px solid rgba(255,255,255,0.1)}}
-        .price{{font-size:36px;font-weight:700;color:#a29bfe;margin:16px 0}}.btn{{display:inline-block;padding:14px 32px;background:#6c5ce7;color:white;border-radius:8px;text-decoration:none;font-weight:600}}</style></head>
-        <body><div class="box"><h2>Checkout Simulado</h2><p style="color:#9b97a0">Plano {plan['name']}</p>
-        <div class="price">R$ {plan['price']:.0f}<small style="font-size:14px;color:#9b97a0">/mês</small></div>
-        <p style="color:#9b97a0;font-size:13px;margin-bottom:24px">SDK não instalado. Simulação de teste.</p>
-        <a href="{BASE_URL}/api/mercadopago/callback?status=success&plan={plan_key}&simulated=1" class="btn">Simular aprovação ✓</a><br><br>
-        <a href="/dashboard/billing" style="color:#9b97a0;font-size:13px">← Voltar</a></div></body></html>"""
+        <style>body{{font-family:'DM Sans',sans-serif;background:#0a0e14;color:#f0f4f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+        .box{{background:#111827;padding:40px;border-radius:16px;max-width:400px;text-align:center;border:1px solid rgba(255,255,255,0.1)}}
+        .price{{font-size:36px;font-weight:700;color:#34d399;margin:16px 0}}.btn{{display:inline-block;padding:14px 32px;background:#00c896;color:white;border-radius:8px;text-decoration:none;font-weight:600}}</style></head>
+        <body><div class="box"><h2>Checkout Simulado</h2><p style="color:#94a3b8">Plano {plan['name']}</p>
+        <div class="price">R$ {plan['price']:.0f}<small style="font-size:14px;color:#94a3b8">/mês</small></div>
+        <p style="color:#94a3b8;font-size:13px;margin-bottom:24px">SDK não instalado. Simulação de teste.</p>
+        <a href="{base}/api/mercadopago/callback?status=success&plan={plan_key}&simulated=1" class="btn">Simular aprovação ✓</a><br><br>
+        <a href="/dashboard/billing" style="color:#94a3b8;font-size:13px">← Voltar</a></div></body></html>"""
     except Exception as e:
+        print(f"[MP] Erro checkout: {e}")
         return redirect(f"/dashboard/billing?error={str(e)}")
 
 @app.route("/api/mercadopago/callback")

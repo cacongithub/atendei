@@ -22,9 +22,7 @@ Rodar:
   python app.py
 """
 
-import os, json, sqlite3, hashlib, secrets, time, re, base64, tempfile, io, smtplib, random
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import os, json, sqlite3, hashlib, secrets, time, re, base64, tempfile, io, random
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import (
@@ -269,34 +267,26 @@ def set_setting(key, value):
 
 # ─── EMAIL ─────────────────────────────────────────────────────
 def send_email(to_email, subject, html_body):
-    """Envia email via SMTP Hostinger"""
-    smtp_host = get_setting("SMTP_HOST", "smtp.hostinger.com")
-    smtp_port = int(get_setting("SMTP_PORT", "465"))
-    smtp_email = get_setting("SMTP_EMAIL", "contato@atendente.online")
-    smtp_password = get_setting("SMTP_PASSWORD", "")
+    """Envia email via Resend API"""
+    resend_key = get_setting("RESEND_API_KEY", "")
+    from_email = get_setting("RESEND_FROM_EMAIL", "atendente.online <onboarding@resend.dev>")
 
-    if not smtp_password:
-        print(f"[EMAIL] SMTP_PASSWORD não configurada. Email para {to_email} não enviado.")
+    if not resend_key:
+        print(f"[EMAIL] RESEND_API_KEY não configurada. Email para {to_email} não enviado.")
         return False
 
     try:
-        msg = MIMEMultipart("alternative")
-        msg["From"] = f"atendente.online <{smtp_email}>"
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-        if smtp_port == 465:
-            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15)
+        import requests as req
+        resp = req.post("https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+            json={"from": from_email, "to": [to_email], "subject": subject, "html": html_body},
+            timeout=15)
+        if resp.status_code == 200:
+            print(f"[EMAIL] Enviado para {to_email}: {subject}")
+            return True
         else:
-            server = smtplib.SMTP(smtp_host, smtp_port, timeout=15)
-            server.starttls()
-
-        server.login(smtp_email, smtp_password)
-        server.sendmail(smtp_email, to_email, msg.as_string())
-        server.quit()
-        print(f"[EMAIL] Enviado para {to_email}: {subject}")
-        return True
+            print(f"[EMAIL] Erro {resp.status_code}: {resp.text}")
+            return False
     except Exception as e:
         print(f"[EMAIL] Erro ao enviar para {to_email}: {e}")
         return False
@@ -2031,6 +2021,10 @@ def admin_api_settings():
         if smtp_password: set_setting("SMTP_PASSWORD", smtp_password)
         if smtp_host: set_setting("SMTP_HOST", smtp_host)
         if smtp_port: set_setting("SMTP_PORT", smtp_port)
+        resend_key = request.form.get("RESEND_API_KEY", "").strip()
+        resend_from = request.form.get("RESEND_FROM_EMAIL", "").strip()
+        if resend_key: set_setting("RESEND_API_KEY", resend_key)
+        if resend_from: set_setting("RESEND_FROM_EMAIL", resend_from)
         msg = '<div class="alert alert-success">Configurações de API salvas!</div>'
 
     anthropic_key = get_setting("ANTHROPIC_API_KEY")
@@ -2043,6 +2037,8 @@ def admin_api_settings():
     smtp_password = get_setting("SMTP_PASSWORD")
     smtp_host = get_setting("SMTP_HOST", "smtp.hostinger.com")
     smtp_port = get_setting("SMTP_PORT", "465")
+    resend_key = get_setting("RESEND_API_KEY")
+    resend_from = get_setting("RESEND_FROM_EMAIL", "atendente.online <onboarding@resend.dev>")
 
     def mask(key):
         if not key: return ""
@@ -2100,30 +2096,20 @@ def admin_api_settings():
         </form>
 
         <div class="card fade-in fade-in-3" style="margin-top:32px">
-            <div class="card-header"><span class="card-title">Email (SMTP) — Verificação de conta</span></div>
+            <div class="card-header"><span class="card-title">Email (Resend) — Verificação de conta</span></div>
             <form method="POST">
             <div class="grid-2">
                 <div class="form-group">
+                    <label class="form-label">Resend API Key</label>
+                    <input type="text" name="RESEND_API_KEY" class="form-input" placeholder="re_..." value="" autocomplete="off"
+                        style="background:#2a2a3a;border:2px solid {'var(--green)' if resend_key else 'var(--red)'}">
+                    <small style="color:var(--text3)">{'✅ Configurada: ' + mask(resend_key) if resend_key else '❌ Não configurada — emails não serão enviados'}</small>
+                </div>
+                <div class="form-group">
                     <label class="form-label">Email remetente</label>
-                    <input type="text" name="SMTP_EMAIL" class="form-input" value="{smtp_email}" autocomplete="off"
-                        style="background:#2a2a3a;border:2px solid {'var(--green)' if smtp_email else 'var(--red)'}">
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Senha do email</label>
-                    <input type="password" name="SMTP_PASSWORD" class="form-input" placeholder="{'••••••••' if smtp_password else 'Senha do email SMTP'}" autocomplete="off"
-                        style="background:#2a2a3a;border:2px solid {'var(--green)' if smtp_password else 'var(--red)'}">
-                    <small style="color:var(--text3)">{'✅ Configurada' if smtp_password else '❌ Não configurada — emails não serão enviados'}</small>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Servidor SMTP</label>
-                    <input type="text" name="SMTP_HOST" class="form-input" value="{smtp_host}" autocomplete="off"
+                    <input type="text" name="RESEND_FROM_EMAIL" class="form-input" value="{resend_from}" autocomplete="off"
                         style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Porta SMTP</label>
-                    <input type="text" name="SMTP_PORT" class="form-input" value="{smtp_port}" autocomplete="off"
-                        style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
-                    <small style="color:var(--text3)">465 (SSL) ou 587 (TLS)</small>
+                    <small style="color:var(--text3)">Use "onboarding@resend.dev" (grátis) ou configure domínio no Resend</small>
                 </div>
             </div>
             <button type="submit" class="btn btn-primary">Salvar configurações de email</button>

@@ -1749,6 +1749,8 @@ def whatsapp_webhook(user_id):
 
                     # Generate AI response using the description (clean text for the AI)
                     ai_input = media_result.get("description", media_result["content"])
+                    if media_result["type"] == "audio":
+                        ai_input = f"[MENSAGEM DE ÁUDIO DO CLIENTE]: {ai_input}"
                     ai_response = generate_ai_response(user, conv["id"], ai_input, db_conn)
 
                     db_conn.execute("INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)", (conv["id"],"bot",ai_response,"text"))
@@ -1800,7 +1802,7 @@ REGRAS:
 - Não invente informações sobre produtos ou preços
 - Se não souber, diga que vai verificar
 - Horário: {user['business_hours']}
-- Se o cliente enviar áudio, você receberá a transcrição. Responda de forma conversacional e natural, como se estivesse falando (a resposta será convertida em áudio)
+- Se o cliente enviar áudio, você receberá a transcrição marcada como [MENSAGEM DE ÁUDIO DO CLIENTE]. Responda de forma conversacional e natural, como se estivesse falando (a resposta será convertida em áudio). NÃO use formatação como asteriscos, bullets, listas numeradas ou markdown. Escreva em frases corridas e naturais. Seja breve, no máximo 3 frases.
 - Se o cliente enviar imagem, você receberá a descrição da imagem
 - Se o cliente enviar PDF, você receberá o texto extraído
 """
@@ -1852,6 +1854,61 @@ def send_whatsapp_message(phone_id, token, to, message):
         print(f"[WA SEND] EXCEÇÃO: {e}")
 
 
+def prepare_tts_text(text):
+    """Prepara texto para TTS, melhorando pronúncia de palavras inglesas"""
+    # Dicionário de palavras inglesas comuns → pronúncia fonética em PT-BR
+    english_words = {
+        "smart": "esmárt", "center": "cênter", "online": "onlái-ne",
+        "delivery": "delíveri", "store": "estóre", "shop": "xóp",
+        "shopping": "xóping", "drive": "dráive", "fitness": "fítness",
+        "beauty": "biúti", "fashion": "féxon", "design": "dezáin",
+        "designer": "dezáiner", "marketing": "márketing", "business": "bízness",
+        "feedback": "fíd-béck", "insight": "ínsait", "startup": "estartâp",
+        "software": "sóftuer", "hardware": "rárdiuer", "network": "nétuork",
+        "meeting": "míting", "deadline": "déd-láine", "budget": "bâdjet",
+        "target": "târguet", "performance": "perfórmance", "coach": "côutch",
+        "coaching": "côutching", "premium": "prêmium", "express": "êx-préss",
+        "service": "sêrvice", "self-service": "sêlf sêrvice",
+        "pet": "pétt", "petshop": "pétt xóp", "coworking": "co-uôrking",
+        "hub": "râb", "tech": "téc", "food": "fúd", "drink": "drínk",
+        "coffee": "cófi", "burger": "bârguer", "happy hour": "répi áuer",
+        "sale": "sêil", "off": "óff", "black friday": "bléck fráidei",
+        "free": "frí", "clean": "clín", "house": "ráus", "home": "rôum",
+        "personal": "persônau", "trainer": "trêiner", "check-up": "tchéc-âp",
+        "check": "tchéc", "whatsapp": "uótsép", "instagram": "ínstagrem",
+        "facebook": "fêis-búk", "google": "gúgou", "youtube": "iú-tiúb",
+        "iphone": "ái-fone", "android": "êndróid", "bluetooth": "blú-tufe",
+        "wifi": "uái-fái", "site": "sáite", "link": "línk", "click": "clíck",
+        "like": "láik", "post": "pôust", "story": "estóri", "stories": "estóris",
+        "live": "láive", "streaming": "estríming", "playlist": "plêi-líst",
+    }
+
+    # Remove emojis para TTS
+    text = re.sub(r'[\U00010000-\U0010ffff]', '', text)
+    text = re.sub(r'[👋🤖📷📄📊⚡🎤💬✅❌⚠️🔑]', '', text)
+
+    # Remove formatação markdown
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)  # **bold** → bold
+    text = re.sub(r'\*(.+?)\*', r'\1', text)       # *italic* → italic
+    text = re.sub(r'__(.+?)__', r'\1', text)       # __underline__ → underline
+    text = re.sub(r'~~(.+?)~~', r'\1', text)       # ~~strike~~ → strike
+    text = re.sub(r'`(.+?)`', r'\1', text)         # `code` → code
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)  # ### heading → heading
+    text = re.sub(r'^\s*[-*•]\s+', '', text, flags=re.MULTILINE)  # - item → item
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)  # 1. item → item
+    text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)  # [link](url) → link
+    text = text.replace('*', '').replace('#', '').replace('_', ' ')  # limpa restantes
+
+    # Substitui palavras inglesas (case-insensitive, palavras inteiras apenas)
+    for eng, phonetic in english_words.items():
+        pattern = re.compile(r'\b' + re.escape(eng) + r'\b', re.IGNORECASE)
+        text = pattern.sub(phonetic, text)
+
+    # Remove múltiplos espaços
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
 def text_to_audio(text, output_path=None):
     """Converte texto em áudio usando Edge TTS (grátis)"""
     try:
@@ -1861,9 +1918,13 @@ def text_to_audio(text, output_path=None):
         if not output_path:
             output_path = os.path.join(MEDIA_FOLDER, f"tts_{secrets.token_hex(8)}.mp3")
 
+        # Prepara texto para melhor pronúncia
+        clean_text = prepare_tts_text(text)
+        print(f"[TTS] Texto preparado: {clean_text[:80]}...")
+
         async def _generate():
-            voice = "pt-BR-AntonioNeural"  # Voz masculina BR natural
-            communicate = edge_tts.Communicate(text, voice, rate="+5%")
+            voice = "pt-BR-AntonioNeural"
+            communicate = edge_tts.Communicate(clean_text, voice, rate="+5%")
             await communicate.save(output_path)
 
         # Roda async no sync context

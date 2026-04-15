@@ -33,19 +33,29 @@ from flask import (
 # ─── CONFIG ────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
+app.config['SESSION_COOKIE_SECURE'] = os.getenv("FLASK_ENV") != "development"
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "TEST-xxxx")
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "meu_token_verificacao")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", secrets.token_hex(16))
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8080")
+BASE_URL = os.getenv("BASE_URL", "https://atendente.online")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@atende.ai")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # Obrigatório configurar
 DATABASE = "atendeia.db"
 MEDIA_FOLDER = "media_files"
 
 os.makedirs(MEDIA_FOLDER, exist_ok=True)
+
+# ─── FORCE HTTPS ───────────────────────────────────────────────
+@app.before_request
+def force_https():
+    if request.headers.get('X-Forwarded-Proto', 'http') == 'http' and not request.host.startswith('localhost') and not request.host.startswith('127.'):
+        url = request.url.replace('http://', 'https://', 1)
+        return redirect(url, code=301)
 
 # ─── SECURITY ──────────────────────────────────────────────────
 login_attempts = {}  # {ip: {"count": n, "last": timestamp}}
@@ -339,6 +349,28 @@ def verify_code(email, code):
     return True
 
 # ─── AUTH ──────────────────────────────────────────────────────
+def generate_csrf_token():
+    if '_csrf_token' not in session:
+        session['_csrf_token'] = secrets.token_hex(32)
+    return session['_csrf_token']
+
+app.jinja_env.globals['csrf_token'] = generate_csrf_token
+
+def csrf_field():
+    return f'<input type="hidden" name="_csrf_token" value="{generate_csrf_token()}">'
+
+@app.before_request
+def csrf_protect():
+    if request.method == "POST":
+        # Skip CSRF for webhooks (external services)
+        if request.path.startswith('/webhook/') or request.path.startswith('/api/mercadopago/webhook'):
+            return
+        token = request.form.get('_csrf_token') or request.headers.get('X-CSRF-Token')
+        if not token or token != session.get('_csrf_token'):
+            if request.path.startswith('/api/'):
+                return  # Skip for internal AJAX
+            abort(403)
+
 def hash_password(pw):
     salt = secrets.token_hex(16)
     h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100000)
@@ -358,6 +390,9 @@ def login_required(f):
         if not user:
             session.clear()
             return redirect("/login")
+        if not dict(user).get("is_active", 1):
+            session.clear()
+            return redirect("/login?error=Conta+desativada.+Entre+em+contato+com+o+suporte.")
         g.user = user
         return f(*args, **kwargs)
     return decorated
@@ -1022,7 +1057,7 @@ def landing():
         <p>Automatize seu WhatsApp com IA treinável. Entende texto, áudio, imagens e documentos. Responda clientes 24/7.</p>
         <div class="hero-badges">
             <span class="hero-badge">✓ WhatsApp Business API</span>
-            <span class="hero-badge">✓ IA Avançada</span>
+            <span class="hero-badge">✓ IA com Voz</span>
             <span class="hero-badge">✓ 7 dias grátis</span>
         </div>
         <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
@@ -1033,7 +1068,7 @@ def landing():
 
     <div id="features" class="features-grid">
         <div class="feature-card fade-in fade-in-1"><div class="feature-icon">🤖</div><h3>IA Treinável</h3><p>Ensine sobre seus produtos, preços e jeito de atender. A IA aprende o DNA do seu negócio.</p></div>
-        <div class="feature-card fade-in fade-in-2"><div class="feature-icon">🎤</div><h3>Entende Áudio</h3><p>Transcreve e responde áudios automaticamente. Seu cliente fala, a IA entende.</p></div>
+        <div class="feature-card fade-in fade-in-2"><div class="feature-icon">🎤</div><h3>Entende e Responde Áudio</h3><p>Transcreve áudios e responde por voz automaticamente. Seu cliente fala, a IA fala de volta.</p></div>
         <div class="feature-card fade-in fade-in-3"><div class="feature-icon">📷</div><h3>Analisa Imagens</h3><p>Entende fotos de produtos, comprovantes e documentos enviados.</p></div>
         <div class="feature-card fade-in fade-in-1"><div class="feature-icon">📄</div><h3>Lê PDFs</h3><p>Extrai e processa texto de documentos. Orçamentos, contratos e mais.</p></div>
         <div class="feature-card fade-in fade-in-2"><div class="feature-icon">📊</div><h3>Painel Completo</h3><p>Conversas em tempo real, métricas de atendimento e controle total.</p></div>
@@ -1079,8 +1114,7 @@ def landing():
     <footer style="text-align:center;padding:40px 24px;border-top:1px solid rgba(255,255,255,0.06);color:var(--text3);font-size:13px">
         <p>© 2026 atendente.online — Todos os direitos reservados</p>
         <p style="margin-top:8px"><a href="/privacy">Política de Privacidade</a> · <a href="/terms">Termos de Serviço</a></p>
-        <p style="margin-top:12px;font-size:11px;color:#475569">Desenvolvido por Clériston Almeida Capistrano</p>
-        </footer>"""
+    </footer>"""
     return base_html("Atendente IA para WhatsApp", content)
 
 
@@ -1117,7 +1151,7 @@ def register():
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     content = f"""<div class="auth-container"><div class="auth-card">
         <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"></a><h2>Criar conta grátis</h2>{alert}
-        <form method="POST"><input type="hidden" name="plan" value="{plan}">
+        <form method="POST">{csrf_field()}<input type="hidden" name="plan" value="{plan}">
         <div class="form-group"><label class="form-label">Seu nome *</label><input type="text" name="name" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Email *</label><input type="email" name="email" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Empresa</label><input type="text" name="company" class="form-input"></div>
@@ -1158,7 +1192,7 @@ def verify_email():
         <h2>Verifique seu email</h2>
         <p style="color:var(--text2);margin-bottom:24px">Enviamos um código de 6 dígitos para<br><strong style="color:var(--accent2)">{masked}</strong></p>
         {alert}
-        <form method="POST">
+        <form method="POST">{csrf_field()}
         <div class="form-group"><input type="text" name="code" class="form-input" placeholder="000000" maxlength="6"
             style="text-align:center;font-size:28px;letter-spacing:8px;font-weight:700" required autofocus></div>
         <button type="submit" class="btn btn-primary btn-block btn-lg">Verificar →</button></form>
@@ -1178,7 +1212,7 @@ def resend_code():
 
 @app.route("/login", methods=["GET","POST"])
 def login():
-    error = ""
+    error = request.args.get("error", "")
     client_ip = request.remote_addr or "unknown"
     if request.method == "POST":
         if not check_rate_limit(client_ip):
@@ -1189,22 +1223,25 @@ def login():
             db = get_db()
             user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
             if user and check_password(password, user["password_hash"]):
-                if not dict(user).get("email_verified", 0):
+                if not dict(user).get("is_active", 1):
+                    error = "Conta desativada. Entre em contato com o suporte."
+                elif not dict(user).get("email_verified", 0):
                     session["pending_email"] = email
                     send_verification_code(email)
                     return redirect("/verify-email")
-                reset_login_attempts(client_ip)
-                session["user_id"] = user["id"]
-                db.execute("UPDATE users SET last_login=datetime('now') WHERE id=?", (user["id"],))
-                db.commit()
-                return redirect("/dashboard")
+                else:
+                    reset_login_attempts(client_ip)
+                    session["user_id"] = user["id"]
+                    db.execute("UPDATE users SET last_login=datetime('now') WHERE id=?", (user["id"],))
+                    db.commit()
+                    return redirect("/dashboard")
             else:
                 record_login_attempt(client_ip)
                 error = "Email ou senha incorretos."
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     content = f"""<div class="auth-container"><div class="auth-card">
         <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"></a><h2>Entrar</h2>{alert}
-        <form method="POST">
+        <form method="POST">{csrf_field()}
         <div class="form-group"><label class="form-label">Email</label><input type="email" name="email" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Senha</label><input type="password" name="password" class="form-input" required></div>
         <button type="submit" class="btn btn-primary btn-block btn-lg">Entrar</button></form>
@@ -1296,14 +1333,27 @@ def conversations():
     let activeConvId = {first_id or 0};
     let lastMsgCount = 0;
 
+    function renderMessages(box, messages){{
+        box.innerHTML='';
+        messages.forEach(m=>{{
+            const div=document.createElement('div');
+            div.className='msg '+(m.sender==='bot'?'msg-bot':'msg-customer');
+            div.textContent=m.content;
+            const t=document.createElement('div');
+            t.className='msg-time';
+            t.textContent=(m.created_at||'').substring(11,16);
+            div.appendChild(t);
+            box.appendChild(div);
+        }});
+        box.scrollTop=box.scrollHeight;
+    }}
+
     function loadConversation(id,el){{
         activeConvId = id;
         document.querySelectorAll('.chat-item').forEach(i=>i.classList.remove('active'));
         if(el) el.classList.add('active');
         fetch('/api/conversations/'+id+'/messages').then(r=>r.json()).then(data=>{{
-            const box=document.getElementById('chat-messages');
-            box.innerHTML=data.messages.map(m=>'<div class="msg '+(m.sender==='bot'?'msg-bot':'msg-customer')+'">'+m.content+'<div class="msg-time">'+((m.created_at||'').substring(11,16))+'</div></div>').join('');
-            box.scrollTop=box.scrollHeight;
+            renderMessages(document.getElementById('chat-messages'), data.messages);
             lastMsgCount = data.messages.length;
             document.getElementById('chat-name').textContent=data.customer_name||data.customer_phone;
             document.getElementById('chat-phone').textContent=data.customer_phone;
@@ -1314,9 +1364,7 @@ def conversations():
         if(!activeConvId) return;
         fetch('/api/conversations/'+activeConvId+'/messages').then(r=>r.json()).then(data=>{{
             if(data.messages.length !== lastMsgCount){{
-                const box=document.getElementById('chat-messages');
-                box.innerHTML=data.messages.map(m=>'<div class="msg '+(m.sender==='bot'?'msg-bot':'msg-customer')+'">'+m.content+'<div class="msg-time">'+((m.created_at||'').substring(11,16))+'</div></div>').join('');
-                box.scrollTop=box.scrollHeight;
+                renderMessages(document.getElementById('chat-messages'), data.messages);
                 lastMsgCount = data.messages.length;
             }}
         }}).catch(()=>{{}});
@@ -1326,26 +1374,37 @@ def conversations():
         fetch('/api/conversations').then(r=>r.json()).then(data=>{{
             const list = document.getElementById('chat-list');
             if(!data.conversations) return;
-            list.innerHTML = data.conversations.map(c=>{{
-                const isActive = c.id === activeConvId ? 'active' : '';
-                const name = c.customer_name || c.customer_phone;
-                const preview = (c.last_msg || 'Sem mensagens').substring(0,50);
-                const date = (c.last_message_at || '').substring(0,10);
-                return '<div class="chat-item '+isActive+'" onclick="loadConversation('+c.id+',this)"><span class="chat-item-time">'+date+'</span><div class="chat-item-name">'+name+'</div><div class="chat-item-preview">'+preview+'</div></div>';
-            }}).join('');
+            list.innerHTML='';
+            data.conversations.forEach(c=>{{
+                const div=document.createElement('div');
+                div.className='chat-item '+(c.id===activeConvId?'active':'');
+                div.onclick=function(){{loadConversation(c.id,div)}};
+                const time=document.createElement('span');
+                time.className='chat-item-time';
+                time.textContent=(c.last_message_at||'').substring(0,10);
+                const name=document.createElement('div');
+                name.className='chat-item-name';
+                name.textContent=c.customer_name||c.customer_phone;
+                const preview=document.createElement('div');
+                preview.className='chat-item-preview';
+                preview.textContent=(c.last_msg||'Sem mensagens').substring(0,50);
+                div.appendChild(time);div.appendChild(name);div.appendChild(preview);
+                list.appendChild(div);
+            }});
         }}).catch(()=>{{}});
     }}
 
-    // Auto-refresh: mensagens a cada 3s, sidebar a cada 10s
     setInterval(refreshMessages, 3000);
     setInterval(refreshSidebar, 10000);
 
-    function sendMsg(){{const i=document.getElementById('msg-input');if(!i.value.trim())return;const b=document.getElementById('chat-messages');
-        b.innerHTML+='<div class="msg msg-bot">'+i.value+'<div class="msg-time">agora</div></div>';b.scrollTop=b.scrollHeight;i.value=''}}
+    function sendMsg(){{const i=document.getElementById('msg-input');if(!i.value.trim())return;
+        const b=document.getElementById('chat-messages');
+        const div=document.createElement('div');div.className='msg msg-bot';div.textContent=i.value;
+        const t=document.createElement('div');t.className='msg-time';t.textContent='agora';
+        div.appendChild(t);b.appendChild(div);b.scrollTop=b.scrollHeight;i.value=''}}
     function filterChats(q){{document.querySelectorAll('.chat-item').forEach(i=>{{i.style.display=i.textContent.toLowerCase().includes(q.toLowerCase())?'':'none'}})}}
     function toggleHuman(){{alert('Você assumiu o atendimento desta conversa!')}}
 
-    // Scroll inicial
     const box=document.getElementById('chat-messages');
     if(box) box.scrollTop=box.scrollHeight;
     </script>"""
@@ -1376,11 +1435,11 @@ def training():
             db.commit(); msg = '<div class="alert alert-success">Removido!</div>'
 
     kb = db.execute("SELECT * FROM knowledge_base WHERE user_id=? ORDER BY created_at DESC", (user["id"],)).fetchall()
-    kb_rows = "".join(f'<tr><td><strong>{i["title"]}</strong></td><td><span class="badge badge-purple">{i["category"]}</span></td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)">{i["content"][:100]}</td><td><form method="POST" style="display:inline"><input type="hidden" name="action" value="delete_kb"><input type="hidden" name="kb_id" value="{i["id"]}"><button type="submit" class="btn btn-danger btn-sm">✕</button></form></td></tr>' for i in kb)
+    kb_rows = "".join(f'<tr><td><strong>{i["title"]}</strong></td><td><span class="badge badge-purple">{i["category"]}</span></td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)">{i["content"][:100]}</td><td><form method="POST">{csrf_field()}<span style="display:inline"><input type="hidden" name="action" value="delete_kb"><input type="hidden" name="kb_id" value="{i["id"]}"><button type="submit" class="btn btn-danger btn-sm">✕</button></form></td></tr>' for i in kb)
 
     content = f"""<div class="container"><div class="page-header fade-in"><h1>Treinamento da IA 🧠</h1><p>Configure personalidade e base de conhecimento.</p></div>{msg}
         <div class="grid-2"><div class="card fade-in fade-in-1"><div class="card-header"><span class="card-title">Personalidade da IA</span></div>
-            <form method="POST"><input type="hidden" name="action" value="update_prompt">
+            <form method="POST">{csrf_field()}<input type="hidden" name="action" value="update_prompt">
             <div class="form-group"><label class="form-label">System prompt</label><textarea name="system_prompt" class="form-input" rows="6">{user['ai_system_prompt']}</textarea></div>
             <div class="form-group"><label class="form-label">Tom de voz</label><select name="tone" class="form-input">
                 <option value="profissional" {'selected' if user['ai_tone']=='profissional' else ''}>Profissional</option>
@@ -1390,7 +1449,7 @@ def training():
             <div class="form-group"><label class="form-label">Saudação</label><input type="text" name="greeting" class="form-input" value="{user['ai_greeting']}"></div>
             <button type="submit" class="btn btn-primary">Salvar</button></form></div>
         <div class="card fade-in fade-in-2"><div class="card-header"><span class="card-title">Adicionar conhecimento</span></div>
-            <form method="POST"><input type="hidden" name="action" value="add_knowledge">
+            <form method="POST">{csrf_field()}<input type="hidden" name="action" value="add_knowledge">
             <div class="form-group"><label class="form-label">Título</label><input type="text" name="title" class="form-input" placeholder="Ex: Tabela de preços" required></div>
             <div class="form-group"><label class="form-label">Categoria</label><select name="category" class="form-input">
                 <option value="produtos">Produtos</option><option value="precos">Preços</option><option value="faq">FAQ</option><option value="politicas">Políticas</option><option value="geral">Geral</option></select></div>
@@ -1419,11 +1478,11 @@ def quick_replies():
             db.commit(); msg = '<div class="alert alert-success">Removida!</div>'
 
     qrs = db.execute("SELECT * FROM quick_replies WHERE user_id=? ORDER BY times_used DESC", (user["id"],)).fetchall()
-    rows = "".join(f'<tr><td><code style="color:var(--accent2)">/{q["shortcut"]}</code></td><td>{q["content"][:80]}</td><td>{q["times_used"]}</td><td><form method="POST" style="display:inline"><input type="hidden" name="action" value="delete"><input type="hidden" name="qr_id" value="{q["id"]}"><button type="submit" class="btn btn-danger btn-sm">✕</button></form></td></tr>' for q in qrs)
+    rows = "".join(f'<tr><td><code style="color:var(--accent2)">/{q["shortcut"]}</code></td><td>{q["content"][:80]}</td><td>{q["times_used"]}</td><td><form method="POST">{csrf_field()}<span style="display:inline"><input type="hidden" name="action" value="delete"><input type="hidden" name="qr_id" value="{q["id"]}"><button type="submit" class="btn btn-danger btn-sm">✕</button></form></td></tr>' for q in qrs)
 
     content = f"""<div class="container"><div class="page-header"><h1>Respostas Rápidas ⚡</h1><p>Atalhos para mensagens que você usa com frequência.</p></div>{msg}
         <div class="grid-2"><div class="card"><div class="card-header"><span class="card-title">Nova resposta rápida</span></div>
-            <form method="POST"><input type="hidden" name="action" value="add">
+            <form method="POST">{csrf_field()}<input type="hidden" name="action" value="add">
             <div class="form-group"><label class="form-label">Atalho (ex: preco, horario)</label><input type="text" name="shortcut" class="form-input" placeholder="preco" required></div>
             <div class="form-group"><label class="form-label">Mensagem</label><textarea name="content" class="form-input" rows="4" placeholder="Nossos preços começam a partir de..." required></textarea></div>
             <button type="submit" class="btn btn-success">+ Adicionar</button></form></div>
@@ -1455,10 +1514,12 @@ def settings():
         db.commit(); msg = '<div class="alert alert-success">Configurações salvas!</div>'
         user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
 
-    webhook_url = f"{BASE_URL}/webhook/whatsapp/{user['id']}"
+    base = get_setting("BASE_URL", BASE_URL)
+    wa_verify = get_setting("WHATSAPP_VERIFY_TOKEN", WHATSAPP_VERIFY_TOKEN)
+    webhook_url = f"{base}/webhook/whatsapp/{user['id']}"
     content = f"""<div class="container"><div class="page-header fade-in"><h1>Configurações ⚙️</h1></div>{msg}
         <div class="grid-2"><div class="card fade-in fade-in-1"><div class="card-header"><span class="card-title">Perfil e WhatsApp</span></div>
-            <form method="POST">
+            <form method="POST">{csrf_field()}
             <div class="form-group"><label class="form-label">Nome</label><input type="text" name="name" class="form-input" value="{user['name']}"></div>
             <div class="form-group"><label class="form-label">Empresa</label><input type="text" name="company" class="form-input" value="{user['company']}"></div>
             <div class="form-group"><label class="form-label">Telefone</label><input type="text" name="phone" class="form-input" value="{user['phone']}"></div>
@@ -1484,11 +1545,11 @@ def settings():
         <div><div class="card fade-in fade-in-2" style="margin-bottom:24px"><div class="card-header"><span class="card-title">Webhook URL</span></div>
             <p style="color:var(--text2);font-size:14px;margin-bottom:12px">Configure no Meta Business:</p>
             <div style="background:var(--bg4);padding:12px 16px;border-radius:var(--radius-sm);font-family:var(--mono);font-size:13px;word-break:break-all;color:var(--accent2)">{webhook_url}</div>
-            <p style="color:var(--text3);font-size:12px;margin-top:8px">Token: <code style="color:var(--accent2)">{WHATSAPP_VERIFY_TOKEN}</code></p></div>
+            <p style="color:var(--text3);font-size:12px;margin-top:8px">Token: <code style="color:var(--accent2)">{wa_verify}</code></p></div>
         <div class="card fade-in fade-in-3"><div class="card-header"><span class="card-title">Mídias suportadas</span></div>
             <div style="color:var(--text2);font-size:14px;line-height:1.8">
                 <p>✅ <strong style="color:var(--text)">Texto</strong> — lê e responde normalmente</p>
-                <p>✅ <strong style="color:var(--text)">Áudio</strong> — transcreve com Groq/Whisper e responde</p>
+                <p>✅ <strong style="color:var(--text)">Áudio</strong> — transcreve com Groq/Whisper e responde por voz</p>
                 <p>✅ <strong style="color:var(--text)">Imagens</strong> — analisa com Claude Vision</p>
                 <p>✅ <strong style="color:var(--text)">PDFs</strong> — extrai texto e interpreta</p>
                 <p>✅ <strong style="color:var(--text)">Localização</strong> — recebe e processa</p>
@@ -1576,10 +1637,17 @@ def mp_create_preference():
 def mp_callback():
     status = request.args.get("status",""); plan_key = request.args.get("plan","starter")
     plan = PLANS.get(plan_key, PLANS["starter"]); user = g.user; db = get_db()
-    if status == "success":
-        pid = request.args.get("payment_id", f"sim_{int(time.time())}")
+    simulated = request.args.get("simulated","")
+    if status == "success" and simulated == "1":
+        # Simulação apenas — ativa direto (modo dev/teste)
+        pid = f"sim_{int(time.time())}"
         db.execute("UPDATE users SET plan=?,plan_status='active',msgs_limit=?,msgs_used=0 WHERE id=?", (plan_key, plan["msgs"], user["id"]))
         db.execute("INSERT INTO payments (user_id,mp_payment_id,amount,status,plan) VALUES (?,?,?,?,?)", (user["id"],pid,plan["price"],"approved",plan_key))
+        db.commit()
+    elif status == "success":
+        # Pagamento real — registra como pendente, webhook ativa depois
+        pid = request.args.get("payment_id", "")
+        db.execute("INSERT INTO payments (user_id,mp_payment_id,amount,status,plan) VALUES (?,?,?,?,?)", (user["id"],pid,plan["price"],"pending",plan_key))
         db.commit()
     return redirect("/dashboard/billing")
 
@@ -1591,7 +1659,8 @@ def mp_webhook():
         if pid:
             try:
                 import mercadopago
-                sdk = mercadopago.SDK(MERCADOPAGO_ACCESS_TOKEN)
+                mp_token = get_setting("MERCADOPAGO_ACCESS_TOKEN", MERCADOPAGO_ACCESS_TOKEN)
+                sdk = mercadopago.SDK(mp_token)
                 payment = sdk.payment().get(pid)["response"]
                 ext = payment.get("external_reference",""); parts = ext.split("_")
                 if len(parts) >= 4:
@@ -1599,9 +1668,13 @@ def mp_webhook():
                     db_c = sqlite3.connect(DATABASE); db_c.row_factory = sqlite3.Row
                     if payment.get("status") == "approved" and plan:
                         db_c.execute("UPDATE users SET plan=?,plan_status='active',msgs_limit=?,msgs_used=0 WHERE id=?", (pk,plan["msgs"],uid))
-                        db_c.execute("INSERT INTO payments (user_id,mp_payment_id,amount,status,plan) VALUES (?,?,?,?,?)", (uid,str(pid),payment.get("transaction_amount",0),"approved",pk))
+                        db_c.execute("UPDATE payments SET status='approved' WHERE mp_payment_id=?", (str(pid),))
+                        db_c.execute("INSERT OR IGNORE INTO payments (user_id,mp_payment_id,amount,status,plan) VALUES (?,?,?,?,?)", (uid,str(pid),payment.get("transaction_amount",0),"approved",pk))
+                    elif payment.get("status") == "rejected":
+                        db_c.execute("UPDATE payments SET status='rejected' WHERE mp_payment_id=?", (str(pid),))
                     db_c.commit(); db_c.close()
-            except Exception as e: print(f"MP webhook error: {e}")
+                    print(f"[MP] Webhook: payment {pid} status={payment.get('status')} user={uid} plan={pk}")
+            except Exception as e: print(f"[MP] Webhook error: {e}")
     return jsonify({"status":"ok"}), 200
 
 
@@ -1631,7 +1704,8 @@ def api_conversations_list():
 @app.route("/webhook/whatsapp/<int:user_id>", methods=["GET","POST"])
 def whatsapp_webhook(user_id):
     if request.method == "GET":
-        if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == WHATSAPP_VERIFY_TOKEN:
+        wa_verify = get_setting("WHATSAPP_VERIFY_TOKEN", WHATSAPP_VERIFY_TOKEN)
+        if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == wa_verify:
             return request.args.get("hub.challenge",""), 200
         return "Forbidden", 403
 
@@ -1681,7 +1755,20 @@ def whatsapp_webhook(user_id):
                     db_conn.execute("UPDATE users SET msgs_used=msgs_used+1 WHERE id=?", (user_id,))
                     db_conn.commit()
 
-                    send_whatsapp_message(user["whatsapp_phone_id"], user["whatsapp_token"], sender_phone, ai_response)
+                    # Se cliente mandou áudio, responde com áudio
+                    audio_sent = False
+                    if media_result["type"] == "audio":
+                        print(f"[VOICE] Cliente enviou áudio, gerando resposta por voz...")
+                        audio_path = text_to_audio(ai_response)
+                        if audio_path:
+                            audio_sent = send_whatsapp_audio(user["whatsapp_phone_id"], user["whatsapp_token"], sender_phone, audio_path)
+                            # Limpa o arquivo temporário
+                            try: os.remove(audio_path)
+                            except: pass
+
+                    # Se não enviou áudio (ou falhou), envia texto
+                    if not audio_sent:
+                        send_whatsapp_message(user["whatsapp_phone_id"], user["whatsapp_token"], sender_phone, ai_response)
         db_conn.close()
     except Exception as e:
         print(f"Webhook error: {e}")
@@ -1713,7 +1800,7 @@ REGRAS:
 - Não invente informações sobre produtos ou preços
 - Se não souber, diga que vai verificar
 - Horário: {user['business_hours']}
-- Se o cliente enviar áudio, você receberá a transcrição
+- Se o cliente enviar áudio, você receberá a transcrição. Responda de forma conversacional e natural, como se estivesse falando (a resposta será convertida em áudio)
 - Se o cliente enviar imagem, você receberá a descrição da imagem
 - Se o cliente enviar PDF, você receberá o texto extraído
 """
@@ -1765,6 +1852,88 @@ def send_whatsapp_message(phone_id, token, to, message):
         print(f"[WA SEND] EXCEÇÃO: {e}")
 
 
+def text_to_audio(text, output_path=None):
+    """Converte texto em áudio usando Edge TTS (grátis)"""
+    try:
+        import asyncio
+        import edge_tts
+
+        if not output_path:
+            output_path = os.path.join(MEDIA_FOLDER, f"tts_{secrets.token_hex(8)}.mp3")
+
+        async def _generate():
+            voice = "pt-BR-AntonioNeural"  # Voz masculina BR natural
+            communicate = edge_tts.Communicate(text, voice, rate="+5%")
+            await communicate.save(output_path)
+
+        # Roda async no sync context
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    pool.submit(lambda: asyncio.run(_generate())).result(timeout=30)
+            else:
+                loop.run_until_complete(_generate())
+        except RuntimeError:
+            asyncio.run(_generate())
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"[TTS] Áudio gerado: {output_path} ({os.path.getsize(output_path)} bytes)")
+            return output_path
+        print("[TTS] Arquivo gerado vazio")
+        return None
+    except Exception as e:
+        print(f"[TTS] Erro: {e}")
+        return None
+
+
+def upload_whatsapp_media(phone_id, token, filepath, mime_type="audio/mpeg"):
+    """Faz upload de mídia para o WhatsApp e retorna o media_id"""
+    try:
+        import requests as req
+        url = f"https://graph.facebook.com/v18.0/{phone_id}/media"
+        headers = {"Authorization": f"Bearer {token}"}
+        with open(filepath, "rb") as f:
+            files = {"file": (os.path.basename(filepath), f, mime_type)}
+            data = {"messaging_product": "whatsapp", "type": mime_type}
+            resp = req.post(url, headers=headers, files=files, data=data, timeout=30)
+        if resp.status_code == 200:
+            media_id = resp.json().get("id", "")
+            print(f"[WA UPLOAD] Mídia enviada: {media_id}")
+            return media_id
+        else:
+            print(f"[WA UPLOAD] Erro: {resp.status_code} {resp.text[:200]}")
+            return None
+    except Exception as e:
+        print(f"[WA UPLOAD] Exceção: {e}")
+        return None
+
+
+def send_whatsapp_audio(phone_id, token, to, audio_path):
+    """Envia áudio pelo WhatsApp"""
+    media_id = upload_whatsapp_media(phone_id, token, audio_path, "audio/mpeg")
+    if not media_id:
+        print("[WA AUDIO] Falha no upload, enviando como texto")
+        return False
+    try:
+        import requests as req
+        url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {"messaging_product": "whatsapp", "to": to, "type": "audio", "audio": {"id": media_id}}
+        resp = req.post(url, headers=headers, json=payload, timeout=15)
+        print(f"[WA AUDIO] Status: {resp.status_code}")
+        if resp.status_code == 200:
+            print(f"[WA AUDIO] Áudio enviado para {to}!")
+            return True
+        else:
+            print(f"[WA AUDIO] Erro: {resp.text[:200]}")
+            return False
+    except Exception as e:
+        print(f"[WA AUDIO] Exceção: {e}")
+        return False
+
+
 # ═══════════════════════════════════════════════════════════════
 #  PAINEL ADMINISTRATIVO (DONO DO SISTEMA)
 # ═══════════════════════════════════════════════════════════════
@@ -1776,6 +1945,8 @@ def admin_login():
     if request.method == "POST":
         if not check_rate_limit(client_ip):
             error = "Muitas tentativas. Aguarde 5 minutos."
+        elif not ADMIN_PASSWORD:
+            error = "ADMIN_PASSWORD não configurada. Defina no Railway → Variables."
         elif request.form.get("email") == ADMIN_EMAIL and request.form.get("password") == ADMIN_PASSWORD:
             reset_login_attempts(client_ip)
             session["is_admin"] = True
@@ -1790,7 +1961,7 @@ def admin_login():
 <div class="auth-container"><div class="auth-card" style="border-top:3px solid var(--red)">
     <div style="text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"><span class="admin-badge" style="margin-left:8px;vertical-align:middle">ADMIN</span></div>
     <h2>Painel Administrativo</h2>{alert}
-    <form method="POST">
+    <form method="POST">{csrf_field()}
     <div class="form-group"><label class="form-label">Email admin</label><input type="email" name="email" class="form-input" required></div>
     <div class="form-group"><label class="form-label">Senha</label><input type="password" name="password" class="form-input" required></div>
     <button type="submit" class="btn btn-primary btn-block btn-lg" style="background:var(--red)">Entrar no Admin</button></form>
@@ -2051,7 +2222,7 @@ def admin_api_settings():
     content = f"""<div class="container">
         <div class="page-header fade-in"><h1>Configurações de API 🔑</h1><p>Configure todas as chaves de API do sistema</p></div>
         {msg}
-        <form method="POST">
+        <form method="POST">{csrf_field()}
         <div class="grid-2">
             <div class="card fade-in fade-in-1">
                 <div class="card-header"><span class="card-title">IA e Transcrição</span></div>
@@ -2101,7 +2272,7 @@ def admin_api_settings():
 
         <div class="card fade-in fade-in-3" style="margin-top:32px">
             <div class="card-header"><span class="card-title">Email (Resend) — Verificação de conta</span></div>
-            <form method="POST">
+            <form method="POST">{csrf_field()}
             <div class="grid-2">
                 <div class="form-group">
                     <label class="form-label">Resend API Key</label>
@@ -2173,4 +2344,4 @@ if __name__ == "__main__":
     print(f"  🎤 Groq (Áudio):   {'✅ Configurada' if get_setting('GROQ_API_KEY') else '❌ Configure no admin → APIs'}")
     print(f"  🎤 OpenAI (Áudio): {'✅ Configurada' if get_setting('OPENAI_API_KEY') else '⬜ Opcional (fallback)'}")
     print("="*60 + "\n")
-    app.run(debug=True, host="0.0.0.0", port=port)
+    app.run(debug=os.getenv("FLASK_ENV")=="development", host="0.0.0.0", port=port)

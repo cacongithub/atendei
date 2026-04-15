@@ -1077,9 +1077,14 @@ def landing():
     </div>
 
     <footer style="text-align:center;padding:40px 24px;border-top:1px solid rgba(255,255,255,0.06);color:var(--text3);font-size:13px">
-        <p>© 2026 atendente.online — Todos os direitos reservados</p>
-        <p style="margin-top:8px"><a href="/privacy">Política de Privacidade</a> · <a href="/terms">Termos de Serviço</a></p>
+    <p>© 2026 atendente.online — Todos os direitos reservados</p>
+    <p style="margin-top:8px"><a href="/privacy">Política de Privacidade</a> · <a href="/terms">Termos de Serviço</a></p>
+    <p style="margin-top:12px;font-size:11px;color:#475569">Desenvolvido por Clériston Almeida Capistrano</p>
     </footer>"""
+
+
+
+  
     return base_html("Atendente IA para WhatsApp", content)
 
 

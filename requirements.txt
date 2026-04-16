@@ -7,3 +7,4 @@ pdfplumber>=0.10
 edge-tts>=6.1
 cryptography>=42.0
 redis>=5.0
+openpyxl>=3.1

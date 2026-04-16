@@ -2239,27 +2239,65 @@ def fetch_weather(message):
     """Busca previsão do tempo usando Open-Meteo (grátis, sem API key, confiável)"""
     try:
         import requests as req
-        # Extrai nome da cidade da mensagem
-        msg_lower = message.lower()
-        remove_words = ["como", "está", "esta", "qual", "tempo", "clima", "temperatura", "previsão",
-                       "previsao", "chuva", "chover", "vai", "hoje", "amanhã", "amanha",
-                       "em", "de", "do", "da", "no", "na", "para", "o", "a", "é", "e",
-                       "frio", "calor", "quente", "agora", "aqui", "lá", "la", "tá", "ta",
-                       "mensagem", "áudio", "audio", "cliente", "faz", "fazer",
-                       "me", "diga", "fala", "saber", "dizer", "ver", "posso",
-                       "qualé", "quale", "que", "tal"]
-
-        # Limpa pontuação
         import re as re_mod
-        msg_clean = re_mod.sub(r'[?!.,;:]', '', msg_lower)
-        words = msg_clean.split()
-        city_words = [w for w in words if w not in remove_words and len(w) > 2]
-        city = " ".join(city_words).strip()
+
+        msg_lower = message.lower()
+        # Remove prefixo [MENSAGEM DE ÁUDIO DO CLIENTE]: se presente
+        msg_lower = re_mod.sub(r'^\[.*?\]:\s*', '', msg_lower)
+        # Remove pontuação
+        msg_clean = re_mod.sub(r'[?!.,;:]', ' ', msg_lower)
+
+        # Estratégia 1: pega o que vem DEPOIS de "em", "para", "de", "no", "na"
+        # Procura nomes de cidade evitando palavras-chave de clima
+        patterns = [
+            r'(?:em|para|de|do|na|no)\s+(?!tempo|clima|previs|chuva|temp|calor|frio)([a-záàâãéèêíïóôõöúçñ\s]+?)(?:\s+(?:hoje|amanhã|agora|$))',
+            r'(?:em|para|de|do|na|no)\s+(?!tempo|clima|previs|chuva|temp|calor|frio)([a-záàâãéèêíïóôõöúçñ\s]+?)$',
+        ]
+        city = ""
+        for pat in patterns:
+            match = re_mod.search(pat, msg_clean)
+            if match:
+                city = match.group(1).strip()
+                # Remove palavras sobrando
+                stop_words = {"hoje", "amanhã", "amanha", "agora", "aqui", "lá", "la", "aí", "ai"}
+                city_words = [w for w in city.split() if w not in stop_words and len(w) > 2]
+                city = " ".join(city_words).strip()
+                if city:
+                    break
+
+        # Estratégia 2: pega a última palavra significativa (maiúscula no original = nome próprio)
+        if not city:
+            words_original = message.split()
+            # Procura palavras que começam com maiúscula (sem contar início de frase)
+            proper_nouns = []
+            for i, w in enumerate(words_original):
+                w_clean = re_mod.sub(r'[?!.,;:]', '', w)
+                if w_clean and w_clean[0].isupper() and i > 0:
+                    proper_nouns.append(w_clean.lower())
+            if proper_nouns:
+                city = proper_nouns[-1]  # última palavra própria
+
+        # Estratégia 3: fallback com remoção de palavras comuns
+        if not city:
+            remove_words = {"como", "está", "esta", "qual", "tempo", "clima", "temperatura", "previsão",
+                           "previsao", "chuva", "chover", "vai", "hoje", "amanhã", "amanha",
+                           "em", "de", "do", "da", "no", "na", "para", "o", "a", "é", "e",
+                           "frio", "calor", "quente", "agora", "aqui", "lá", "la", "tá", "ta",
+                           "mensagem", "áudio", "audio", "cliente", "faz", "fazer",
+                           "me", "diga", "fala", "saber", "dizer", "ver", "posso",
+                           "qualé", "quale", "que", "tal", "eu", "você", "voce",
+                           "queria", "quero", "gostaria", "amigo", "amiga", "por", "favor",
+                           "obrigado", "obrigada", "oi", "olá"}
+            words = msg_clean.split()
+            city_words = [w for w in words if w not in remove_words and len(w) > 2]
+            # Pega apenas a última palavra (geralmente é o nome da cidade)
+            if city_words:
+                city = city_words[-1]
 
         if not city:
             city = "Fortaleza"
 
-        print(f"[WEATHER] Buscando cidade: {city}")
+        print(f"[WEATHER] Cidade extraída: '{city}'")
 
         # 1. Geocodificação: converte nome → coordenadas
         geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=pt&format=json"
@@ -2279,9 +2317,8 @@ def fetch_weather(message):
         lon = loc.get("longitude")
         city_name = loc.get("name", city)
         country = loc.get("country", "")
-        admin1 = loc.get("admin1", "")  # Estado/Província
+        admin1 = loc.get("admin1", "")
 
-        # 2. Busca clima atual + previsão
         weather_url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
@@ -2309,7 +2346,6 @@ def fetch_weather(message):
         min_temp = daily.get("temperature_2m_min", [None])[0]
         rain_prob = daily.get("precipitation_probability_max", [None])[0]
 
-        # Mapeia código WMO para descrição em PT-BR
         desc = _weather_code_to_pt(wcode, is_day)
 
         location = f"{city_name}"

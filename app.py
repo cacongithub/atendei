@@ -1802,6 +1802,131 @@ def quick_replies():
 
 
 # ─── SETTINGS ──────────────────────────────────────────────────
+def upload_whatsapp_profile_photo(phone_id, token, image_bytes, mime_type="image/jpeg"):
+    """Atualiza a foto de perfil do WhatsApp Business via API da Meta"""
+    if not phone_id or not token:
+        return False, "Phone ID ou Token não configurados"
+
+    try:
+        import requests as req
+
+        # Passo 1: Iniciar sessão de upload resumível
+        session_url = "https://graph.facebook.com/v18.0/app/uploads"
+        session_headers = {
+            "Authorization": f"OAuth {token}",
+        }
+        session_params = {
+            "file_length": str(len(image_bytes)),
+            "file_type": mime_type,
+            "access_token": token,
+        }
+        session_resp = req.post(session_url, headers=session_headers, params=session_params, timeout=15)
+
+        if session_resp.status_code != 200:
+            # Método alternativo: upload direto via /{phone-number-ID}
+            print(f"[PHOTO] Sessão falhou ({session_resp.status_code}), tentando upload direto...")
+            # Upload direto da foto usando profile_photo_handle
+            files = {"file": ("photo.jpg", image_bytes, mime_type)}
+            data = {
+                "messaging_product": "whatsapp",
+            }
+            headers_direct = {"Authorization": f"Bearer {token}"}
+
+            # Tenta fazer upload via /media
+            media_url = f"https://graph.facebook.com/v18.0/{phone_id}/media"
+            media_resp = req.post(media_url, headers=headers_direct, files=files, data=data, timeout=30)
+            if media_resp.status_code != 200:
+                return False, f"Upload falhou: {media_resp.status_code} {media_resp.text[:200]}"
+            media_id = media_resp.json().get("id", "")
+
+            # Atualiza perfil com media_id
+            profile_url = f"https://graph.facebook.com/v18.0/{phone_id}/whatsapp_business_profile"
+            profile_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            profile_data = {
+                "messaging_product": "whatsapp",
+                "profile_picture_handle": media_id,
+            }
+            profile_resp = req.post(profile_url, headers=profile_headers, json=profile_data, timeout=15)
+            if profile_resp.status_code == 200:
+                return True, "Foto atualizada com sucesso!"
+            return False, f"Erro ao definir perfil: {profile_resp.status_code} {profile_resp.text[:200]}"
+
+        # Sessão criada - continua upload
+        upload_session_id = session_resp.json().get("id", "")
+
+        # Passo 2: Upload dos bytes
+        upload_url = f"https://graph.facebook.com/v18.0/{upload_session_id}"
+        upload_headers = {
+            "Authorization": f"OAuth {token}",
+            "file_offset": "0",
+        }
+        upload_resp = req.post(upload_url, headers=upload_headers, data=image_bytes, timeout=30)
+
+        if upload_resp.status_code != 200:
+            return False, f"Upload falhou: {upload_resp.status_code}"
+
+        upload_handle = upload_resp.json().get("h", "")
+
+        # Passo 3: Atualizar perfil do WhatsApp com o handle
+        profile_url = f"https://graph.facebook.com/v18.0/{phone_id}/whatsapp_business_profile"
+        profile_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        profile_data = {
+            "messaging_product": "whatsapp",
+            "profile_picture_handle": upload_handle,
+        }
+        profile_resp = req.post(profile_url, headers=profile_headers, json=profile_data, timeout=15)
+
+        if profile_resp.status_code == 200:
+            return True, "Foto de perfil atualizada com sucesso!"
+        return False, f"Erro ao definir perfil: {profile_resp.text[:200]}"
+
+    except Exception as e:
+        return False, f"Exceção: {str(e)}"
+
+
+@app.route("/dashboard/settings/upload-photo", methods=["POST"])
+@login_required
+def upload_profile_photo():
+    """Endpoint para upload de foto de perfil do WhatsApp"""
+    user = g.user
+    if not user["whatsapp_phone_id"] or not user["whatsapp_token"]:
+        return redirect("/dashboard/settings?photo_error=" + "Configure%20Phone%20ID%20e%20Token%20primeiro")
+
+    if "photo" not in request.files:
+        return redirect("/dashboard/settings?photo_error=" + "Nenhum%20arquivo%20enviado")
+
+    file = request.files["photo"]
+    if file.filename == "":
+        return redirect("/dashboard/settings?photo_error=" + "Arquivo%20vazio")
+
+    # Valida tipo
+    allowed_types = {"image/jpeg", "image/png", "image/jpg"}
+    if file.content_type not in allowed_types:
+        return redirect("/dashboard/settings?photo_error=" + "Apenas%20JPG%20ou%20PNG")
+
+    # Lê bytes
+    image_bytes = file.read()
+    if len(image_bytes) > 5 * 1024 * 1024:
+        return redirect("/dashboard/settings?photo_error=" + "M%C3%A1ximo%205MB")
+
+    if len(image_bytes) < 100:
+        return redirect("/dashboard/settings?photo_error=" + "Arquivo%20muito%20pequeno")
+
+    # Upload para o Meta
+    success, message = upload_whatsapp_profile_photo(
+        user["whatsapp_phone_id"],
+        user["whatsapp_token"],
+        image_bytes,
+        file.content_type
+    )
+
+    if success:
+        return redirect("/dashboard/settings?photo_ok=" + "Foto%20atualizada!")
+    else:
+        import urllib.parse
+        return redirect("/dashboard/settings?photo_error=" + urllib.parse.quote(message))
+
+
 @app.route("/dashboard/settings", methods=["GET","POST"])
 @login_required
 def settings():
@@ -1813,6 +1938,15 @@ def settings():
              request.form.get("name","").strip(), request.form.get("company","").strip(), request.form.get("phone","").strip(), user["id"]))
         db.commit(); msg = '<div class="alert alert-success">Configurações salvas!</div>'
         user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+
+    # Mensagens de foto
+    photo_ok = request.args.get("photo_ok", "")
+    photo_error = request.args.get("photo_error", "")
+    photo_msg = ""
+    if photo_ok:
+        photo_msg = f'<div class="alert alert-success">✅ {esc(photo_ok)}</div>'
+    elif photo_error:
+        photo_msg = f'<div class="alert alert-error">❌ {esc(photo_error)}</div>'
 
     base = get_setting("BASE_URL", BASE_URL)
     wa_verify = get_setting("WHATSAPP_VERIFY_TOKEN", WHATSAPP_VERIFY_TOKEN)
@@ -1827,7 +1961,7 @@ def settings():
     u_wa_token = esc(user['whatsapp_token'] or '')
     e_webhook = esc(webhook_url)
     e_verify = esc(wa_verify)
-    content = f"""<div class="container"><div class="page-header fade-in"><h1>Configurações ⚙️</h1></div>{msg}
+    content = f"""<div class="container"><div class="page-header fade-in"><h1>Configurações ⚙️</h1></div>{msg}{photo_msg}
         <div class="grid-2"><div class="card fade-in fade-in-1"><div class="card-header"><span class="card-title">Perfil e WhatsApp</span></div>
             <form method="POST">{csrf_field()}
             <div class="form-group"><label class="form-label">Nome</label><input type="text" name="name" class="form-input" value="{u_name}"></div>
@@ -1838,6 +1972,20 @@ def settings():
             <div class="form-group"><label class="form-label">WhatsApp Phone ID</label><input type="text" id="wp_phone_id" name="whatsapp_phone_id" class="form-input" value="{u_wa_id}" placeholder="Cole aqui o Phone Number ID" autocomplete="off" style="background:#2a2a3a;border:2px solid #00c896;color:#fff;cursor:text"></div>
             <div class="form-group"><label class="form-label">WhatsApp Token</label><input type="text" id="wp_token" name="whatsapp_token" class="form-input" value="{u_wa_token}" placeholder="Cole aqui o Access Token" autocomplete="off" style="background:#2a2a3a;border:2px solid #00c896;color:#fff;cursor:text"></div>
             <button type="submit" class="btn btn-primary">Salvar</button></form>
+
+            <div style="margin-top:24px;padding-top:24px;border-top:1px solid rgba(255,255,255,0.06)">
+                <h3 style="font-size:16px;margin-bottom:12px;color:var(--text)">📷 Foto do WhatsApp</h3>
+                <p style="color:var(--text3);font-size:13px;margin-bottom:12px">Envie uma foto JPG ou PNG (máx 5MB) para aparecer como foto de perfil do atendente no WhatsApp.</p>
+                <form method="POST" action="/dashboard/settings/upload-photo" enctype="multipart/form-data">{csrf_field()}
+                    <div class="form-group">
+                        <input type="file" name="photo" accept="image/jpeg,image/png,image/jpg" required
+                            style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08);padding:10px;border-radius:8px;color:var(--text);width:100%">
+                    </div>
+                    <button type="submit" class="btn btn-primary" style="background:#00c896">📤 Enviar foto</button>
+                </form>
+                <p style="color:var(--text3);font-size:12px;margin-top:8px">⚠️ Requer Phone ID e Token configurados acima.</p>
+            </div>
+
             <script nonce="{g.csp_nonce}">
             document.addEventListener('DOMContentLoaded', function() {{
                 ['wp_phone_id','wp_token'].forEach(function(id) {{

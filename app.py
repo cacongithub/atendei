@@ -23,12 +23,67 @@ Rodar:
 """
 
 import os, json, sqlite3, hashlib, secrets, time, re, base64, tempfile, io, random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import (
     Flask, request, jsonify, redirect, url_for,
     session, g, make_response, abort, send_file
 )
+from markupsafe import escape as html_escape
+
+
+def esc(text):
+    """Escape HTML para prevenir XSS. Retorna string vazia se None."""
+    if text is None:
+        return ""
+    return str(html_escape(str(text)))
+
+
+# Fuso horário de Brasília (UTC-3)
+BRAZIL_TZ = timezone(timedelta(hours=-3))
+
+def to_br_time(utc_str, fmt="%H:%M"):
+    """Converte string de UTC (formato SQLite 'YYYY-MM-DD HH:MM:SS') para horário de Brasília"""
+    if not utc_str:
+        return ""
+    try:
+        # SQLite datetime('now') retorna 'YYYY-MM-DD HH:MM:SS' em UTC
+        if "T" in utc_str:
+            # ISO format
+            dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+        else:
+            dt = datetime.strptime(utc_str[:19], "%Y-%m-%d %H:%M:%S")
+        # Marca como UTC e converte para Brasília
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        br_dt = dt.astimezone(BRAZIL_TZ)
+        return br_dt.strftime(fmt)
+    except Exception:
+        return utc_str[:16] if len(utc_str) >= 16 else utc_str
+
+
+def to_br_date(utc_str):
+    """Converte UTC para data DD/MM/YYYY em horário de Brasília"""
+    return to_br_time(utc_str, "%d/%m/%Y")
+
+
+def to_br_datetime(utc_str):
+    """Converte UTC para data + hora no formato brasileiro"""
+    return to_br_time(utc_str, "%d/%m/%Y %H:%M")
+
+
+def csv_safe(value):
+    """Previne CSV Injection - escapa valores que começam com =, +, -, @, tab, CR"""
+    if value is None:
+        return ""
+    s = str(value)
+    # Escape dos caracteres perigosos
+    if s and s[0] in ('=', '+', '-', '@', '\t', '\r'):
+        s = "'" + s
+    # Escape de aspas e quebras
+    if '"' in s or ',' in s or '\n' in s or '\r' in s:
+        s = '"' + s.replace('"', '""') + '"'
+    return s
 
 # ─── CONFIG ────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -50,6 +105,14 @@ MEDIA_FOLDER = "media_files"
 
 os.makedirs(MEDIA_FOLDER, exist_ok=True)
 
+# ─── LOGGING ──────────────────────────────────────────────────
+DEBUG_MODE = os.getenv("FLASK_ENV", "").lower() == "development" or os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
+
+def log_debug(msg):
+    """Log só em modo debug/dev"""
+    if DEBUG_MODE:
+        print(msg)
+
 # ─── FORCE HTTPS ───────────────────────────────────────────────
 @app.before_request
 def force_https():
@@ -60,6 +123,38 @@ def force_https():
 # ─── SECURITY ──────────────────────────────────────────────────
 login_attempts = {}  # {ip: {"count": n, "last": timestamp}}
 
+# ─── RATE LIMITING ─────────────────────────────────────────────
+# Usa Redis se disponível (suporta múltiplos workers), senão fallback para memória
+_redis_client = None
+login_attempts = {}  # fallback em memória
+
+def _get_redis():
+    """Retorna cliente Redis se REDIS_URL configurado, senão None"""
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client if _redis_client != "disabled" else None
+    redis_url = os.getenv("REDIS_URL", "")
+    if not redis_url:
+        _redis_client = "disabled"
+        return None
+    try:
+        import redis
+        _redis_client = redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=2, socket_connect_timeout=2)
+        _redis_client.ping()
+        print("[REDIS] Conectado com sucesso — rate limit distribuído ativo")
+        return _redis_client
+    except Exception as e:
+        print(f"[REDIS] Falha ao conectar ({e}) — usando rate limit em memória")
+        _redis_client = "disabled"
+        return None
+
+
+@app.before_request
+def generate_nonce():
+    """Gera nonce CSP único por request para scripts inline"""
+    g.csp_nonce = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
+
+
 @app.after_request
 def add_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -67,12 +162,42 @@ def add_security_headers(response):
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    # Content Security Policy
+    # Nota: 'unsafe-inline' em script-src + nonce permite handlers inline (onclick/onkeydown)
+    # usados nos templates atuais. Ainda bloqueia eval() e scripts dinâmicos.
+    # Para uma CSP ainda mais forte, seria preciso refatorar handlers inline para addEventListener.
+    nonce = getattr(g, 'csp_nonce', '')
+    csp = (
+        "default-src 'self'; "
+        f"script-src 'self' 'unsafe-inline' 'nonce-{nonce}'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
+        "img-src 'self' data: https:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "object-src 'none'"
+    )
+    response.headers['Content-Security-Policy'] = csp
     if request.is_secure:
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
 
 def check_rate_limit(ip, max_attempts=5, window=300):
-    """Bloqueia login após 5 tentativas em 5 minutos"""
+    """Bloqueia login após 5 tentativas em 5 minutos. Usa Redis se disponível."""
+    r = _get_redis()
+    if r:
+        try:
+            key = f"ratelimit:login:{ip}"
+            count = r.get(key)
+            if count and int(count) >= max_attempts:
+                return False
+            return True
+        except Exception as e:
+            print(f"[REDIS] Erro no check: {e}")
+            # Fallback para memória
+    # Fallback: memória local
     now = time.time()
     if ip in login_attempts:
         data = login_attempts[ip]
@@ -83,14 +208,35 @@ def check_rate_limit(ip, max_attempts=5, window=300):
             return False
     return True
 
-def record_login_attempt(ip):
+
+def record_login_attempt(ip, window=300):
+    r = _get_redis()
+    if r:
+        try:
+            key = f"ratelimit:login:{ip}"
+            pipe = r.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, window)
+            pipe.execute()
+            return
+        except Exception as e:
+            print(f"[REDIS] Erro no record: {e}")
+    # Fallback memória
     now = time.time()
     if ip not in login_attempts:
         login_attempts[ip] = {"count": 0, "last": now}
     login_attempts[ip]["count"] += 1
     login_attempts[ip]["last"] = now
 
+
 def reset_login_attempts(ip):
+    r = _get_redis()
+    if r:
+        try:
+            r.delete(f"ratelimit:login:{ip}")
+            return
+        except Exception:
+            pass
     if ip in login_attempts:
         del login_attempts[ip]
 
@@ -254,6 +400,109 @@ def init_db():
     db.close()
 
 
+def _get_fernet():
+    """Retorna instância Fernet derivada do SECRET_KEY (cacheada)"""
+    if not hasattr(_get_fernet, "_instance"):
+        try:
+            from cryptography.fernet import Fernet
+            import hashlib as _h
+            secret = os.getenv("SECRET_KEY") or (app.secret_key if isinstance(app.secret_key, str) else app.secret_key.decode('utf-8', errors='ignore'))
+            if not secret:
+                secret = "fallback-key-please-set-SECRET_KEY"
+            key_bytes = _h.sha256(secret.encode()).digest()
+            fernet_key = base64.urlsafe_b64encode(key_bytes)
+            _get_fernet._instance = Fernet(fernet_key)
+        except ImportError:
+            _get_fernet._instance = None
+    return _get_fernet._instance
+
+
+def _assert_crypto_available():
+    """Em produção, criptografia é OBRIGATÓRIA. Se cryptography não está instalada, falha."""
+    is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+    if _get_fernet() is None and not is_dev:
+        raise RuntimeError(
+            "[CRITICAL] biblioteca 'cryptography' não instalada em produção. "
+            "Segredos não podem ser salvos em texto puro. "
+            "Instale com: pip install cryptography>=42.0 "
+            "ou defina FLASK_ENV=development para testes locais."
+        )
+
+
+def _encrypt_value(plaintext):
+    """Criptografa valor usando Fernet (AES-128-CBC + HMAC-SHA256). Falha em produção se cryptography não instalada."""
+    if not plaintext:
+        return ""
+    fernet = _get_fernet()
+    if not fernet:
+        _assert_crypto_available()
+        # Se chegou aqui, está em dev explícito — permite fallback com aviso
+        print("[CRYPTO] ⚠️ AVISO DEV: salvando em texto puro (cryptography não instalada)")
+        return plaintext
+    try:
+        token = fernet.encrypt(plaintext.encode('utf-8'))
+        return f"fer:v1:{token.decode('ascii')}"
+    except Exception as e:
+        print(f"[CRYPTO] Erro ao criptografar: {e}")
+        _assert_crypto_available()
+        return plaintext
+
+
+def _decrypt_value(encrypted):
+    """Descriptografa valor Fernet. Aceita formato antigo e novo."""
+    if not encrypted or not isinstance(encrypted, str):
+        return encrypted
+    # Formato novo (Fernet)
+    if encrypted.startswith("fer:v1:"):
+        fernet = _get_fernet()
+        if not fernet:
+            return ""
+        try:
+            return fernet.decrypt(encrypted[7:].encode('ascii')).decode('utf-8')
+        except Exception as e:
+            print(f"[CRYPTO] Erro ao descriptografar Fernet: {e}")
+            return ""
+    # Formato antigo (XOR custom — compatibilidade com dados antigos)
+    if encrypted.startswith("enc:v1:"):
+        return _decrypt_legacy(encrypted)
+    # Texto puro (ainda não criptografado)
+    return encrypted
+
+
+def _decrypt_legacy(encrypted):
+    """Descriptografa formato antigo (XOR + HMAC) para migração"""
+    try:
+        import hmac
+        secret = os.getenv("SECRET_KEY", "") or (app.secret_key if isinstance(app.secret_key, str) else "")
+        if isinstance(secret, str):
+            secret = secret.encode()
+        key = hashlib.sha256(secret or b"default-key").digest()
+        blob = base64.b64decode(encrypted[7:])
+        iv = blob[:16]
+        mac_received = blob[-32:]
+        ciphertext = blob[16:-32]
+        mac_expected = hmac.new(key, iv + ciphertext, hashlib.sha256).digest()
+        if not hmac.compare_digest(mac_received, mac_expected):
+            return ""
+        keystream = b""
+        counter = 0
+        while len(keystream) < len(ciphertext):
+            keystream += hashlib.sha256(key + iv + counter.to_bytes(4, 'big')).digest()
+            counter += 1
+        plaintext = bytes(a ^ b for a, b in zip(ciphertext, keystream[:len(ciphertext)]))
+        return plaintext.decode('utf-8')
+    except Exception:
+        return ""
+
+
+# Chaves/tokens que precisam ser criptografados no banco
+SENSITIVE_SETTINGS = {
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY",
+    "MERCADOPAGO_ACCESS_TOKEN", "RESEND_API_KEY",
+    "WHATSAPP_APP_SECRET", "SMTP_PASSWORD"
+}
+
+
 def get_setting(key, default=""):
     """Busca config do banco, se não existir usa variável de ambiente"""
     try:
@@ -261,16 +510,22 @@ def get_setting(key, default=""):
         row = db_conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
         db_conn.close()
         if row and row[0]:
-            return row[0]
+            value = row[0]
+            # Descriptografa se for campo sensível
+            if key in SENSITIVE_SETTINGS:
+                value = _decrypt_value(value)
+            return value
     except:
         pass
     return os.getenv(key, default)
 
 
 def set_setting(key, value):
-    """Salva config no banco"""
+    """Salva config no banco. Criptografa se for campo sensível."""
+    # Criptografa campos sensíveis antes de salvar
+    stored_value = _encrypt_value(value) if key in SENSITIVE_SETTINGS else value
     db_conn = sqlite3.connect(DATABASE)
-    db_conn.execute("INSERT OR REPLACE INTO system_settings (key, value) VALUES (?, ?)", (key, value))
+    db_conn.execute("INSERT OR REPLACE INTO system_settings (key, value) VALUES (?, ?)", (key, stored_value))
     db_conn.commit()
     db_conn.close()
 
@@ -362,13 +617,17 @@ def csrf_field():
 @app.before_request
 def csrf_protect():
     if request.method == "POST":
-        # Skip CSRF for webhooks (external services)
-        if request.path.startswith('/webhook/') or request.path.startswith('/api/mercadopago/webhook'):
+        # Endpoints externos (webhooks de Meta/Mercado Pago) validam autenticidade por outros meios
+        public_webhooks = [
+            '/webhook/',
+            '/api/mercadopago/webhook',
+        ]
+        if any(request.path.startswith(p) for p in public_webhooks):
             return
+
+        # Verifica CSRF token
         token = request.form.get('_csrf_token') or request.headers.get('X-CSRF-Token')
         if not token or token != session.get('_csrf_token'):
-            if request.path.startswith('/api/'):
-                return  # Skip for internal AJAX
             abort(403)
 
 def hash_password(pw):
@@ -1305,33 +1564,68 @@ def conversations():
     for c in convos:
         if not first_id: first_id = c["id"]
         active = "active" if c["id"] == first_id else ""
-        sidebar_items += f'<div class="chat-item {active}" onclick="loadConversation({c["id"]},this)"><span class="chat-item-time">{(c["last_message_at"] or "")[:10]}</span><div class="chat-item-name">{c["customer_name"] or c["customer_phone"]}</div><div class="chat-item-preview">{(c["last_msg"] or "Sem mensagens")[:50]}</div></div>'
+        name = esc(c["customer_name"] or c["customer_phone"])
+        preview = esc((c["last_msg"] or "Sem mensagens")[:50])
+        date = esc(to_br_date(c["last_message_at"]))
+        sidebar_items += f'<div class="chat-item {active}" onclick="loadConversation({int(c["id"])},this)"><span class="chat-item-time">{date}</span><div class="chat-item-name">{name}</div><div class="chat-item-preview">{preview}</div></div>'
 
     if first_id:
         messages = db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (first_id,)).fetchall()
         for m in messages:
             cls = "msg-bot" if m["sender"]=="bot" else "msg-customer"
-            media_tag = f'<div class="msg-media">{m["msg_type"]}</div>' if m["msg_type"] not in ("text","") else ""
-            msgs_html += f'<div class="msg {cls}">{m["content"]}{media_tag}<div class="msg-time">{(m["created_at"] or "")[11:16]}</div></div>'
+            content = esc(m["content"])
+            msg_type = esc(m["msg_type"])
+            media_tag = f'<div class="msg-media">{msg_type}</div>' if m["msg_type"] not in ("text","") else ""
+            time_str = esc(to_br_time(m["created_at"]))
+            msgs_html += f'<div class="msg {cls}">{content}{media_tag}<div class="msg-time">{time_str}</div></div>'
 
     if not convos:
         return base_html("Conversas", '<div class="container"><div class="card"><div class="empty-state"><div class="icon">💬</div><h3>Nenhuma conversa ainda</h3><p>As conversas aparecerão aqui quando clientes enviarem mensagens.</p></div></div></div>', dict(user))
 
-    content = f"""<div class="container"><div class="page-header"><h1>Conversas <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--green2);font-weight:500;background:rgba(0,200,150,0.1);padding:4px 12px;border-radius:20px;vertical-align:middle"><span style="width:8px;height:8px;border-radius:50%;background:var(--green2);display:inline-block;animation:pulse 2s infinite"></span> ao vivo</span></h1><p>{len(convos)} conversas</p></div>
+    first_name = esc(convos[0]['customer_name'] or convos[0]['customer_phone'])
+    first_phone = esc(convos[0]['customer_phone'])
+    content = f"""<div class="container"><div class="page-header"><h1>Conversas <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--green2);font-weight:500;background:rgba(0,200,150,0.1);padding:4px 12px;border-radius:20px;vertical-align:middle"><span style="width:8px;height:8px;border-radius:50%;background:var(--green2);display:inline-block;animation:pulse 2s infinite"></span> ao vivo</span></h1><p>{len(convos)} conversas <a href="/dashboard/conversations/export" class="btn btn-sm btn-secondary" style="margin-left:12px">📥 Exportar CSV</a></p></div>
     <style>@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:0.3}}}}</style>
         <div class="chat-container"><div class="chat-sidebar"><div class="chat-sidebar-header">
             <input type="text" class="form-input" placeholder="Buscar..." style="font-size:13px;padding:8px 12px" oninput="filterChats(this.value)">
             </div><div id="chat-list">{sidebar_items}</div></div>
-            <div class="chat-main"><div class="chat-header"><div><strong id="chat-name">{convos[0]['customer_name'] or convos[0]['customer_phone']}</strong>
-                <span style="color:var(--text3);font-size:12px" id="chat-phone">{convos[0]['customer_phone']}</span></div>
-                <button class="btn btn-secondary btn-sm" onclick="toggleHuman()">🙋 Assumir</button></div>
+            <div class="chat-main"><div class="chat-header"><div><strong id="chat-name">{first_name}</strong>
+                <span style="color:var(--text3);font-size:12px" id="chat-phone">{first_phone}</span></div>
+                <div><a href="/dashboard/conversations/{first_id}/export" class="btn btn-sm btn-secondary" style="margin-right:8px">📥 Exportar</a>
+                <button class="btn btn-secondary btn-sm" onclick="toggleHuman()">🙋 Assumir</button></div></div>
                 <div class="chat-messages" id="chat-messages">{msgs_html}</div>
                 <div style="padding:16px 24px;border-top:1px solid rgba(255,255,255,0.06);display:flex;gap:8px">
                     <input type="text" class="form-input" id="msg-input" placeholder="Digite..." style="flex:1" onkeydown="if(event.key==='Enter')sendMsg()">
                     <button class="btn btn-primary" onclick="sendMsg()">Enviar</button></div></div></div></div>
-    <script>
+    <script nonce="{g.csp_nonce}">
     let activeConvId = {first_id or 0};
     let lastMsgCount = 0;
+
+    function formatBrTime(utcStr){{
+        // Converte 'YYYY-MM-DD HH:MM:SS' (UTC) para HH:MM de Brasília
+        if(!utcStr) return '';
+        try {{
+            // SQLite retorna sem timezone — adiciona 'Z' para marcar como UTC
+            const iso = utcStr.replace(' ', 'T') + 'Z';
+            const d = new Date(iso);
+            if(isNaN(d)) return utcStr.substring(11,16);
+            return d.toLocaleTimeString('pt-BR', {{hour:'2-digit', minute:'2-digit', timeZone:'America/Sao_Paulo'}});
+        }} catch(e) {{
+            return utcStr.substring(11,16);
+        }}
+    }}
+
+    function formatBrDate(utcStr){{
+        if(!utcStr) return '';
+        try {{
+            const iso = utcStr.replace(' ', 'T') + 'Z';
+            const d = new Date(iso);
+            if(isNaN(d)) return utcStr.substring(0,10);
+            return d.toLocaleDateString('pt-BR', {{timeZone:'America/Sao_Paulo'}});
+        }} catch(e) {{
+            return utcStr.substring(0,10);
+        }}
+    }}
 
     function renderMessages(box, messages){{
         box.innerHTML='';
@@ -1341,7 +1635,7 @@ def conversations():
             div.textContent=m.content;
             const t=document.createElement('div');
             t.className='msg-time';
-            t.textContent=(m.created_at||'').substring(11,16);
+            t.textContent=formatBrTime(m.created_at);
             div.appendChild(t);
             box.appendChild(div);
         }});
@@ -1381,7 +1675,7 @@ def conversations():
                 div.onclick=function(){{loadConversation(c.id,div)}};
                 const time=document.createElement('span');
                 time.className='chat-item-time';
-                time.textContent=(c.last_message_at||'').substring(0,10);
+                time.textContent=formatBrDate(c.last_message_at);
                 const name=document.createElement('div');
                 name.className='chat-item-name';
                 name.textContent=c.customer_name||c.customer_phone;
@@ -1517,18 +1811,28 @@ def settings():
     base = get_setting("BASE_URL", BASE_URL)
     wa_verify = get_setting("WHATSAPP_VERIFY_TOKEN", WHATSAPP_VERIFY_TOKEN)
     webhook_url = f"{base}/webhook/whatsapp/{user['id']}"
+    # Escape de todos os valores do usuário para prevenir XSS
+    u_name = esc(user['name'])
+    u_company = esc(user['company'])
+    u_phone = esc(user['phone'])
+    u_hours = esc(user['business_hours'])
+    u_reply = esc(user['auto_reply_off_hours'])
+    u_wa_id = esc(user['whatsapp_phone_id'] or '')
+    u_wa_token = esc(user['whatsapp_token'] or '')
+    e_webhook = esc(webhook_url)
+    e_verify = esc(wa_verify)
     content = f"""<div class="container"><div class="page-header fade-in"><h1>Configurações ⚙️</h1></div>{msg}
         <div class="grid-2"><div class="card fade-in fade-in-1"><div class="card-header"><span class="card-title">Perfil e WhatsApp</span></div>
             <form method="POST">{csrf_field()}
-            <div class="form-group"><label class="form-label">Nome</label><input type="text" name="name" class="form-input" value="{user['name']}"></div>
-            <div class="form-group"><label class="form-label">Empresa</label><input type="text" name="company" class="form-input" value="{user['company']}"></div>
-            <div class="form-group"><label class="form-label">Telefone</label><input type="text" name="phone" class="form-input" value="{user['phone']}"></div>
-            <div class="form-group"><label class="form-label">Horário de atendimento</label><input type="text" name="business_hours" class="form-input" value="{user['business_hours']}"></div>
-            <div class="form-group"><label class="form-label">Resposta fora do horário</label><textarea name="auto_reply_off_hours" class="form-input" rows="3">{user['auto_reply_off_hours']}</textarea></div>
-            <div class="form-group"><label class="form-label">WhatsApp Phone ID</label><input type="text" id="wp_phone_id" name="whatsapp_phone_id" class="form-input" value="{user['whatsapp_phone_id'] or ''}" placeholder="Cole aqui o Phone Number ID" autocomplete="off" style="background:#2a2a3a;border:2px solid #6c5ce7;color:#fff;cursor:text"></div>
-            <div class="form-group"><label class="form-label">WhatsApp Token</label><input type="text" id="wp_token" name="whatsapp_token" class="form-input" value="{user['whatsapp_token'] or ''}" placeholder="Cole aqui o Access Token" autocomplete="off" style="background:#2a2a3a;border:2px solid #6c5ce7;color:#fff;cursor:text"></div>
+            <div class="form-group"><label class="form-label">Nome</label><input type="text" name="name" class="form-input" value="{u_name}"></div>
+            <div class="form-group"><label class="form-label">Empresa</label><input type="text" name="company" class="form-input" value="{u_company}"></div>
+            <div class="form-group"><label class="form-label">Telefone</label><input type="text" name="phone" class="form-input" value="{u_phone}"></div>
+            <div class="form-group"><label class="form-label">Horário de atendimento</label><input type="text" name="business_hours" class="form-input" value="{u_hours}"></div>
+            <div class="form-group"><label class="form-label">Resposta fora do horário</label><textarea name="auto_reply_off_hours" class="form-input" rows="3">{u_reply}</textarea></div>
+            <div class="form-group"><label class="form-label">WhatsApp Phone ID</label><input type="text" id="wp_phone_id" name="whatsapp_phone_id" class="form-input" value="{u_wa_id}" placeholder="Cole aqui o Phone Number ID" autocomplete="off" style="background:#2a2a3a;border:2px solid #00c896;color:#fff;cursor:text"></div>
+            <div class="form-group"><label class="form-label">WhatsApp Token</label><input type="text" id="wp_token" name="whatsapp_token" class="form-input" value="{u_wa_token}" placeholder="Cole aqui o Access Token" autocomplete="off" style="background:#2a2a3a;border:2px solid #00c896;color:#fff;cursor:text"></div>
             <button type="submit" class="btn btn-primary">Salvar</button></form>
-            <script>
+            <script nonce="{g.csp_nonce}">
             document.addEventListener('DOMContentLoaded', function() {{
                 ['wp_phone_id','wp_token'].forEach(function(id) {{
                     var el = document.getElementById(id);
@@ -1544,8 +1848,8 @@ def settings():
             </script></div>
         <div><div class="card fade-in fade-in-2" style="margin-bottom:24px"><div class="card-header"><span class="card-title">Webhook URL</span></div>
             <p style="color:var(--text2);font-size:14px;margin-bottom:12px">Configure no Meta Business:</p>
-            <div style="background:var(--bg4);padding:12px 16px;border-radius:var(--radius-sm);font-family:var(--mono);font-size:13px;word-break:break-all;color:var(--accent2)">{webhook_url}</div>
-            <p style="color:var(--text3);font-size:12px;margin-top:8px">Token: <code style="color:var(--accent2)">{wa_verify}</code></p></div>
+            <div style="background:var(--bg4);padding:12px 16px;border-radius:var(--radius-sm);font-family:var(--mono);font-size:13px;word-break:break-all;color:var(--accent2)">{e_webhook}</div>
+            <p style="color:var(--text3);font-size:12px;margin-top:8px">Token: <code style="color:var(--accent2)">{e_verify}</code></p></div>
         <div class="card fade-in fade-in-3"><div class="card-header"><span class="card-title">Mídias suportadas</span></div>
             <div style="color:var(--text2);font-size:14px;line-height:1.8">
                 <p>✅ <strong style="color:var(--text)">Texto</strong> — lê e responde normalmente</p>
@@ -1619,11 +1923,16 @@ def mp_create_preference():
         if checkout_url: return redirect(checkout_url)
         return redirect("/dashboard/billing?error=Erro ao criar pagamento")
     except ImportError:
-        return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Checkout Simulado</title>
+        # Se SDK não instalado, só mostra tela de simulação em DEV
+        is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+        if not is_dev:
+            return redirect("/dashboard/billing?error=Sistema de pagamento indisponível")
+        return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Checkout Simulado (DEV)</title>
         <style>body{{font-family:'DM Sans',sans-serif;background:#0a0e14;color:#f0f4f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
         .box{{background:#111827;padding:40px;border-radius:16px;max-width:400px;text-align:center;border:1px solid rgba(255,255,255,0.1)}}
-        .price{{font-size:36px;font-weight:700;color:#34d399;margin:16px 0}}.btn{{display:inline-block;padding:14px 32px;background:#00c896;color:white;border-radius:8px;text-decoration:none;font-weight:600}}</style></head>
-        <body><div class="box"><h2>Checkout Simulado</h2><p style="color:#94a3b8">Plano {plan['name']}</p>
+        .price{{font-size:36px;font-weight:700;color:#34d399;margin:16px 0}}.btn{{display:inline-block;padding:14px 32px;background:#00c896;color:white;border-radius:8px;text-decoration:none;font-weight:600}}
+        .warn{{background:#7f1d1d;color:#fff;padding:8px;border-radius:6px;margin-bottom:16px;font-size:12px}}</style></head>
+        <body><div class="box"><div class="warn">⚠️ MODO DESENVOLVIMENTO</div><h2>Checkout Simulado</h2><p style="color:#94a3b8">Plano {plan['name']}</p>
         <div class="price">R$ {plan['price']:.0f}<small style="font-size:14px;color:#94a3b8">/mês</small></div>
         <p style="color:#94a3b8;font-size:13px;margin-bottom:24px">SDK não instalado. Simulação de teste.</p>
         <a href="{base}/api/mercadopago/callback?status=success&plan={plan_key}&simulated=1" class="btn">Simular aprovação ✓</a><br><br>
@@ -1638,8 +1947,17 @@ def mp_callback():
     status = request.args.get("status",""); plan_key = request.args.get("plan","starter")
     plan = PLANS.get(plan_key, PLANS["starter"]); user = g.user; db = get_db()
     simulated = request.args.get("simulated","")
+
+    # Simulação SÓ funciona em modo desenvolvimento explícito
+    # (variável de ambiente FLASK_ENV=development)
+    is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+
     if status == "success" and simulated == "1":
-        # Simulação apenas — ativa direto (modo dev/teste)
+        if not is_dev:
+            # Em produção, simulação está DESABILITADA — registra tentativa suspeita
+            print(f"[SECURITY] Tentativa de bypass com simulated=1 por user {user['id']} ({user.get('email','')})")
+            return redirect("/dashboard/billing?error=Operação não permitida")
+        # Em dev, permite simular
         pid = f"sim_{int(time.time())}"
         db.execute("UPDATE users SET plan=?,plan_status='active',msgs_limit=?,msgs_used=0 WHERE id=?", (plan_key, plan["msgs"], user["id"]))
         db.execute("INSERT INTO payments (user_id,mp_payment_id,amount,status,plan) VALUES (?,?,?,?,?)", (user["id"],pid,plan["price"],"approved",plan_key))
@@ -1700,7 +2018,126 @@ def api_conversations_list():
     return jsonify({"conversations": [dict(c) for c in convos]})
 
 
+@app.route("/dashboard/conversations/export")
+@login_required
+def export_all_conversations():
+    """Exporta todas as conversas do usuário em CSV"""
+    db = get_db()
+    rows = db.execute("""SELECT c.id as conv_id, c.customer_phone, c.customer_name, c.last_message_at,
+        m.sender, m.content, m.msg_type, m.created_at
+        FROM conversations c
+        LEFT JOIN messages m ON m.conversation_id = c.id
+        WHERE c.user_id=?
+        ORDER BY c.id, m.created_at""", (g.user["id"],)).fetchall()
+
+    lines = ["ID,Telefone,Nome,Remetente,Mensagem,Tipo,Data"]
+    for r in rows:
+        lines.append(",".join([
+            csv_safe(r["conv_id"]),
+            csv_safe(r["customer_phone"]),
+            csv_safe(r["customer_name"]),
+            csv_safe(r["sender"]),
+            csv_safe(r["content"]),
+            csv_safe(r["msg_type"]),
+            csv_safe(r["created_at"])
+        ]))
+
+    csv_content = "\n".join(lines)
+    # UTF-8 BOM para Excel abrir acentos corretamente
+    response = make_response("\ufeff" + csv_content)
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = f'attachment; filename="conversas_{datetime.now().strftime("%Y%m%d")}.csv"'
+    return response
+
+
+@app.route("/dashboard/conversations/<int:conv_id>/export")
+@login_required
+def export_single_conversation(conv_id):
+    """Exporta uma conversa específica em CSV"""
+    db = get_db()
+    conv = db.execute("SELECT * FROM conversations WHERE id=? AND user_id=?", (conv_id, g.user["id"])).fetchone()
+    if not conv:
+        return "Conversa não encontrada", 404
+
+    messages = db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (conv_id,)).fetchall()
+
+    lines = ["Data,Remetente,Tipo,Mensagem"]
+    for m in messages:
+        lines.append(",".join([
+            csv_safe(m["created_at"]),
+            csv_safe("Bot" if m["sender"] == "bot" else (conv["customer_name"] or conv["customer_phone"])),
+            csv_safe(m["msg_type"]),
+            csv_safe(m["content"])
+        ]))
+
+    csv_content = "\n".join(lines)
+    response = make_response("\ufeff" + csv_content)
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    safe_phone = re.sub(r'[^0-9]', '', conv["customer_phone"] or "contato")
+    response.headers["Content-Disposition"] = f'attachment; filename="conversa_{safe_phone}_{datetime.now().strftime("%Y%m%d")}.csv"'
+    return response
+
+
+@app.route("/dashboard/conversations/<int:conv_id>/print")
+@login_required
+def print_conversation(conv_id):
+    """Versão imprimível de uma conversa"""
+    db = get_db()
+    conv = db.execute("SELECT * FROM conversations WHERE id=? AND user_id=?", (conv_id, g.user["id"])).fetchone()
+    if not conv:
+        return "Conversa não encontrada", 404
+
+    messages = db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (conv_id,)).fetchall()
+    user = g.user
+
+    msgs_html = ""
+    for m in messages:
+        sender = "Bot" if m["sender"] == "bot" else esc(conv["customer_name"] or conv["customer_phone"])
+        bg = "#e8f5e9" if m["sender"] == "bot" else "#f5f5f5"
+        date = esc(m["created_at"] or "")
+        content = esc(m["content"])
+        msgs_html += f'<div style="background:{bg};padding:12px;margin-bottom:8px;border-radius:8px"><div style="font-size:12px;color:#666;margin-bottom:4px"><strong>{sender}</strong> — {date}</div><div>{content}</div></div>'
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Conversa — {esc(conv['customer_name'] or conv['customer_phone'])}</title>
+<style>
+body{{font-family:Arial,sans-serif;max-width:800px;margin:0 auto;padding:24px;background:#fff;color:#000}}
+h1{{border-bottom:2px solid #00c896;padding-bottom:8px}}
+.info{{background:#f9f9f9;padding:12px;margin-bottom:20px;border-radius:8px;font-size:14px}}
+@media print{{.no-print{{display:none}}}}
+</style></head><body>
+<h1>Conversa com {esc(conv['customer_name'] or conv['customer_phone'])}</h1>
+<div class="info">
+<strong>Telefone:</strong> {esc(conv['customer_phone'])}<br>
+<strong>Última mensagem:</strong> {esc(conv['last_message_at'])}<br>
+<strong>Total de mensagens:</strong> {len(messages)}<br>
+<strong>Empresa:</strong> {esc(user['company'] or user['name'])}
+</div>
+<div class="no-print" style="margin-bottom:20px">
+<button onclick="window.print()" style="padding:10px 20px;background:#00c896;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px">🖨️ Imprimir</button>
+<a href="/dashboard/conversations/{conv_id}/export" style="margin-left:8px;padding:10px 20px;background:#0ea5e9;color:white;text-decoration:none;border-radius:6px;font-size:14px">📥 Baixar CSV</a>
+<a href="/dashboard/conversations" style="margin-left:8px;padding:10px 20px;background:#666;color:white;text-decoration:none;border-radius:6px;font-size:14px">← Voltar</a>
+</div>
+{msgs_html}
+<div style="margin-top:40px;font-size:12px;color:#999;text-align:center">
+Exportado em {datetime.now().strftime("%d/%m/%Y %H:%M")} — atendente.online
+</div>
+</body></html>"""
+
+
 # ─── WHATSAPP WEBHOOK ─────────────────────────────────────────
+def verify_whatsapp_signature(request_data, signature_header, app_secret):
+    """Valida assinatura X-Hub-Signature-256 da Meta"""
+    if not signature_header or not app_secret:
+        return False
+    if not signature_header.startswith("sha256="):
+        return False
+    import hmac
+    expected = hmac.new(app_secret.encode(), request_data, hashlib.sha256).hexdigest()
+    received = signature_header.replace("sha256=", "")
+    return hmac.compare_digest(expected, received)
+
+
 @app.route("/webhook/whatsapp/<int:user_id>", methods=["GET","POST"])
 def whatsapp_webhook(user_id):
     if request.method == "GET":
@@ -1708,6 +2145,21 @@ def whatsapp_webhook(user_id):
         if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == wa_verify:
             return request.args.get("hub.challenge",""), 200
         return "Forbidden", 403
+
+    # Valida assinatura da Meta — OBRIGATÓRIO em produção
+    app_secret = get_setting("WHATSAPP_APP_SECRET", "")
+    is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+
+    if app_secret:
+        # APP_SECRET configurado → valida assinatura
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        if not verify_whatsapp_signature(request.get_data(), signature, app_secret):
+            print(f"[WEBHOOK] Assinatura inválida de {request.remote_addr}")
+            return jsonify({"status":"invalid signature"}), 403
+    elif not is_dev:
+        # Produção sem APP_SECRET → recusa (força configuração)
+        print(f"[WEBHOOK] REJEITADO: WHATSAPP_APP_SECRET não configurado em produção (user_id={user_id}, IP={request.remote_addr})")
+        return jsonify({"status":"webhook not configured - APP_SECRET required"}), 503
 
     data = request.json or {}
     try:
@@ -1882,7 +2334,7 @@ REGRAS:
             import requests as req
             resp = req.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key":api_key,"anthropic-version":"2023-06-01","content-type":"application/json"},
-                json={"model":"claude-sonnet-4-20250514","max_tokens":500,"system":system_prompt,"messages":api_messages}, timeout=30)
+                json={"model":"claude-sonnet-4-6","max_tokens":500,"system":system_prompt,"messages":api_messages}, timeout=30)
             if resp.status_code == 200:
                 result = resp.json()
                 tokens_in = result.get("usage",{}).get("input_tokens",0)
@@ -1921,9 +2373,7 @@ REGRAS:
 
 
 def send_whatsapp_message(phone_id, token, to, message):
-    print(f"\n[WA SEND] Tentando enviar para {to}...")
-    print(f"[WA SEND] Phone ID: {phone_id}")
-    print(f"[WA SEND] Token: {token[:20]}... ({len(token)} chars)")
+    print(f"[WA SEND] Tentando enviar para {to}...")
     if not phone_id or not token:
         print(f"[WA SEND] ERRO: Phone ID ou Token vazio!")
         return
@@ -1932,14 +2382,12 @@ def send_whatsapp_message(phone_id, token, to, message):
         url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": message}}
-        print(f"[WA SEND] URL: {url}")
-        print(f"[WA SEND] Para: {to}")
-        print(f"[WA SEND] Mensagem: {message[:80]}...")
         resp = req.post(url, headers=headers, json=payload, timeout=15)
-        print(f"[WA SEND] Status: {resp.status_code}")
-        print(f"[WA SEND] Resposta: {resp.text[:500]}")
         if resp.status_code != 200:
-            print(f"[WA SEND] ERRO! Verifique o token e Phone ID")
+            print(f"[WA SEND] ERRO! Status {resp.status_code}")
+            print(f"[WA SEND] Resposta: {resp.text[:300]}")
+        else:
+            print(f"[WA SEND] ✓ Mensagem enviada para {to}")
     except Exception as e:
         print(f"[WA SEND] EXCEÇÃO: {e}")
 
@@ -2131,8 +2579,27 @@ def admin_dashboard():
     s = get_admin_stats()
     profit = s["mrr"] - s["total_api_cost"]
 
+    # Alertas de segurança
+    security_alerts = []
+    if _get_fernet() is None:
+        security_alerts.append("🚨 <strong>CRÍTICO: criptografia indisponível</strong> — biblioteca 'cryptography' não instalada. Segredos salvos podem estar em texto puro.")
+    if not get_setting("WHATSAPP_APP_SECRET", ""):
+        security_alerts.append("🚨 <strong>WHATSAPP_APP_SECRET não configurado</strong> — webhook está recusando mensagens em produção. Configure em APIs.")
+    if not os.getenv("SECRET_KEY"):
+        security_alerts.append("⚠️ <strong>SECRET_KEY usando valor aleatório</strong> — sessions serão invalidadas a cada restart. Defina SECRET_KEY no Railway → Variables.")
+    if not os.getenv("ADMIN_PASSWORD"):
+        security_alerts.append("⚠️ <strong>ADMIN_PASSWORD não configurada</strong> — defina no Railway → Variables para uma senha forte.")
+
+    alerts_html = ""
+    if security_alerts:
+        alerts_html = '<div class="card fade-in" style="border:2px solid var(--red);margin-bottom:24px;background:rgba(239,68,68,0.05)"><div class="card-header"><span class="card-title" style="color:var(--red)">⚠️ Alertas de Segurança</span></div>'
+        for alert in security_alerts:
+            alerts_html += f'<p style="margin:8px 0;color:var(--text2);font-size:14px">{alert}</p>'
+        alerts_html += '</div>'
+
     content = f"""<div class="container">
         <div class="page-header fade-in"><h1>Dashboard Administrativo 🏢</h1><p>Visão geral do seu SaaS</p></div>
+        {alerts_html}
         
         <div class="grid-5 fade-in fade-in-1">
             <div class="metric-card"><div style="font-size:24px">👥</div><div class="metric-value">{s['total_users']}</div><div class="metric-label">Clientes totais</div>
@@ -2331,7 +2798,7 @@ def admin_logs():
 def admin_api_settings():
     msg = ""
     if request.method == "POST":
-        keys = ["ANTHROPIC_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY", "MERCADOPAGO_ACCESS_TOKEN", "WHATSAPP_VERIFY_TOKEN"]
+        keys = ["ANTHROPIC_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY", "MERCADOPAGO_ACCESS_TOKEN", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_APP_SECRET"]
         for key in keys:
             value = request.form.get(key, "").strip()
             if value:
@@ -2360,6 +2827,7 @@ def admin_api_settings():
     openai_key = get_setting("OPENAI_API_KEY")
     mp_token = get_setting("MERCADOPAGO_ACCESS_TOKEN")
     wa_verify = get_setting("WHATSAPP_VERIFY_TOKEN", "meu_token_verificacao")
+    wa_app_secret = get_setting("WHATSAPP_APP_SECRET", "")
     base_url = get_setting("BASE_URL", "http://localhost:8080")
     smtp_email = get_setting("SMTP_EMAIL", "contato@atendente.online")
     smtp_password = get_setting("SMTP_PASSWORD")
@@ -2417,15 +2885,21 @@ def admin_api_settings():
                 </div>
                 <div class="form-group">
                     <label class="form-label">WhatsApp Verify Token</label>
-                    <input type="text" name="WHATSAPP_VERIFY_TOKEN" class="form-input" value="{wa_verify}" autocomplete="off"
+                    <input type="text" name="WHATSAPP_VERIFY_TOKEN" class="form-input" value="{esc(wa_verify)}" autocomplete="off"
                         style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
                     <small style="color:var(--text3)">Token usado na verificação do webhook do Meta</small>
                 </div>
                 <div class="form-group">
+                    <label class="form-label">WhatsApp App Secret (segurança)</label>
+                    <input type="password" name="WHATSAPP_APP_SECRET" class="form-input" placeholder="{'••••••••' if wa_app_secret else 'Meta App Secret'}" autocomplete="off"
+                        style="background:#2a2a3a;border:2px solid {'var(--green)' if wa_app_secret else 'var(--orange)'}">
+                    <small style="color:var(--text3)">{'✅ Configurado — assinaturas do webhook serão validadas' if wa_app_secret else '⚠️ Configure para validar assinatura do Meta (previne webhooks falsos)'}</small>
+                </div>
+                <div class="form-group">
                     <label class="form-label">URL Base do Sistema</label>
-                    <input type="text" name="BASE_URL" class="form-input" value="{base_url}" autocomplete="off"
+                    <input type="text" name="BASE_URL" class="form-input" value="{esc(base_url)}" autocomplete="off"
                         style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
-                    <small style="color:var(--text3)">URL pública (ex: https://seudominio.com ou URL do ngrok)</small>
+                    <small style="color:var(--text3)">URL pública (ex: https://seudominio.com)</small>
                 </div>
             </div>
         </div>
@@ -2474,36 +2948,128 @@ def admin_export(data_type):
     if data_type == "users":
         rows = db.execute("SELECT id,name,email,company,phone,plan,plan_status,msgs_used,msgs_limit,created_at,last_login FROM users").fetchall()
         csv = "id,nome,email,empresa,telefone,plano,status,msgs_usadas,msgs_limite,cadastro,ultimo_login\n"
-        csv += "\n".join(",".join(str(r[k]) for k in r.keys()) for r in rows)
+        csv += "\n".join(",".join(csv_safe(r[k]) for k in r.keys()) for r in rows)
     elif data_type == "payments":
         rows = db.execute("SELECT p.id,u.name,u.email,p.amount,p.status,p.plan,p.mp_payment_id,p.created_at FROM payments p JOIN users u ON p.user_id=u.id").fetchall()
         csv = "id,cliente,email,valor,status,plano,mp_id,data\n"
-        csv += "\n".join(",".join(str(r[k]) for k in r.keys()) for r in rows)
+        csv += "\n".join(",".join(csv_safe(r[k]) for k in r.keys()) for r in rows)
     else:
         return "Tipo inválido", 400
-    
-    output = io.BytesIO(csv.encode("utf-8"))
+
+    output = io.BytesIO(("\ufeff" + csv).encode("utf-8"))
     output.seek(0)
     return send_file(output, mimetype="text/csv", as_attachment=True, download_name=f"atendeia_{data_type}_{datetime.now().strftime('%Y%m%d')}.csv")
+
+
+def migrate_encrypt_existing_secrets():
+    """Migra segredos: texto puro → Fernet, formato antigo XOR → Fernet"""
+    fernet = _get_fernet()
+    if not fernet:
+        is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+        if not is_dev:
+            print("[MIGRATION] ❌ Criptografia indisponível — migração abortada")
+            return
+        print("[MIGRATION] ⚠️ DEV: criptografia indisponível, migração pulada")
+        return
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+        migrated = 0
+        for key in SENSITIVE_SETTINGS:
+            row = db_conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+            if not row or not row["value"]:
+                continue
+            current = row["value"]
+            # Já está em formato Fernet novo, pula
+            if current.startswith("fer:v1:"):
+                continue
+            # Está no formato antigo XOR, descriptografa e re-criptografa com Fernet
+            if current.startswith("enc:v1:"):
+                plaintext = _decrypt_legacy(current)
+                if plaintext:
+                    encrypted = _encrypt_value(plaintext)
+                    if encrypted.startswith("fer:v1:"):
+                        db_conn.execute("UPDATE system_settings SET value=? WHERE key=?", (encrypted, key))
+                        print(f"[MIGRATION] Re-criptografado (XOR → Fernet): {key}")
+                        migrated += 1
+                continue
+            # Texto puro → criptografa com Fernet
+            encrypted = _encrypt_value(current)
+            if encrypted.startswith("fer:v1:"):
+                db_conn.execute("UPDATE system_settings SET value=? WHERE key=?", (encrypted, key))
+                print(f"[MIGRATION] Criptografado (plaintext → Fernet): {key}")
+                migrated += 1
+        db_conn.commit()
+        db_conn.close()
+        if migrated:
+            print(f"[MIGRATION] ✅ {migrated} segredo(s) migrado(s) para Fernet")
+    except Exception as e:
+        print(f"[MIGRATION] Erro: {e}")
+
+
+def check_production_requirements():
+    """Verifica requisitos obrigatórios de produção. Aborta se algo crítico faltar."""
+    is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+    errors = []
+
+    # 1. cryptography deve estar instalada em produção
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError:
+        errors.append("cryptography>=42.0 não instalada — segredos não podem ser criptografados")
+
+    # 2. SECRET_KEY deve ser fixo (não aleatório) em produção
+    if not os.getenv("SECRET_KEY"):
+        errors.append("SECRET_KEY não configurado — sessões e segredos criptografados ficam inválidos após restart")
+
+    # 3. ADMIN_PASSWORD deve estar configurado
+    if not os.getenv("ADMIN_PASSWORD"):
+        errors.append("ADMIN_PASSWORD não configurado — painel admin inacessível")
+
+    if errors and not is_dev:
+        print("="*70)
+        print("  🚨 ERRO CRÍTICO: requisitos de produção não atendidos")
+        print("="*70)
+        for e in errors:
+            print(f"  ❌ {e}")
+        print("="*70)
+        print("  Para resolver:")
+        print("  1. Adicione 'cryptography>=42.0' em requirements.txt")
+        print("  2. No Railway → Variables, defina:")
+        print("     SECRET_KEY    (gere com: python3 -c 'import secrets; print(secrets.token_hex(32))')")
+        print("     ADMIN_PASSWORD (sua senha de admin)")
+        print()
+        print("  Para rodar em modo desenvolvimento, defina FLASK_ENV=development")
+        print("="*70)
+        raise SystemExit(1)
+    elif errors and is_dev:
+        print("[DEV] Avisos de produção (ignorados em FLASK_ENV=development):")
+        for e in errors:
+            print(f"  ⚠️ {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
 #  INIT & RUN
 # ═══════════════════════════════════════════════════════════════
 
+# Verifica requisitos ANTES de iniciar o banco
+check_production_requirements()
+
 # Inicializa o banco sempre (necessário para gunicorn no Railway)
 init_db()
+migrate_encrypt_existing_secrets()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     print("\n" + "="*60)
-    print("  ⚡ ATENDE.AI v2.0 — Sistema rodando!")
+    print("  ⚡ atendente.online — Sistema rodando!")
     print(f"  📍 Painel cliente: http://localhost:{port}")
     print(f"  🔐 Painel admin:   http://localhost:{port}/admin/login")
-    print(f"  👤 Admin login:    {ADMIN_EMAIL} / {ADMIN_PASSWORD}")
+    print(f"  👤 Admin email:    {ADMIN_EMAIL}")
+    print(f"  🔑 Admin senha:    {'✅ Configurada' if ADMIN_PASSWORD else '❌ NÃO CONFIGURADA — defina ADMIN_PASSWORD'}")
     print("  ─────────────────────────────────────")
     print(f"  🤖 Claude (IA):    {'✅ Configurada' if get_setting('ANTHROPIC_API_KEY') else '❌ Configure no admin → APIs'}")
     print(f"  🎤 Groq (Áudio):   {'✅ Configurada' if get_setting('GROQ_API_KEY') else '❌ Configure no admin → APIs'}")
-    print(f"  🎤 OpenAI (Áudio): {'✅ Configurada' if get_setting('OPENAI_API_KEY') else '⬜ Opcional (fallback)'}")
+    print(f"  🎤 OpenAI:         {'✅ Configurada' if get_setting('OPENAI_API_KEY') else '⬜ Opcional'}")
     print("="*60 + "\n")
     app.run(debug=os.getenv("FLASK_ENV")=="development", host="0.0.0.0", port=port)

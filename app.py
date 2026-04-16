@@ -386,6 +386,17 @@ def init_db():
         used INTEGER DEFAULT 0,
         created_at TEXT DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS product_gallery (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        keywords TEXT DEFAULT '',
+        description TEXT DEFAULT '',
+        file_path TEXT NOT NULL,
+        file_type TEXT DEFAULT 'image/jpeg',
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
     """)
     # ── MIGRAÇÃO AUTOMÁTICA ──
     migrations = [
@@ -775,7 +786,7 @@ def analyze_image_with_claude(filepath, user_question=""):
         resp = req.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 500,
                 "messages": [{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
@@ -791,34 +802,77 @@ def analyze_image_with_claude(filepath, user_question=""):
         return "[Erro ao analisar imagem]"
 
 
-def extract_pdf_text(filepath):
-    """Extrai texto de PDF"""
+def extract_pdf_text(filepath, max_pages=100):
+    """Extrai texto de PDF (até 100 páginas para treinamento)"""
     try:
-        # Tenta com PyPDF2 ou pdfplumber
         try:
             import pdfplumber
             with pdfplumber.open(filepath) as pdf:
                 text = ""
-                for page in pdf.pages[:10]:  # Limita a 10 páginas
+                for page in pdf.pages[:max_pages]:
                     text += (page.extract_text() or "") + "\n"
                 return text.strip() if text.strip() else "[PDF sem texto extraível]"
         except ImportError:
             pass
-        
+
         try:
             from PyPDF2 import PdfReader
             reader = PdfReader(filepath)
             text = ""
-            for page in reader.pages[:10]:
+            for page in reader.pages[:max_pages]:
                 text += (page.extract_text() or "") + "\n"
             return text.strip() if text.strip() else "[PDF sem texto extraível]"
         except ImportError:
             pass
-        
+
         return "[Instale pdfplumber ou PyPDF2 para ler PDFs: pip install pdfplumber]"
     except Exception as e:
         print(f"PDF extraction error: {e}")
         return "[Erro ao extrair texto do PDF]"
+
+
+def extract_spreadsheet_text(file_obj):
+    """Extrai texto de planilha XLSX/XLS"""
+    try:
+        # Tenta openpyxl primeiro (XLSX)
+        try:
+            from openpyxl import load_workbook
+            import io
+            content = file_obj.read()
+            wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+            text_parts = []
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                text_parts.append(f"\n=== Aba: {sheet_name} ===")
+                for row in ws.iter_rows(values_only=True, max_row=1000):
+                    row_text = " | ".join(str(c) if c is not None else "" for c in row)
+                    if row_text.strip(" |"):  # Pula linhas vazias
+                        text_parts.append(row_text)
+            return "\n".join(text_parts)
+        except ImportError:
+            pass
+
+        # Fallback: xlrd (XLS legado)
+        try:
+            import xlrd
+            import io
+            content = file_obj.read() if hasattr(file_obj, "read") else file_obj
+            wb = xlrd.open_workbook(file_contents=content)
+            text_parts = []
+            for sheet_name in wb.sheet_names():
+                sheet = wb.sheet_by_name(sheet_name)
+                text_parts.append(f"\n=== Aba: {sheet_name} ===")
+                for row_idx in range(min(sheet.nrows, 1000)):
+                    row = [str(sheet.cell_value(row_idx, c)) for c in range(sheet.ncols)]
+                    text_parts.append(" | ".join(row))
+            return "\n".join(text_parts)
+        except ImportError:
+            pass
+
+        return "[Instale openpyxl para ler planilhas: pip install openpyxl]"
+    except Exception as e:
+        print(f"Spreadsheet extraction error: {e}")
+        return f"[Erro ao extrair planilha: {str(e)}]"
 
 
 def process_whatsapp_media(msg, token):
@@ -1105,6 +1159,7 @@ def base_html(title, content, user=None):
                 <a href="/dashboard/conversations" class="nav-link">Conversas</a>
                 <a href="/dashboard/training" class="nav-link">Treinamento</a>
                 <a href="/dashboard/quick-replies" class="nav-link">Respostas rápidas</a>
+                <a href="/dashboard/gallery" class="nav-link">Galeria</a>
                 <a href="/dashboard/settings" class="nav-link">Config</a>
                 <a href="/dashboard/billing" class="nav-link nav-link-accent">Plano</a>
             </div>
@@ -1733,6 +1788,59 @@ def training():
         elif action == "delete_kb":
             db.execute("DELETE FROM knowledge_base WHERE id=? AND user_id=?", (request.form.get("kb_id"), user["id"]))
             db.commit(); msg = '<div class="alert alert-success">Removido!</div>'
+        elif action == "import_file":
+            # Processa arquivo enviado (PDF, XLSX, CSV, TXT)
+            if "file" not in request.files:
+                msg = '<div class="alert alert-error">Nenhum arquivo enviado</div>'
+            else:
+                file = request.files["file"]
+                if file.filename == "":
+                    msg = '<div class="alert alert-error">Arquivo vazio</div>'
+                else:
+                    file_title = request.form.get("file_title", "").strip() or file.filename
+                    file_category = request.form.get("file_category", "geral")
+                    # Lê conteúdo baseado no tipo
+                    extracted_text = ""
+                    try:
+                        fname_lower = file.filename.lower()
+                        if fname_lower.endswith(".pdf"):
+                            # Salva temporariamente e extrai
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                                tmp.write(file.read())
+                                tmp_path = tmp.name
+                            extracted_text = extract_pdf_text(tmp_path)
+                            try: os.remove(tmp_path)
+                            except: pass
+                        elif fname_lower.endswith(".txt"):
+                            extracted_text = file.read().decode("utf-8", errors="ignore")
+                        elif fname_lower.endswith(".csv"):
+                            import csv as csv_mod, io
+                            content_str = file.read().decode("utf-8", errors="ignore")
+                            reader = csv_mod.reader(io.StringIO(content_str))
+                            rows = list(reader)
+                            # Formata como tabela legível
+                            extracted_text = "\n".join([" | ".join(r) for r in rows])
+                        elif fname_lower.endswith((".xlsx", ".xls")):
+                            extracted_text = extract_spreadsheet_text(file)
+                        else:
+                            msg = '<div class="alert alert-error">Formato não suportado. Use: PDF, XLSX, CSV ou TXT</div>'
+
+                        if extracted_text and len(extracted_text.strip()) > 10:
+                            # Limita tamanho (máx ~50k caracteres para não estourar contexto)
+                            if len(extracted_text) > 50000:
+                                extracted_text = extracted_text[:50000] + "\n\n[...conteúdo truncado em 50k chars]"
+                            db.execute(
+                                "INSERT INTO knowledge_base (user_id,title,content,category) VALUES (?,?,?,?)",
+                                (user["id"], file_title, extracted_text, file_category)
+                            )
+                            db.commit()
+                            chars = len(extracted_text)
+                            msg = f'<div class="alert alert-success">✅ Arquivo importado! ({chars} caracteres extraídos)</div>'
+                        elif not msg:
+                            msg = '<div class="alert alert-error">Não foi possível extrair texto do arquivo</div>'
+                    except Exception as e:
+                        msg = f'<div class="alert alert-error">Erro ao processar arquivo: {esc(str(e))}</div>'
 
     kb = db.execute("SELECT * FROM knowledge_base WHERE user_id=? ORDER BY created_at DESC", (user["id"],)).fetchall()
     kb_rows = "".join(f'<tr><td><strong>{i["title"]}</strong></td><td><span class="badge badge-purple">{i["category"]}</span></td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)">{i["content"][:100]}</td><td><form method="POST">{csrf_field()}<span style="display:inline"><input type="hidden" name="action" value="delete_kb"><input type="hidden" name="kb_id" value="{i["id"]}"><button type="submit" class="btn btn-danger btn-sm">✕</button></form></td></tr>' for i in kb)
@@ -1755,6 +1863,41 @@ def training():
                 <option value="produtos">Produtos</option><option value="precos">Preços</option><option value="faq">FAQ</option><option value="politicas">Políticas</option><option value="geral">Geral</option></select></div>
             <div class="form-group"><label class="form-label">Conteúdo</label><textarea name="content" class="form-input" rows="6" placeholder="Informações que a IA deve saber..." required></textarea></div>
             <button type="submit" class="btn btn-success">+ Adicionar</button></form></div></div>
+
+        <div class="card fade-in fade-in-3" style="margin-bottom:24px">
+            <div class="card-header"><span class="card-title">📄 Importar arquivo (PDF, Excel, CSV)</span></div>
+            <p style="color:var(--text3);font-size:13px;margin-bottom:16px">
+                Envie um arquivo e o sistema extrai o conteúdo automaticamente. Útil para tabela de preços,
+                catálogos, manuais ou planilhas de produtos.
+            </p>
+            <form method="POST" enctype="multipart/form-data">{csrf_field()}<input type="hidden" name="action" value="import_file">
+                <div class="grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Título (opcional)</label>
+                        <input type="text" name="file_title" class="form-input" placeholder="Ex: Tabela de preços 2026" maxlength="100">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Categoria</label>
+                        <select name="file_category" class="form-input">
+                            <option value="precos">Preços</option>
+                            <option value="produtos">Produtos</option>
+                            <option value="faq">FAQ</option>
+                            <option value="politicas">Políticas</option>
+                            <option value="geral">Geral</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Arquivo (PDF, XLSX, CSV ou TXT — máx 10MB)</label>
+                    <input type="file" name="file" accept=".pdf,.xlsx,.xls,.csv,.txt,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,text/plain" required
+                        style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08);padding:10px;border-radius:8px;color:var(--text);width:100%">
+                </div>
+                <button type="submit" class="btn btn-primary">📤 Importar e treinar IA</button>
+            </form>
+            <p style="color:var(--text3);font-size:12px;margin-top:12px">
+                ℹ️ O conteúdo extraído será salvo como um item na base de conhecimento e a IA usará essas informações nas respostas.
+            </p>
+        </div>
         <div class="card fade-in fade-in-3"><div class="card-header"><span class="card-title">Base de conhecimento ({len(kb)} itens)</span></div>
             {'<div class="table-wrap"><table><thead><tr><th>Título</th><th>Categoria</th><th>Conteúdo</th><th></th></tr></thead><tbody>'+kb_rows+'</tbody></table></div>' if kb else '<div class="empty-state"><div class="icon">📚</div><h3>Base vazia</h3><p>Adicione informações sobre seus produtos.</p></div>'}</div></div>"""
     return base_html("Treinamento", content, dict(user))
@@ -2363,6 +2506,25 @@ def whatsapp_webhook(user_id):
                     db_conn.execute("UPDATE users SET msgs_used=msgs_used+1 WHERE id=?", (user_id,))
                     db_conn.commit()
 
+                    # Verifica se deve enviar foto de produto da galeria
+                    product = find_matching_product(user_id, ai_input)
+                    if product and os.path.exists(product["file_path"]):
+                        print(f"[GALLERY] Enviando foto: {product['name']}")
+                        caption = product["description"] or product["name"]
+                        send_whatsapp_image(
+                            user["whatsapp_phone_id"],
+                            user["whatsapp_token"],
+                            sender_phone,
+                            product["file_path"],
+                            caption=caption
+                        )
+                        # Registra no histórico
+                        db_conn.execute(
+                            "INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
+                            (conv["id"], "bot", f"[Foto: {product['name']}]", "image")
+                        )
+                        db_conn.commit()
+
                     # Se cliente mandou áudio, responde com áudio
                     audio_sent = False
                     if media_result["type"] == "audio":
@@ -2370,7 +2532,6 @@ def whatsapp_webhook(user_id):
                         audio_path = text_to_audio(ai_response)
                         if audio_path:
                             audio_sent = send_whatsapp_audio(user["whatsapp_phone_id"], user["whatsapp_token"], sender_phone, audio_path)
-                            # Limpa o arquivo temporário
                             try: os.remove(audio_path)
                             except: pass
 
@@ -2778,6 +2939,272 @@ def upload_whatsapp_media(phone_id, token, filepath, mime_type="audio/mpeg"):
     except Exception as e:
         print(f"[WA UPLOAD] Exceção: {e}")
         return None
+
+
+def send_whatsapp_image(phone_id, token, to, image_path, caption=""):
+    """Envia imagem pelo WhatsApp"""
+    media_id = upload_whatsapp_media(phone_id, token, image_path, "image/jpeg")
+    if not media_id:
+        print("[WA IMAGE] Falha no upload")
+        return False
+    try:
+        import requests as req
+        url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {"messaging_product": "whatsapp", "to": to, "type": "image",
+                   "image": {"id": media_id}}
+        if caption:
+            payload["image"]["caption"] = caption[:1024]
+        resp = req.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code == 200:
+            print(f"[WA IMAGE] ✓ Imagem enviada para {to}")
+            return True
+        print(f"[WA IMAGE] Erro: {resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[WA IMAGE] Exceção: {e}")
+        return False
+
+
+def find_matching_product(user_id, message):
+    """Encontra produto na galeria que combina com a mensagem do cliente"""
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+        products = db_conn.execute(
+            "SELECT * FROM product_gallery WHERE user_id=?", (user_id,)
+        ).fetchall()
+        db_conn.close()
+
+        if not products:
+            return None
+
+        msg_lower = message.lower()
+        # Remove acentos para busca mais robusta
+        import unicodedata
+        def strip_accents(s):
+            return ''.join(c for c in unicodedata.normalize('NFD', s)
+                          if unicodedata.category(c) != 'Mn')
+
+        msg_norm = strip_accents(msg_lower)
+
+        # Calcula score de cada produto baseado em matches de keywords/nome
+        best_match = None
+        best_score = 0
+        for p in products:
+            score = 0
+            # Nome do produto
+            name_norm = strip_accents(p["name"].lower())
+            if name_norm in msg_norm:
+                score += 10
+            for word in name_norm.split():
+                if len(word) > 3 and word in msg_norm:
+                    score += 3
+
+            # Keywords (separadas por vírgula)
+            keywords = p["keywords"] or ""
+            for kw in keywords.split(","):
+                kw = kw.strip().lower()
+                kw_norm = strip_accents(kw)
+                if not kw_norm or len(kw_norm) < 3:
+                    continue
+                if kw_norm in msg_norm:
+                    score += 5
+
+            if score > best_score:
+                best_score = score
+                best_match = p
+
+        # Só retorna se o score for suficientemente alto
+        if best_score >= 3:
+            return best_match
+        return None
+    except Exception as e:
+        print(f"[GALLERY] Erro busca: {e}")
+        return None
+
+
+# ─── GALERIA DE PRODUTOS ──────────────────────────────────────
+@app.route("/dashboard/gallery")
+@login_required
+def gallery():
+    user = g.user
+    db = get_db()
+    products = db.execute(
+        "SELECT * FROM product_gallery WHERE user_id=? ORDER BY created_at DESC",
+        (user["id"],)
+    ).fetchall()
+
+    # Mensagens
+    ok_msg = request.args.get("ok", "")
+    err_msg = request.args.get("err", "")
+    alert = ""
+    if ok_msg:
+        alert = f'<div class="alert alert-success">✅ {esc(ok_msg)}</div>'
+    elif err_msg:
+        alert = f'<div class="alert alert-error">❌ {esc(err_msg)}</div>'
+
+    # Grid de produtos cadastrados
+    products_html = ""
+    if products:
+        for p in products:
+            img_url = f"/media/gallery/{p['id']}"
+            products_html += f"""
+            <div class="card" style="padding:16px">
+                <img src="{img_url}" style="width:100%;height:180px;object-fit:cover;border-radius:8px;margin-bottom:12px" alt="{esc(p['name'])}">
+                <h3 style="font-size:16px;margin-bottom:4px;color:var(--text)">{esc(p['name'])}</h3>
+                <p style="font-size:13px;color:var(--text3);margin-bottom:8px">{esc(p['description'] or 'Sem descrição')}</p>
+                <p style="font-size:12px;color:var(--accent2);margin-bottom:12px"><strong>Palavras-chave:</strong> {esc(p['keywords'] or 'nenhuma')}</p>
+                <form method="POST" action="/dashboard/gallery/delete" style="margin:0">{csrf_field()}
+                    <input type="hidden" name="id" value="{int(p['id'])}">
+                    <button type="submit" class="btn" style="background:rgba(239,68,68,0.2);color:#ef4444;width:100%;font-size:13px">🗑️ Excluir</button>
+                </form>
+            </div>
+            """
+    else:
+        products_html = '<p style="color:var(--text3);grid-column:1/-1;text-align:center;padding:40px">Nenhuma foto cadastrada ainda. Adicione produtos acima para que a IA possa enviá-los automaticamente.</p>'
+
+    content = f"""<div class="container">
+        <div class="page-header fade-in">
+            <h1>Galeria de Produtos 📸</h1>
+            <p>Cadastre fotos de produtos/serviços. Quando um cliente pedir, a IA envia automaticamente.</p>
+        </div>
+        {alert}
+
+        <div class="card fade-in fade-in-1" style="margin-bottom:24px">
+            <div class="card-header"><span class="card-title">➕ Adicionar nova foto</span></div>
+            <form method="POST" action="/dashboard/gallery/upload" enctype="multipart/form-data">{csrf_field()}
+                <div class="grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Nome do produto *</label>
+                        <input type="text" name="name" class="form-input" placeholder="Ex: Pizza Calabresa" required maxlength="100">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Palavras-chave (separadas por vírgula) *</label>
+                        <input type="text" name="keywords" class="form-input" placeholder="Ex: pizza, calabresa, calabreza, peperoni" required maxlength="300">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Descrição (opcional)</label>
+                    <textarea name="description" class="form-input" rows="2" placeholder="Ex: Pizza grande de calabresa com cebola, mussarela e orégano - R$ 49,90" maxlength="500"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Imagem (JPG ou PNG, máx 5MB) *</label>
+                    <input type="file" name="photo" accept="image/jpeg,image/png,image/jpg" required
+                        style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08);padding:10px;border-radius:8px;color:var(--text);width:100%">
+                </div>
+                <button type="submit" class="btn btn-primary">📤 Cadastrar produto</button>
+            </form>
+        </div>
+
+        <div class="card fade-in fade-in-2">
+            <div class="card-header"><span class="card-title">📦 Produtos cadastrados ({len(products)})</span></div>
+            <div class="grid-3" style="gap:20px">
+                {products_html}
+            </div>
+        </div>
+    </div>"""
+    return base_html("Galeria", content, dict(user))
+
+
+@app.route("/dashboard/gallery/upload", methods=["POST"])
+@login_required
+def gallery_upload():
+    user = g.user
+    name = request.form.get("name", "").strip()
+    keywords = request.form.get("keywords", "").strip()
+    description = request.form.get("description", "").strip()
+
+    if not name or not keywords:
+        return redirect("/dashboard/gallery?err=" + "Nome%20e%20palavras-chave%20s%C3%A3o%20obrigat%C3%B3rios")
+
+    if "photo" not in request.files:
+        return redirect("/dashboard/gallery?err=" + "Nenhuma%20imagem%20enviada")
+
+    file = request.files["photo"]
+    if file.filename == "":
+        return redirect("/dashboard/gallery?err=" + "Arquivo%20vazio")
+
+    allowed_types = {"image/jpeg", "image/png", "image/jpg"}
+    if file.content_type not in allowed_types:
+        return redirect("/dashboard/gallery?err=" + "Apenas%20JPG%20ou%20PNG")
+
+    image_bytes = file.read()
+    if len(image_bytes) > 5 * 1024 * 1024:
+        return redirect("/dashboard/gallery?err=" + "M%C3%A1ximo%205MB")
+
+    # Salva no diretório de mídia
+    gallery_dir = os.path.join(MEDIA_FOLDER, "gallery")
+    os.makedirs(gallery_dir, exist_ok=True)
+
+    # Nome único do arquivo
+    ext = "jpg" if "jpeg" in file.content_type else "png"
+    timestamp = int(time.time() * 1000)
+    filename = f"user{user['id']}_{timestamp}.{ext}"
+    file_path = os.path.join(gallery_dir, filename)
+
+    with open(file_path, "wb") as f:
+        f.write(image_bytes)
+
+    # Salva no banco
+    db = get_db()
+    db.execute(
+        "INSERT INTO product_gallery (user_id, name, keywords, description, file_path, file_type) VALUES (?,?,?,?,?,?)",
+        (user["id"], name, keywords, description, file_path, file.content_type)
+    )
+    db.commit()
+
+    return redirect("/dashboard/gallery?ok=" + "Produto%20cadastrado!")
+
+
+@app.route("/dashboard/gallery/delete", methods=["POST"])
+@login_required
+def gallery_delete():
+    user = g.user
+    product_id = request.form.get("id", "")
+    try:
+        product_id = int(product_id)
+    except ValueError:
+        return redirect("/dashboard/gallery?err=ID%20inv%C3%A1lido")
+
+    db = get_db()
+    product = db.execute(
+        "SELECT * FROM product_gallery WHERE id=? AND user_id=?",
+        (product_id, user["id"])
+    ).fetchone()
+
+    if not product:
+        return redirect("/dashboard/gallery?err=Produto%20n%C3%A3o%20encontrado")
+
+    # Remove arquivo físico
+    try:
+        if os.path.exists(product["file_path"]):
+            os.remove(product["file_path"])
+    except Exception as e:
+        print(f"[GALLERY] Erro ao remover arquivo: {e}")
+
+    # Remove do banco
+    db.execute("DELETE FROM product_gallery WHERE id=?", (product_id,))
+    db.commit()
+
+    return redirect("/dashboard/gallery?ok=" + "Produto%20removido")
+
+
+@app.route("/media/gallery/<int:product_id>")
+@login_required
+def serve_gallery_image(product_id):
+    """Serve imagem da galeria (somente dono)"""
+    user = g.user
+    db = get_db()
+    product = db.execute(
+        "SELECT * FROM product_gallery WHERE id=? AND user_id=?",
+        (product_id, user["id"])
+    ).fetchone()
+
+    if not product or not os.path.exists(product["file_path"]):
+        return "Imagem não encontrada", 404
+
+    return send_file(product["file_path"], mimetype=product["file_type"])
 
 
 def send_whatsapp_audio(phone_id, token, to, audio_path):

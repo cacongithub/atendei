@@ -100,10 +100,16 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 BASE_URL = os.getenv("BASE_URL", "https://atendente.online")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@atende.ai")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # Obrigatório configurar
-DATABASE = "atendeia.db"
-MEDIA_FOLDER = "media_files"
+DATABASE = os.getenv("DATABASE_PATH", "/app/data/atendeia.db" if os.path.isdir("/app/data") else "atendeia.db")
+MEDIA_FOLDER = os.getenv("MEDIA_PATH", "/app/data/media_files" if os.path.isdir("/app/data") else "media_files")
 
 os.makedirs(MEDIA_FOLDER, exist_ok=True)
+# Garante que o diretório do banco existe (para volumes persistentes)
+db_dir = os.path.dirname(DATABASE)
+if db_dir:
+    os.makedirs(db_dir, exist_ok=True)
+print(f"[STORAGE] Banco de dados: {DATABASE}")
+print(f"[STORAGE] Mídia: {MEDIA_FOLDER}")
 
 # ─── LOGGING ──────────────────────────────────────────────────
 DEBUG_MODE = os.getenv("FLASK_ENV", "").lower() == "development" or os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
@@ -2230,55 +2236,136 @@ def whatsapp_webhook(user_id):
 
 
 def fetch_weather(message):
-    """Busca previsão do tempo usando wttr.in (grátis, sem API key)"""
+    """Busca previsão do tempo usando Open-Meteo (grátis, sem API key, confiável)"""
     try:
         import requests as req
-        # Tenta extrair nome da cidade da mensagem
+        # Extrai nome da cidade da mensagem
         msg_lower = message.lower()
-        # Remove palavras comuns para isolar a cidade
-        remove_words = ["como", "está", "qual", "tempo", "clima", "temperatura", "previsão",
+        remove_words = ["como", "está", "esta", "qual", "tempo", "clima", "temperatura", "previsão",
                        "previsao", "chuva", "chover", "vai", "hoje", "amanhã", "amanha",
                        "em", "de", "do", "da", "no", "na", "para", "o", "a", "é", "e",
                        "frio", "calor", "quente", "agora", "aqui", "lá", "la", "tá", "ta",
-                       "mensagem", "áudio", "audio", "cliente", "faz", "fazer"]
-        
-        words = msg_lower.split()
+                       "mensagem", "áudio", "audio", "cliente", "faz", "fazer",
+                       "me", "diga", "fala", "saber", "dizer", "ver", "posso",
+                       "qualé", "quale", "que", "tal"]
+
+        # Limpa pontuação
+        import re as re_mod
+        msg_clean = re_mod.sub(r'[?!.,;:]', '', msg_lower)
+        words = msg_clean.split()
         city_words = [w for w in words if w not in remove_words and len(w) > 2]
         city = " ".join(city_words).strip()
-        
+
         if not city:
-            city = "Fortaleza"  # Cidade padrão
-        
-        print(f"[WEATHER] Buscando clima para: {city}")
-        resp = req.get(f"https://wttr.in/{city}?format=j1&lang=pt", timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            current = data.get("current_condition", [{}])[0]
-            forecast = data.get("weather", [{}])[0]
-            
-            temp = current.get("temp_C", "?")
-            feels = current.get("FeelsLikeC", "?")
-            humidity = current.get("humidity", "?")
-            desc_list = current.get("lang_pt", [{}])
-            desc = desc_list[0].get("value", current.get("weatherDesc", [{}])[0].get("value", "")) if desc_list else ""
-            wind = current.get("windspeedKmph", "?")
-            
-            max_temp = forecast.get("maxtempC", "?")
-            min_temp = forecast.get("mintempC", "?")
-            
-            area = data.get("nearest_area", [{}])[0]
-            area_name = area.get("areaName", [{}])[0].get("value", city) if area.get("areaName") else city
-            region = area.get("region", [{}])[0].get("value", "") if area.get("region") else ""
-            
-            weather_text = f"Cidade: {area_name}{', ' + region if region else ''}. Condição: {desc}. Temperatura: {temp}°C (sensação {feels}°C). Mínima: {min_temp}°C, Máxima: {max_temp}°C. Umidade: {humidity}%. Vento: {wind} km/h."
-            print(f"[WEATHER] Resultado: {weather_text}")
-            return weather_text
-        else:
-            print(f"[WEATHER] Erro: {resp.status_code}")
+            city = "Fortaleza"
+
+        print(f"[WEATHER] Buscando cidade: {city}")
+
+        # 1. Geocodificação: converte nome → coordenadas
+        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=pt&format=json"
+        geo_resp = req.get(geo_url, timeout=10)
+        if geo_resp.status_code != 200:
+            print(f"[WEATHER] Erro geocoding: {geo_resp.status_code}")
             return ""
+
+        geo_data = geo_resp.json()
+        results = geo_data.get("results", [])
+        if not results:
+            print(f"[WEATHER] Cidade não encontrada: {city}")
+            return ""
+
+        loc = results[0]
+        lat = loc.get("latitude")
+        lon = loc.get("longitude")
+        city_name = loc.get("name", city)
+        country = loc.get("country", "")
+        admin1 = loc.get("admin1", "")  # Estado/Província
+
+        # 2. Busca clima atual + previsão
+        weather_url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code,is_day"
+            f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"
+            f"&timezone=America/Sao_Paulo&forecast_days=1"
+        )
+        weather_resp = req.get(weather_url, timeout=10)
+        if weather_resp.status_code != 200:
+            print(f"[WEATHER] Erro clima: {weather_resp.status_code}")
+            return ""
+
+        data = weather_resp.json()
+        current = data.get("current", {})
+        daily = data.get("daily", {})
+
+        temp = current.get("temperature_2m", "?")
+        feels = current.get("apparent_temperature", "?")
+        humidity = current.get("relative_humidity_2m", "?")
+        wind = current.get("wind_speed_10m", "?")
+        wcode = current.get("weather_code", 0)
+        is_day = current.get("is_day", 1)
+
+        max_temp = daily.get("temperature_2m_max", [None])[0]
+        min_temp = daily.get("temperature_2m_min", [None])[0]
+        rain_prob = daily.get("precipitation_probability_max", [None])[0]
+
+        # Mapeia código WMO para descrição em PT-BR
+        desc = _weather_code_to_pt(wcode, is_day)
+
+        location = f"{city_name}"
+        if admin1 and admin1 != city_name:
+            location += f", {admin1}"
+        if country:
+            location += f", {country}"
+
+        parts = [
+            f"Cidade: {location}",
+            f"Condição: {desc}",
+            f"Temperatura: {temp}°C (sensação {feels}°C)",
+        ]
+        if max_temp is not None and min_temp is not None:
+            parts.append(f"Mínima: {min_temp}°C, Máxima: {max_temp}°C")
+        if rain_prob is not None:
+            parts.append(f"Chance de chuva: {rain_prob}%")
+        parts.append(f"Umidade: {humidity}%")
+        parts.append(f"Vento: {wind} km/h")
+
+        weather_text = ". ".join(parts) + "."
+        print(f"[WEATHER] ✅ {weather_text}")
+        return weather_text
+
     except Exception as e:
         print(f"[WEATHER] Exceção: {e}")
         return ""
+
+
+def _weather_code_to_pt(code, is_day=1):
+    """Converte código WMO (Open-Meteo) para descrição em português"""
+    codes = {
+        0: "céu limpo" if is_day else "noite limpa",
+        1: "predominantemente ensolarado" if is_day else "predominantemente limpo",
+        2: "parcialmente nublado",
+        3: "nublado",
+        45: "nevoeiro",
+        48: "nevoeiro com geada",
+        51: "garoa leve",
+        53: "garoa moderada",
+        55: "garoa intensa",
+        61: "chuva leve",
+        63: "chuva moderada",
+        65: "chuva forte",
+        71: "neve leve",
+        73: "neve moderada",
+        75: "neve forte",
+        77: "granizo",
+        80: "pancadas de chuva leves",
+        81: "pancadas de chuva moderadas",
+        82: "pancadas de chuva fortes",
+        95: "tempestade com raios",
+        96: "tempestade com granizo leve",
+        99: "tempestade com granizo forte",
+    }
+    return codes.get(code, "condição desconhecida")
 
 
 def generate_ai_response(user, conversation_id, message, db_conn):

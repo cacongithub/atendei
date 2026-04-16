@@ -1777,6 +1777,58 @@ def whatsapp_webhook(user_id):
     return jsonify({"status":"ok"}), 200
 
 
+def fetch_weather(message):
+    """Busca previsão do tempo usando wttr.in (grátis, sem API key)"""
+    try:
+        import requests as req
+        # Tenta extrair nome da cidade da mensagem
+        msg_lower = message.lower()
+        # Remove palavras comuns para isolar a cidade
+        remove_words = ["como", "está", "qual", "tempo", "clima", "temperatura", "previsão",
+                       "previsao", "chuva", "chover", "vai", "hoje", "amanhã", "amanha",
+                       "em", "de", "do", "da", "no", "na", "para", "o", "a", "é", "e",
+                       "frio", "calor", "quente", "agora", "aqui", "lá", "la", "tá", "ta",
+                       "mensagem", "áudio", "audio", "cliente", "faz", "fazer"]
+        
+        words = msg_lower.split()
+        city_words = [w for w in words if w not in remove_words and len(w) > 2]
+        city = " ".join(city_words).strip()
+        
+        if not city:
+            city = "Fortaleza"  # Cidade padrão
+        
+        print(f"[WEATHER] Buscando clima para: {city}")
+        resp = req.get(f"https://wttr.in/{city}?format=j1&lang=pt", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            current = data.get("current_condition", [{}])[0]
+            forecast = data.get("weather", [{}])[0]
+            
+            temp = current.get("temp_C", "?")
+            feels = current.get("FeelsLikeC", "?")
+            humidity = current.get("humidity", "?")
+            desc_list = current.get("lang_pt", [{}])
+            desc = desc_list[0].get("value", current.get("weatherDesc", [{}])[0].get("value", "")) if desc_list else ""
+            wind = current.get("windspeedKmph", "?")
+            
+            max_temp = forecast.get("maxtempC", "?")
+            min_temp = forecast.get("mintempC", "?")
+            
+            area = data.get("nearest_area", [{}])[0]
+            area_name = area.get("areaName", [{}])[0].get("value", city) if area.get("areaName") else city
+            region = area.get("region", [{}])[0].get("value", "") if area.get("region") else ""
+            
+            weather_text = f"Cidade: {area_name}{', ' + region if region else ''}. Condição: {desc}. Temperatura: {temp}°C (sensação {feels}°C). Mínima: {min_temp}°C, Máxima: {max_temp}°C. Umidade: {humidity}%. Vento: {wind} km/h."
+            print(f"[WEATHER] Resultado: {weather_text}")
+            return weather_text
+        else:
+            print(f"[WEATHER] Erro: {resp.status_code}")
+            return ""
+    except Exception as e:
+        print(f"[WEATHER] Exceção: {e}")
+        return ""
+
+
 def generate_ai_response(user, conversation_id, message, db_conn):
     history = list(reversed(db_conn.execute("SELECT sender,content FROM messages WHERE conversation_id=? ORDER BY created_at DESC LIMIT 10", (conversation_id,)).fetchall()))
     kb_items = db_conn.execute("SELECT title,content FROM knowledge_base WHERE user_id=? LIMIT 20", (user["id"],)).fetchall()
@@ -1805,13 +1857,27 @@ REGRAS:
 - Se o cliente enviar áudio, você receberá a transcrição marcada como [MENSAGEM DE ÁUDIO DO CLIENTE]. Responda de forma conversacional e natural, como se estivesse falando (a resposta será convertida em áudio). NÃO use formatação como asteriscos, bullets, listas numeradas ou markdown. Escreva em frases corridas e naturais. Seja breve, no máximo 3 frases.
 - Se o cliente enviar imagem, você receberá a descrição da imagem
 - Se o cliente enviar PDF, você receberá o texto extraído
+- Se o cliente perguntar sobre tempo/clima, você receberá dados reais marcados como [DADOS DO CLIMA ATUALIZADOS]. Use esses dados para responder com precisão.
 """
 
     api_messages = [{"role":"assistant" if h["sender"]=="bot" else "user","content":h["content"]} for h in history]
+
+    # Detecta perguntas sobre clima/tempo e busca dados reais
+    weather_data = ""
+    weather_keywords = ["tempo", "clima", "temperatura", "previsão", "chuva", "chover", "frio", "calor", "quente", "ensolarado", "nublado"]
+    msg_lower = message.lower()
+    if any(kw in msg_lower for kw in weather_keywords):
+        weather_data = fetch_weather(message)
+        if weather_data:
+            message = f"{message}\n\n[DADOS DO CLIMA ATUALIZADOS]: {weather_data}"
+
     api_messages.append({"role":"user","content":message})
 
+    ai_engine = get_setting("AI_ENGINE", "claude")  # claude ou openai
+
+    # Tenta Claude primeiro (se configurado e selecionado)
     api_key = get_setting("ANTHROPIC_API_KEY")
-    if api_key:
+    if api_key and ai_engine == "claude":
         try:
             import requests as req
             resp = req.post("https://api.anthropic.com/v1/messages",
@@ -1825,7 +1891,31 @@ REGRAS:
                 db_conn.execute("INSERT INTO api_usage_log (user_id,api_name,tokens_in,tokens_out,cost_estimate) VALUES (?,?,?,?,?)",
                     (user["id"],"anthropic",tokens_in,tokens_out,cost))
                 return result["content"][0]["text"]
-        except Exception as e: print(f"AI error: {e}")
+            else:
+                print(f"Claude error: {resp.status_code} {resp.text[:200]}")
+        except Exception as e: print(f"Claude error: {e}")
+
+    # Tenta OpenAI/ChatGPT (se configurado)
+    openai_key = get_setting("OPENAI_API_KEY")
+    if openai_key and (ai_engine == "openai" or not api_key):
+        try:
+            import requests as req
+            openai_messages = [{"role": "system", "content": system_prompt}] + api_messages
+            resp = req.post("https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                json={"model": "gpt-4o-mini", "max_tokens": 500, "messages": openai_messages}, timeout=30)
+            if resp.status_code == 200:
+                result = resp.json()
+                usage = result.get("usage", {})
+                tokens_in = usage.get("prompt_tokens", 0)
+                tokens_out = usage.get("completion_tokens", 0)
+                cost = (tokens_in * 0.15 / 1000000) + (tokens_out * 0.6 / 1000000)
+                db_conn.execute("INSERT INTO api_usage_log (user_id,api_name,tokens_in,tokens_out,cost_estimate) VALUES (?,?,?,?,?)",
+                    (user["id"],"openai",tokens_in,tokens_out,cost))
+                return result["choices"][0]["message"]["content"]
+            else:
+                print(f"OpenAI error: {resp.status_code} {resp.text[:200]}")
+        except Exception as e: print(f"OpenAI error: {e}")
 
     return user["ai_greeting"] or "Olá! Obrigado por entrar em contato. Como posso ajudar?"
 
@@ -2257,6 +2347,8 @@ def admin_api_settings():
         if smtp_password: set_setting("SMTP_PASSWORD", smtp_password)
         if smtp_host: set_setting("SMTP_HOST", smtp_host)
         if smtp_port: set_setting("SMTP_PORT", smtp_port)
+        ai_engine_val = request.form.get("AI_ENGINE", "").strip()
+        if ai_engine_val: set_setting("AI_ENGINE", ai_engine_val)
         resend_key = request.form.get("RESEND_API_KEY", "").strip()
         resend_from = request.form.get("RESEND_FROM_EMAIL", "").strip()
         if resend_key: set_setting("RESEND_API_KEY", resend_key)
@@ -2273,6 +2365,7 @@ def admin_api_settings():
     smtp_password = get_setting("SMTP_PASSWORD")
     smtp_host = get_setting("SMTP_HOST", "smtp.hostinger.com")
     smtp_port = get_setting("SMTP_PORT", "465")
+    ai_engine = get_setting("AI_ENGINE", "claude")
     resend_key = get_setting("RESEND_API_KEY")
     resend_from = get_setting("RESEND_FROM_EMAIL", "atendente.online <onboarding@resend.dev>")
 
@@ -2288,10 +2381,18 @@ def admin_api_settings():
             <div class="card fade-in fade-in-1">
                 <div class="card-header"><span class="card-title">IA e Transcrição</span></div>
                 <div class="form-group">
-                    <label class="form-label">Anthropic API Key (Claude — IA)</label>
+                    <label class="form-label">Motor de IA</label>
+                    <select name="AI_ENGINE" class="form-input" style="background:#2a2a3a;border:2px solid var(--accent)">
+                        <option value="claude" {'selected' if ai_engine == 'claude' else ''}>Claude (Anthropic) — Recomendado</option>
+                        <option value="openai" {'selected' if ai_engine == 'openai' else ''}>ChatGPT (OpenAI)</option>
+                    </select>
+                    <small style="color:var(--text3)">Motor atual: <strong style="color:var(--accent2)">{'Claude' if ai_engine == 'claude' else 'ChatGPT'}</strong></small>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Anthropic API Key (Claude)</label>
                     <input type="text" name="ANTHROPIC_API_KEY" class="form-input" placeholder="sk-ant-..." value="" autocomplete="off"
                         style="background:#2a2a3a;border:2px solid {'var(--green)' if anthropic_key else 'var(--red)'}">
-                    <small style="color:var(--text3)">{'✅ Configurada: ' + mask(anthropic_key) if anthropic_key else '❌ Não configurada — IA usa respostas padrão'}</small>
+                    <small style="color:var(--text3)">{'✅ Configurada: ' + mask(anthropic_key) if anthropic_key else '❌ Não configurada'}</small>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Groq API Key (Transcrição de áudio)</label>
@@ -2300,10 +2401,10 @@ def admin_api_settings():
                     <small style="color:var(--text3)">{'✅ Configurada: ' + mask(groq_key) if groq_key else '❌ Não configurada — áudios não serão transcritos'}</small>
                 </div>
                 <div class="form-group">
-                    <label class="form-label">OpenAI API Key (fallback áudio)</label>
+                    <label class="form-label">OpenAI API Key (ChatGPT + fallback áudio)</label>
                     <input type="text" name="OPENAI_API_KEY" class="form-input" placeholder="sk-..." value="" autocomplete="off"
-                        style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
-                    <small style="color:var(--text3)">{'✅ Configurada: ' + mask(openai_key) if openai_key else '⬜ Opcional — usado se Groq falhar'}</small>
+                        style="background:#2a2a3a;border:2px solid {'var(--green)' if openai_key else 'var(--orange)'}">
+                    <small style="color:var(--text3)">{'✅ Configurada: ' + mask(openai_key) if openai_key else '⬜ Configure para usar ChatGPT como motor de IA'}</small>
                 </div>
             </div>
             <div class="card fade-in fade-in-2">

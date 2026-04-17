@@ -251,10 +251,94 @@ LOGO_NAV_B64 = "iVBORw0KGgoAAAANSUhEUgAAALsAAAA4CAIAAAAq1h5LAAABCGlDQ1BJQ0MgUHJv
 
 # Planos
 PLANS = {
-    "starter":  {"name": "Starter",       "price": 97.00,  "msgs": 500,   "desc": "Ideal para começar"},
-    "pro":      {"name": "Profissional",   "price": 197.00, "msgs": 2000,  "desc": "Para negócios em crescimento"},
-    "business": {"name": "Business",       "price": 397.00, "msgs": 10000, "desc": "Volume máximo"},
+    "starter":  {
+        "name": "Starter",
+        "price": 97.00,
+        "msgs": 500,
+        "desc": "Para quem está começando",
+        "tagline": "Automatize seu WhatsApp com IA",
+        "features": [
+            "Atendimento automático com IA (Claude)",
+            "500 mensagens/mês",
+            "Entende texto, áudio, imagens e PDFs",
+            "Responde por áudio (text-to-speech)",
+            "Base de conhecimento treinável",
+            "Dashboard com conversas em tempo real",
+            "Galeria de produtos (sem venda)",
+            "Suporte por email"
+        ],
+        "highlight": False,
+        "cta": "Começar grátis"
+    },
+    "pro": {
+        "name": "Profissional",
+        "price": 197.00,
+        "msgs": 2000,
+        "desc": "Para negócios em crescimento",
+        "tagline": "Atendimento + Agência Digital",
+        "features": [
+            "Tudo do Starter",
+            "2.000 mensagens/mês",
+            "📸 Agência Digital com IA",
+            "Posts automáticos para redes sociais",
+            "Aprovação via Telegram Bot",
+            "Biblioteca de mídia ilimitada",
+            "Agenda semanal de publicações",
+            "Respostas rápidas",
+            "Exportação de conversas",
+            "Suporte prioritário"
+        ],
+        "highlight": True,
+        "cta": "Começar teste grátis"
+    },
+    "business": {
+        "name": "Business",
+        "price": 397.00,
+        "msgs": 10000,
+        "desc": "Para empresas que vendem",
+        "tagline": "Vendas + Campanhas + Agência",
+        "features": [
+            "Tudo do Profissional",
+            "10.000 mensagens/mês",
+            "🛒 Comércio direto no WhatsApp",
+            "PIX automático via Mercado Pago",
+            "Link de cartão/boleto no chat",
+            "Detecção de intenção de compra",
+            "📢 Campanhas em massa (broadcast)",
+            "CRM com funil de vendas",
+            "Gestão de contatos e tags",
+            "Analytics avançado",
+            "Multicanal (Instagram + Messenger)*",
+            "Suporte WhatsApp"
+        ],
+        "highlight": False,
+        "cta": "Começar teste grátis"
+    },
+    "agency": {
+        "name": "Agência",
+        "price": 997.00,
+        "msgs": 50000,
+        "desc": "Para revender como serviço",
+        "tagline": "Multi-contas + tudo ilimitado",
+        "features": [
+            "Tudo do Business",
+            "50.000 mensagens/mês",
+            "Até 10 contas de cliente",
+            "Sub-usuários atendentes",
+            "Campanhas ilimitadas",
+            "Posts automáticos ilimitados",
+            "Modelos de templates para clientes",
+            "Dashboard multi-empresa",
+            "API dedicada",
+            "Relatórios white-label",
+            "Suporte telefônico",
+            "Onboarding personalizado"
+        ],
+        "highlight": False,
+        "cta": "Falar com vendas"
+    }
 }
+# *Multicanal disponível após aprovação Meta (em andamento)
 
 # ─── DATABASE ──────────────────────────────────────────────────
 def get_db():
@@ -397,6 +481,117 @@ def init_db():
         created_at TEXT DEFAULT (datetime('now')),
         FOREIGN KEY (user_id) REFERENCES users(id)
     );
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        conversation_id INTEGER,
+        customer_phone TEXT,
+        customer_name TEXT,
+        items TEXT DEFAULT '',
+        total REAL DEFAULT 0,
+        payment_method TEXT DEFAULT 'pix',
+        payment_status TEXT DEFAULT 'pending',
+        mp_payment_id TEXT DEFAULT '',
+        mp_qr_code TEXT DEFAULT '',
+        mp_copy_paste TEXT DEFAULT '',
+        mp_checkout_url TEXT DEFAULT '',
+        paid_at TEXT DEFAULT '',
+        expires_at TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS campaigns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        template_id INTEGER,
+        total_contacts INTEGER DEFAULT 0,
+        sent_count INTEGER DEFAULT 0,
+        delivered_count INTEGER DEFAULT 0,
+        failed_count INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'draft',
+        scheduled_for TEXT DEFAULT '',
+        started_at TEXT DEFAULT '',
+        completed_at TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS campaign_contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id INTEGER NOT NULL,
+        phone TEXT NOT NULL,
+        name TEXT DEFAULT '',
+        status TEXT DEFAULT 'pending',
+        error TEXT DEFAULT '',
+        sent_at TEXT DEFAULT '',
+        variables TEXT DEFAULT '',
+        FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+    );
+    CREATE TABLE IF NOT EXISTS whatsapp_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        variables_count INTEGER DEFAULT 0,
+        category TEXT DEFAULT 'marketing',
+        status TEXT DEFAULT 'pending',
+        meta_template_id TEXT DEFAULT '',
+        times_used INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        phone TEXT NOT NULL,
+        name TEXT DEFAULT '',
+        email TEXT DEFAULT '',
+        tags TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        lifecycle_stage TEXT DEFAULT 'lead',
+        last_contact_at TEXT DEFAULT '',
+        total_orders INTEGER DEFAULT 0,
+        total_spent REAL DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS pipeline_stages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        color TEXT DEFAULT '#6366f1',
+        position INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS pipeline_cards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        stage_id INTEGER NOT NULL,
+        conversation_id INTEGER,
+        contact_id INTEGER,
+        title TEXT NOT NULL,
+        value REAL DEFAULT 0,
+        notes TEXT DEFAULT '',
+        position INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        moved_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS sub_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER NOT NULL,
+        email TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT DEFAULT 'agent',
+        is_active INTEGER DEFAULT 1,
+        last_login TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (owner_id) REFERENCES users(id)
+    );
     CREATE TABLE IF NOT EXISTS social_media_library (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -446,6 +641,15 @@ def init_db():
         ("users", "social_post_days", "TEXT DEFAULT '1,2,3,4,5'"),
         ("users", "social_post_times", "TEXT DEFAULT '09:00'"),
         ("users", "social_last_run", "TEXT DEFAULT ''"),
+        ("users", "mp_access_token", "TEXT DEFAULT ''"),
+        ("users", "mp_public_key", "TEXT DEFAULT ''"),
+        ("users", "commerce_enabled", "INTEGER DEFAULT 0"),
+        ("users", "auto_payment_enabled", "INTEGER DEFAULT 1"),
+        ("product_gallery", "price", "REAL DEFAULT 0"),
+        ("product_gallery", "stock", "INTEGER DEFAULT -1"),
+        ("product_gallery", "sku", "TEXT DEFAULT ''"),
+        ("product_gallery", "category", "TEXT DEFAULT ''"),
+        ("product_gallery", "active", "INTEGER DEFAULT 1"),
         ("conversations", "satisfaction_rating", "INTEGER DEFAULT 0"),
         ("conversations", "tags", "TEXT DEFAULT ''"),
         ("conversations", "notes", "TEXT DEFAULT ''"),
@@ -1202,8 +1406,11 @@ def base_html(title, content, user=None):
                 <a href="/dashboard" class="nav-link">Dashboard</a>
                 <a href="/dashboard/conversations" class="nav-link">Conversas</a>
                 <a href="/dashboard/training" class="nav-link">Treinamento</a>
-                <a href="/dashboard/quick-replies" class="nav-link">Respostas rápidas</a>
                 <a href="/dashboard/gallery" class="nav-link">Galeria</a>
+                <a href="/dashboard/commerce" class="nav-link">🛒 Vendas</a>
+                <a href="/dashboard/campaigns" class="nav-link">📢 Campanhas</a>
+                <a href="/dashboard/contacts" class="nav-link">Contatos</a>
+                <a href="/dashboard/pipeline" class="nav-link">Funil</a>
                 <a href="/dashboard/social" class="nav-link">📸 Agência</a>
                 <a href="/dashboard/settings" class="nav-link">Config</a>
                 <a href="/dashboard/billing" class="nav-link nav-link-accent">Plano</a>
@@ -1514,20 +1721,126 @@ def landing():
         </div>
     </div>
 
-    <div id="pricing" style="text-align:center;padding:20px 24px 80px">
-        <p style="color:var(--accent2);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">Planos</p>
-        <h2 style="font-size:32px;margin-bottom:12px;letter-spacing:-0.5px">Invista no crescimento do seu negócio</h2>
-        <p style="color:var(--text2);margin-bottom:40px">7 dias grátis em todos os planos. Cancele quando quiser.</p>
-        <div class="grid-3" style="max-width:900px;margin:0 auto">
-            <div class="plan-card fade-in fade-in-1"><div class="plan-name">Starter</div><div class="plan-price">R$ 97<small>/mês</small></div><div class="plan-desc">Ideal para começar</div>
-                <ul class="plan-features"><li>500 mensagens/mês</li><li>Áudio + Imagem + PDF</li><li>Base de conhecimento</li><li>Painel de conversas</li></ul>
-                <a href="/register?plan=starter" class="btn btn-secondary btn-block">Começar grátis</a></div>
-            <div class="plan-card popular fade-in fade-in-2"><div class="plan-name">Profissional</div><div class="plan-price">R$ 197<small>/mês</small></div><div class="plan-desc">Para negócios em crescimento</div>
-                <ul class="plan-features"><li>2.000 mensagens/mês</li><li>Tudo do Starter</li><li>Respostas rápidas</li><li>CRM básico</li><li>Suporte prioritário</li></ul>
-                <a href="/register?plan=pro" class="btn btn-primary btn-block">Começar grátis</a></div>
-            <div class="plan-card fade-in fade-in-3"><div class="plan-name">Business</div><div class="plan-price">R$ 397<small>/mês</small></div><div class="plan-desc">Volume máximo</div>
-                <ul class="plan-features"><li>10.000 mensagens/mês</li><li>Tudo do Pro</li><li>Múltiplos números</li><li>API personalizada</li><li>Gerente de conta</li></ul>
-                <a href="/register?plan=business" class="btn btn-secondary btn-block">Começar grátis</a></div>
+    <div id="pricing" style="text-align:center;padding:60px 24px 80px;max-width:1400px;margin:0 auto">
+        <p style="color:var(--accent2);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">Planos e preços</p>
+        <h2 style="font-size:36px;margin-bottom:12px;letter-spacing:-0.5px">Escolha o plano ideal para você</h2>
+        <p style="color:var(--text2);margin-bottom:48px;font-size:16px">7 dias grátis em todos os planos · Cancele quando quiser · Sem fidelidade</p>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:20px;max-width:1300px;margin:0 auto;text-align:left">
+
+            <!-- STARTER -->
+            <div class="plan-card fade-in fade-in-1" style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:32px 24px;display:flex;flex-direction:column">
+                <div style="text-align:center;margin-bottom:20px">
+                    <div style="font-size:14px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:1px">STARTER</div>
+                    <div style="font-size:12px;color:var(--text3);margin-top:4px">Para quem está começando</div>
+                </div>
+                <div style="text-align:center;margin-bottom:24px">
+                    <div style="font-size:42px;font-weight:700;color:var(--text)">R$ 97<span style="font-size:16px;color:var(--text3);font-weight:400">/mês</span></div>
+                    <div style="color:var(--text3);font-size:13px;margin-top:4px">500 mensagens incluídas</div>
+                </div>
+                <ul style="list-style:none;padding:0;margin:0 0 24px 0;flex:1">
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">✅ <strong>IA Claude</strong> (modelo top)</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">🎤 Entende áudio</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">🔊 Responde por áudio</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📷 Analisa imagens</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📄 Lê PDFs</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📚 Base de conhecimento</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📸 Galeria de produtos</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px">💬 Suporte por email</li>
+                </ul>
+                <a href="/register?plan=starter" class="btn btn-secondary btn-block" style="text-align:center">Começar grátis</a>
+            </div>
+
+            <!-- PRO (highlighted) -->
+            <div class="plan-card fade-in fade-in-2" style="background:linear-gradient(135deg,rgba(99,102,241,0.08),rgba(168,85,247,0.08));border:2px solid var(--accent2);border-radius:16px;padding:32px 24px;display:flex;flex-direction:column;position:relative;transform:scale(1.02)">
+                <div style="position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,var(--accent),var(--accent2));padding:4px 16px;border-radius:20px;font-size:11px;font-weight:700;color:white;letter-spacing:1px">⭐ MAIS POPULAR</div>
+                <div style="text-align:center;margin-bottom:20px">
+                    <div style="font-size:14px;color:var(--accent2);font-weight:600;text-transform:uppercase;letter-spacing:1px">PROFISSIONAL</div>
+                    <div style="font-size:12px;color:var(--text3);margin-top:4px">Atendimento + Agência Digital</div>
+                </div>
+                <div style="text-align:center;margin-bottom:24px">
+                    <div style="font-size:42px;font-weight:700;color:var(--text)">R$ 197<span style="font-size:16px;color:var(--text3);font-weight:400">/mês</span></div>
+                    <div style="color:var(--text3);font-size:13px;margin-top:4px">2.000 mensagens incluídas</div>
+                </div>
+                <ul style="list-style:none;padding:0;margin:0 0 24px 0;flex:1">
+                    <li style="padding:8px 0;color:var(--text);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)"><strong>Tudo do Starter +</strong></li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📸 <strong>Agência Digital com IA</strong></li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">✨ Posts automáticos</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📱 Aprovação via Telegram</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">🗓️ Agenda de publicações</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">⚡ Respostas rápidas</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📥 Exportação de conversas</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px">🎯 Suporte prioritário</li>
+                </ul>
+                <a href="/register?plan=pro" class="btn btn-primary btn-block" style="text-align:center">Começar teste grátis</a>
+            </div>
+
+            <!-- BUSINESS -->
+            <div class="plan-card fade-in fade-in-3" style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:32px 24px;display:flex;flex-direction:column;position:relative">
+                <div style="position:absolute;top:-12px;right:20px;background:#10b981;padding:4px 12px;border-radius:12px;font-size:10px;font-weight:700;color:white;letter-spacing:1px">💰 VENDEDOR</div>
+                <div style="text-align:center;margin-bottom:20px">
+                    <div style="font-size:14px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:1px">BUSINESS</div>
+                    <div style="font-size:12px;color:var(--text3);margin-top:4px">Vendas + Campanhas + Agência</div>
+                </div>
+                <div style="text-align:center;margin-bottom:24px">
+                    <div style="font-size:42px;font-weight:700;color:var(--text)">R$ 397<span style="font-size:16px;color:var(--text3);font-weight:400">/mês</span></div>
+                    <div style="color:var(--text3);font-size:13px;margin-top:4px">10.000 mensagens incluídas</div>
+                </div>
+                <ul style="list-style:none;padding:0;margin:0 0 24px 0;flex:1">
+                    <li style="padding:8px 0;color:var(--text);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)"><strong>Tudo do Profissional +</strong></li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">🛒 <strong>Venda direto no WhatsApp</strong></li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">💳 PIX + Cartão via Mercado Pago</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📢 <strong>Campanhas em massa</strong></li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">🎯 CRM com funil de vendas</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📊 Analytics avançado</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">🏷️ Tags e segmentação</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px">💬 Suporte via WhatsApp</li>
+                </ul>
+                <a href="/register?plan=business" class="btn btn-secondary btn-block" style="text-align:center">Começar teste grátis</a>
+            </div>
+
+            <!-- AGÊNCIA -->
+            <div class="plan-card fade-in fade-in-3" style="background:linear-gradient(135deg,rgba(251,191,36,0.05),rgba(168,85,247,0.05));border:1px solid rgba(251,191,36,0.2);border-radius:16px;padding:32px 24px;display:flex;flex-direction:column;position:relative">
+                <div style="position:absolute;top:-12px;right:20px;background:linear-gradient(135deg,#fbbf24,#a855f7);padding:4px 12px;border-radius:12px;font-size:10px;font-weight:700;color:white;letter-spacing:1px">👑 PREMIUM</div>
+                <div style="text-align:center;margin-bottom:20px">
+                    <div style="font-size:14px;color:#fbbf24;font-weight:600;text-transform:uppercase;letter-spacing:1px">AGÊNCIA</div>
+                    <div style="font-size:12px;color:var(--text3);margin-top:4px">Para revender como serviço</div>
+                </div>
+                <div style="text-align:center;margin-bottom:24px">
+                    <div style="font-size:42px;font-weight:700;color:var(--text)">R$ 997<span style="font-size:16px;color:var(--text3);font-weight:400">/mês</span></div>
+                    <div style="color:var(--text3);font-size:13px;margin-top:4px">50.000 mensagens + multi-conta</div>
+                </div>
+                <ul style="list-style:none;padding:0;margin:0 0 24px 0;flex:1">
+                    <li style="padding:8px 0;color:var(--text);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)"><strong>Tudo do Business +</strong></li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">🏢 <strong>Até 10 contas de cliente</strong></li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">👥 Sub-usuários atendentes</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">♾️ Campanhas ilimitadas</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">♾️ Posts automáticos ilimitados</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">🔌 API dedicada</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px;border-bottom:1px solid rgba(255,255,255,0.04)">📞 Suporte telefônico</li>
+                    <li style="padding:8px 0;color:var(--text2);font-size:14px">🚀 Onboarding personalizado</li>
+                </ul>
+                <a href="/register?plan=agency" class="btn btn-secondary btn-block" style="text-align:center">Começar teste grátis</a>
+            </div>
+
+        </div>
+
+        <div style="margin-top:48px;padding:24px;background:rgba(99,102,241,0.04);border:1px solid rgba(99,102,241,0.15);border-radius:12px;max-width:900px;margin-left:auto;margin-right:auto;text-align:left">
+            <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+                <div style="font-size:32px">💡</div>
+                <div style="flex:1;min-width:250px">
+                    <h3 style="color:var(--text);margin:0 0 4px 0;font-size:16px">Por que pagar múltiplas ferramentas?</h3>
+                    <p style="color:var(--text2);font-size:13px;margin:0;line-height:1.6">
+                        Chatbot comum: R$ 597 · Ferramenta de campanhas: R$ 400 · Agência de conteúdo: R$ 2.000+<br>
+                        <strong style="color:var(--accent2)">Total: R$ 2.997/mês.</strong>
+                        Com atendente.online, tudo incluso por R$ 397/mês. <strong style="color:#10b981">Economize 87%.</strong>
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <div style="margin-top:32px;color:var(--text3);font-size:12px;max-width:800px;margin-left:auto;margin-right:auto">
+            💳 Aceitamos Cartão, PIX e Boleto · 🔒 Pagamento seguro via Mercado Pago · ❌ Cancele quando quiser, sem multa
         </div>
     </div>
 
@@ -2353,27 +2666,89 @@ def billing():
         p_label = {"approved":"Aprovado","pending":"Pendente","rejected":"Rejeitado"}.get(p["status"], p["status"])
         payment_rows += f'<tr><td>{p_date}</td><td>R$ {p["amount"]:.2f}</td><td>{p_plan}</td><td><span class="badge {p_cls}">{p_label}</span></td></tr>'
 
+    # Gera cards dos 4 planos com features completas
     plans_html = ""
-    for key, p in PLANS.items():
+    plan_order = ["starter", "pro", "business", "agency"]
+    for key in plan_order:
+        p = PLANS.get(key)
+        if not p:
+            continue
         is_current = key == user["plan"]
-        popular = "popular" if key == "pro" else ""
-        btn = '<span class="badge badge-green" style="font-size:13px;padding:8px 20px">Plano atual</span>' if is_current else f'<a href="/api/mercadopago/create-preference?plan={key}" class="btn btn-primary btn-block">Assinar →</a>'
-        feats = {"starter":["500 msgs/mês","Áudio+Imagem+PDF","Base de conhecimento","Painel conversas"],"pro":["2.000 msgs/mês","Tudo do Starter","Respostas rápidas","CRM básico","Suporte prioritário"],"business":["10.000 msgs/mês","Tudo do Pro","Múltiplos números","API personalizada","Gerente de conta"]}
-        fl = "".join(f"<li>{f}</li>" for f in feats.get(key,[]))
-        plans_html += f'<div class="plan-card {popular}"><div class="plan-name">{p["name"]}</div><div class="plan-price">R$ {p["price"]:.0f}<small>/mês</small></div><div class="plan-desc">{p["desc"]}</div><ul class="plan-features">{fl}</ul>{btn}</div>'
+        is_popular = key == "pro"
+        is_premium = key == "agency"
+
+        border_style = ""
+        badge = ""
+        if is_popular:
+            border_style = "border:2px solid var(--accent2);transform:scale(1.02)"
+            badge = '<div style="position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,var(--accent),var(--accent2));padding:4px 14px;border-radius:20px;font-size:11px;font-weight:700;color:white;letter-spacing:1px">⭐ MAIS POPULAR</div>'
+        elif is_premium:
+            border_style = "border:1px solid rgba(251,191,36,0.3);background:linear-gradient(135deg,rgba(251,191,36,0.04),rgba(168,85,247,0.04))"
+            badge = '<div style="position:absolute;top:-12px;right:20px;background:linear-gradient(135deg,#fbbf24,#a855f7);padding:4px 12px;border-radius:12px;font-size:10px;font-weight:700;color:white">👑 PREMIUM</div>'
+        elif key == "business":
+            badge = '<div style="position:absolute;top:-12px;right:20px;background:#10b981;padding:4px 12px;border-radius:12px;font-size:10px;font-weight:700;color:white">💰 VENDEDOR</div>'
+
+        feats_html = "".join([
+            f'<li style="padding:8px 0;color:var(--text2);font-size:13px;border-bottom:1px solid rgba(255,255,255,0.04)">✓ {f}</li>'
+            for f in p.get("features", [])
+        ])
+
+        if is_current:
+            btn = '<button class="btn" style="width:100%;background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3);pointer-events:none">✓ Plano atual</button>'
+        else:
+            cta = p.get("cta", "Assinar")
+            btn_class = "btn-primary" if is_popular else "btn-secondary"
+            btn = f'<a href="/api/mercadopago/create-preference?plan={key}" class="btn {btn_class}" style="width:100%;text-align:center;text-decoration:none">{cta} →</a>'
+
+        plans_html += f"""
+        <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);{border_style};border-radius:16px;padding:28px 20px;position:relative;display:flex;flex-direction:column">
+            {badge}
+            <div style="text-align:center;margin-bottom:16px">
+                <div style="font-size:13px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:1px">{p['name']}</div>
+                <div style="font-size:11px;color:var(--text3);margin-top:4px">{p.get('tagline', p['desc'])}</div>
+            </div>
+            <div style="text-align:center;margin-bottom:20px">
+                <div style="font-size:36px;font-weight:700;color:var(--text)">R$ {p['price']:.0f}<span style="font-size:14px;color:var(--text3);font-weight:400">/mês</span></div>
+                <div style="color:var(--text3);font-size:12px;margin-top:4px">{p['msgs']:,} mensagens/mês</div>
+            </div>
+            <ul style="list-style:none;padding:0;margin:0 0 20px 0;flex:1">
+                {feats_html}
+            </ul>
+            {btn}
+        </div>
+        """
 
     status_map = {"active":"Ativo","trial":"Período de teste","inactive":"Inativo","cancelled":"Cancelado"}
     cls_map = {"active":"badge-green","trial":"badge-orange","inactive":"badge-red","cancelled":"badge-red"}
 
-    content = f"""<div class="container"><div class="page-header fade-in"><h1>Plano e Pagamento 💳</h1></div>
-        <div class="card fade-in" style="margin-bottom:32px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px">
-            <div><div style="font-size:13px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px">Plano atual</div>
-                <div style="font-size:24px;font-weight:700;margin-top:4px">{plan['name']} <span class="badge {cls_map.get(user['plan_status'],'badge-orange')}">{status_map.get(user['plan_status'],user['plan_status'])}</span></div>
-                <div style="color:var(--text2);margin-top:4px">R$ {plan['price']:.0f}/mês · {user['msgs_used']}/{user['msgs_limit']} mensagens</div></div>
-            <a href="#plans" class="btn btn-primary">Alterar plano</a></div></div>
-        <div id="plans" class="grid-3 fade-in fade-in-1">{plans_html}</div>
-        <div class="card fade-in fade-in-2"><div class="card-header"><span class="card-title">Histórico de pagamentos</span></div>
-            {'<div class="table-wrap"><table><thead><tr><th>Data</th><th>Valor</th><th>Plano</th><th>Status</th></tr></thead><tbody>'+payment_rows+'</tbody></table></div>' if payments else '<div class="empty-state"><div class="icon">📋</div><h3>Nenhum pagamento</h3></div>'}</div></div>"""
+    content = f"""<div class="container">
+        <div class="page-header fade-in"><h1>Plano e Pagamento 💳</h1><p>Escolha o plano ideal para o tamanho do seu negócio</p></div>
+
+        <div class="card fade-in" style="margin-bottom:32px">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px">
+                <div>
+                    <div style="font-size:13px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px">Plano atual</div>
+                    <div style="font-size:24px;font-weight:700;margin-top:4px">{plan['name']} <span class="badge {cls_map.get(user['plan_status'],'badge-orange')}">{status_map.get(user['plan_status'],user['plan_status'])}</span></div>
+                    <div style="color:var(--text2);margin-top:4px">R$ {plan['price']:.0f}/mês · {user['msgs_used']}/{user['msgs_limit']} mensagens usadas</div>
+                </div>
+                <a href="#plans" class="btn btn-primary">Alterar plano ↓</a>
+            </div>
+        </div>
+
+        <div id="plans" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px;margin-top:40px;margin-bottom:32px">
+            {plans_html}
+        </div>
+
+        <div class="alert alert-info" style="margin-bottom:32px">
+            💡 <strong>Dúvidas?</strong> Todos os planos incluem 7 dias grátis, cancelamento a qualquer momento e suporte em português.
+            Pagamento via Cartão, PIX ou Boleto pelo Mercado Pago.
+        </div>
+
+        <div class="card fade-in fade-in-2">
+            <div class="card-header"><span class="card-title">📋 Histórico de pagamentos</span></div>
+            {'<div class="table-wrap"><table><thead><tr><th>Data</th><th>Valor</th><th>Plano</th><th>Status</th></tr></thead><tbody>'+payment_rows+'</tbody></table></div>' if payments else '<div style="text-align:center;padding:40px;color:var(--text3)"><div style="font-size:36px;margin-bottom:8px">📋</div><h3 style="margin:0;font-size:16px">Nenhum pagamento ainda</h3><p style="font-size:13px;margin-top:4px">Seus pagamentos aparecerão aqui</p></div>'}
+        </div>
+    </div>"""
     return base_html("Pagamento", content, dict(user))
 
 
@@ -2678,6 +3053,47 @@ def whatsapp_webhook(user_id):
                     ai_input = media_result.get("description", media_result["content"])
                     if media_result["type"] == "audio":
                         ai_input = f"[MENSAGEM DE ÁUDIO DO CLIENTE]: {ai_input}"
+
+                    # ═══ DETECÇÃO DE INTENÇÃO DE COMPRA ═══
+                    commerce_triggered = False
+                    if user["commerce_enabled"] and user["mp_access_token"] and media_result["type"] == "text":
+                        products = db_conn.execute(
+                            "SELECT * FROM product_gallery WHERE user_id=? AND active=1 AND price > 0",
+                            (user_id,)
+                        ).fetchall()
+                        products_list = [dict(p) for p in products]
+
+                        if products_list:
+                            intent = detect_purchase_intent(ai_input, products_list)
+                            if intent and intent.get("is_purchase") and intent.get("confidence") in ("high", "medium"):
+                                db_conn.close()
+                                order = create_order_from_intent(user, conv["id"], sender_phone, intent)
+                                if order:
+                                    commerce_msg = format_order_message(order)
+                                    send_whatsapp_message(
+                                        user["whatsapp_phone_id"],
+                                        user["whatsapp_token"],
+                                        sender_phone,
+                                        commerce_msg
+                                    )
+                                    # Reabre conexão
+                                    db_conn = sqlite3.connect(DATABASE)
+                                    db_conn.row_factory = sqlite3.Row
+                                    db_conn.execute(
+                                        "INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
+                                        (conv["id"], "bot", commerce_msg, "text")
+                                    )
+                                    db_conn.execute("UPDATE users SET msgs_used=msgs_used+1 WHERE id=?", (user_id,))
+                                    db_conn.commit()
+                                    commerce_triggered = True
+                                else:
+                                    # Reabre conexão mesmo se falhou
+                                    db_conn = sqlite3.connect(DATABASE)
+                                    db_conn.row_factory = sqlite3.Row
+
+                    if commerce_triggered:
+                        continue  # Pula IA normal se gerou cobrança
+
                     ai_response = generate_ai_response(user, conv["id"], ai_input, db_conn)
 
                     db_conn.execute("INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)", (conv["id"],"bot",ai_response,"text"))
@@ -3841,6 +4257,1062 @@ def start_social_scheduler():
     print("[SCHEDULER] Scheduler de posts iniciado (roda a cada minuto)")
 
 
+# ═══════════════════════════════════════════════════════════════
+#  COMÉRCIO — Pagamentos via PIX/Cartão direto no WhatsApp
+# ═══════════════════════════════════════════════════════════════
+
+def mp_create_pix_payment(access_token, amount, description, payer_phone, external_reference):
+    """Cria cobrança PIX via Mercado Pago"""
+    if not access_token:
+        return None
+    try:
+        import requests as req, uuid as uuid_mod
+        url = "https://api.mercadopago.com/v1/payments"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": str(uuid_mod.uuid4())
+        }
+        expires_at = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+        payload = {
+            "transaction_amount": float(amount),
+            "description": description[:150],
+            "payment_method_id": "pix",
+            "external_reference": external_reference,
+            "date_of_expiration": expires_at,
+            "payer": {
+                "email": f"customer_{payer_phone[-9:] if len(payer_phone) >= 9 else payer_phone}@atendente.online",
+                "first_name": "Cliente",
+                "last_name": "WhatsApp"
+            }
+        }
+        resp = req.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code == 201:
+            data = resp.json()
+            poi = data.get("point_of_interaction", {}).get("transaction_data", {})
+            return {
+                "id": str(data.get("id", "")),
+                "qr_code": poi.get("qr_code", ""),
+                "qr_code_base64": poi.get("qr_code_base64", ""),
+                "ticket_url": poi.get("ticket_url", ""),
+                "copy_paste": poi.get("qr_code", ""),
+                "status": data.get("status", "pending")
+            }
+        print(f"[MP PIX] Erro {resp.status_code}: {resp.text[:200]}")
+        return None
+    except Exception as e:
+        print(f"[MP PIX] Exceção: {e}")
+        return None
+
+
+def mp_create_checkout_preference(access_token, items, payer_phone, external_reference, notification_url):
+    """Cria link de checkout Mercado Pago (cartão/boleto)"""
+    if not access_token:
+        return None
+    try:
+        import requests as req
+        url = "https://api.mercadopago.com/checkout/preferences"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "items": items,
+            "external_reference": external_reference,
+            "notification_url": notification_url,
+            "back_urls": {
+                "success": "https://atendente.online/payment/success",
+                "pending": "https://atendente.online/payment/pending",
+                "failure": "https://atendente.online/payment/failure"
+            },
+            "auto_return": "approved",
+            "payment_methods": {
+                "excluded_payment_methods": [],
+                "excluded_payment_types": [],
+                "installments": 12
+            }
+        }
+        resp = req.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return {
+                "id": data.get("id", ""),
+                "checkout_url": data.get("init_point", ""),
+                "sandbox_url": data.get("sandbox_init_point", "")
+            }
+        print(f"[MP CHECKOUT] Erro {resp.status_code}: {resp.text[:200]}")
+        return None
+    except Exception as e:
+        print(f"[MP CHECKOUT] Exceção: {e}")
+        return None
+
+
+def detect_purchase_intent(message, products):
+    """Usa IA para detectar se mensagem do cliente é intenção de compra"""
+    try:
+        import requests as req, json as json_mod
+        api_key = get_setting("ANTHROPIC_API_KEY", "")
+        if not api_key or not products:
+            return None
+
+        products_text = "\n".join([
+            f"- ID:{p['id']} | {p['name']} | R$ {p['price']:.2f}"
+            + (f" (estoque: {p['stock']})" if p['stock'] >= 0 else "")
+            for p in products if p.get('active', 1) and p.get('price', 0) > 0
+        ])
+
+        if not products_text:
+            return None
+
+        prompt = f"""Você analisa mensagens de clientes no WhatsApp e identifica intenção de compra.
+
+CATÁLOGO DISPONÍVEL:
+{products_text}
+
+MENSAGEM DO CLIENTE:
+"{message}"
+
+Analise e responda APENAS em JSON válido (sem ```json, sem explicação):
+{{"is_purchase": true/false, "items": [{{"product_id": N, "quantity": N}}], "confidence": "high/medium/low"}}
+
+REGRAS:
+- is_purchase = true apenas se o cliente está claramente querendo comprar
+- Se não menciona produto específico: is_purchase = false
+- Se só está perguntando preço: is_purchase = false
+- Se pede "1 pizza", "2 camisetas", etc: is_purchase = true
+- quantidade padrão = 1 se não especificado
+
+Responda apenas com o JSON:"""
+
+        resp = req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=15
+        )
+        if resp.status_code != 200:
+            return None
+
+        text = resp.json()["content"][0]["text"].strip()
+        # Remove markdown se tiver
+        text = text.replace("```json", "").replace("```", "").strip()
+        result = json_mod.loads(text)
+
+        if not result.get("is_purchase"):
+            return None
+
+        return result
+    except Exception as e:
+        print(f"[PURCHASE AI] Erro: {e}")
+        return None
+
+
+def create_order_from_intent(user, conversation_id, customer_phone, purchase_data):
+    """Cria pedido e gera cobrança PIX automaticamente"""
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+
+        items_detail = []
+        total = 0
+        items_json = []
+
+        for item in purchase_data.get("items", []):
+            product = db_conn.execute(
+                "SELECT * FROM product_gallery WHERE id=? AND user_id=?",
+                (item["product_id"], user["id"])
+            ).fetchone()
+            if not product:
+                continue
+            qty = int(item.get("quantity", 1))
+            subtotal = product["price"] * qty
+            total += subtotal
+            items_detail.append({
+                "name": product["name"],
+                "quantity": qty,
+                "price": product["price"],
+                "subtotal": subtotal
+            })
+            items_json.append({
+                "id": str(product["id"]),
+                "title": product["name"][:250],
+                "quantity": qty,
+                "unit_price": float(product["price"]),
+                "currency_id": "BRL"
+            })
+
+        if total <= 0:
+            db_conn.close()
+            return None
+
+        # Cria registro do pedido
+        import json as json_mod
+        cur = db_conn.execute(
+            """INSERT INTO orders
+               (user_id, conversation_id, customer_phone, items, total, payment_status, expires_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (user["id"], conversation_id, customer_phone,
+             json_mod.dumps(items_detail, ensure_ascii=False),
+             total, "pending",
+             (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        order_id = cur.lastrowid
+        db_conn.commit()
+
+        # Gera PIX via Mercado Pago
+        items_names = ", ".join([f"{i['quantity']}x {i['name']}" for i in items_detail])
+        pix = mp_create_pix_payment(
+            user["mp_access_token"],
+            total,
+            f"Pedido #{order_id}: {items_names[:100]}",
+            customer_phone,
+            f"order_{order_id}"
+        )
+
+        if pix:
+            db_conn.execute(
+                """UPDATE orders SET
+                    mp_payment_id=?, mp_qr_code=?, mp_copy_paste=?
+                   WHERE id=?""",
+                (pix["id"], pix["qr_code_base64"], pix["copy_paste"], order_id)
+            )
+            db_conn.commit()
+
+        # Gera link de checkout cartão
+        checkout = mp_create_checkout_preference(
+            user["mp_access_token"],
+            items_json,
+            customer_phone,
+            f"order_{order_id}",
+            f"https://atendente.online/webhook/mp-commerce/{user['id']}"
+        )
+
+        if checkout:
+            db_conn.execute(
+                "UPDATE orders SET mp_checkout_url=? WHERE id=?",
+                (checkout["checkout_url"], order_id)
+            )
+            db_conn.commit()
+
+        db_conn.close()
+
+        return {
+            "order_id": order_id,
+            "total": total,
+            "items": items_detail,
+            "pix_copy_paste": pix["copy_paste"] if pix else None,
+            "checkout_url": checkout["checkout_url"] if checkout else None
+        }
+    except Exception as e:
+        print(f"[ORDER] Erro: {e}")
+        return None
+
+
+def format_order_message(order_data):
+    """Formata mensagem bonita com pedido + PIX + link cartão"""
+    items_text = "\n".join([f"• {i['quantity']}x {i['name']} — R$ {i['subtotal']:.2f}"
+                            for i in order_data["items"]])
+
+    msg = f"""🛒 *Seu pedido #{order_data['order_id']}*
+
+{items_text}
+
+💰 *Total: R$ {order_data['total']:.2f}*
+
+━━━━━━━━━━━━━━━━━━━━
+💳 *COMO PAGAR:*
+
+*OPÇÃO 1 — PIX (mais rápido)*
+Copie e cole este código no seu app do banco:
+
+```
+{order_data.get('pix_copy_paste', 'PIX indisponível')}
+```
+"""
+    if order_data.get("checkout_url"):
+        msg += f"""
+*OPÇÃO 2 — Cartão/Boleto*
+{order_data['checkout_url']}
+"""
+    msg += """
+━━━━━━━━━━━━━━━━━━━━
+✅ Após o pagamento, confirmarei automaticamente seu pedido!
+⏰ Válido por 24 horas."""
+    return msg
+
+
+# ─── ROTA: Webhook do Mercado Pago para confirmação de pagamento ───
+@app.route("/webhook/mp-commerce/<int:user_id>", methods=["POST"])
+def mp_commerce_webhook(user_id):
+    """Recebe notificação de pagamento do Mercado Pago"""
+    try:
+        data = request.json or {}
+        payment_id = data.get("data", {}).get("id") or data.get("id")
+
+        if not payment_id:
+            return jsonify({"status": "no_id"}), 200
+
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+
+        user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user or not user["mp_access_token"]:
+            db_conn.close()
+            return jsonify({"status": "user_not_found"}), 404
+
+        # Consulta status do pagamento no MP
+        import requests as req
+        resp = req.get(
+            f"https://api.mercadopago.com/v1/payments/{payment_id}",
+            headers={"Authorization": f"Bearer {user['mp_access_token']}"},
+            timeout=10
+        )
+        if resp.status_code != 200:
+            db_conn.close()
+            return jsonify({"status": "mp_error"}), 200
+
+        payment = resp.json()
+        status = payment.get("status", "")
+        external_ref = payment.get("external_reference", "")
+
+        if not external_ref.startswith("order_"):
+            db_conn.close()
+            return jsonify({"status": "ok"}), 200
+
+        order_id = int(external_ref.replace("order_", ""))
+        order = db_conn.execute(
+            "SELECT * FROM orders WHERE id=? AND user_id=?",
+            (order_id, user_id)
+        ).fetchone()
+
+        if not order:
+            db_conn.close()
+            return jsonify({"status": "order_not_found"}), 200
+
+        if status == "approved" and order["payment_status"] != "paid":
+            db_conn.execute(
+                "UPDATE orders SET payment_status='paid', paid_at=datetime('now') WHERE id=?",
+                (order_id,)
+            )
+            db_conn.commit()
+
+            # Envia confirmação via WhatsApp
+            if user["whatsapp_phone_id"] and user["whatsapp_token"]:
+                msg = f"""✅ *Pagamento confirmado!*
+
+Pedido #{order_id} foi pago com sucesso.
+Valor: R$ {order['total']:.2f}
+
+Obrigado pela compra! 🎉
+Em breve entraremos em contato para combinar a entrega/retirada."""
+                send_whatsapp_message(
+                    user["whatsapp_phone_id"],
+                    user["whatsapp_token"],
+                    order["customer_phone"],
+                    msg
+                )
+
+            # Atualiza contato
+            db_conn.execute(
+                """UPDATE contacts SET
+                    total_orders=total_orders+1,
+                    total_spent=total_spent+?,
+                    last_contact_at=datetime('now')
+                   WHERE user_id=? AND phone=?""",
+                (order["total"], user_id, order["customer_phone"])
+            )
+            db_conn.commit()
+
+        db_conn.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        print(f"[MP COMMERCE WEBHOOK] Erro: {e}")
+        return jsonify({"status": "error"}), 200
+
+
+# ─── ROTAS: Dashboard de Comércio ──────────────────────────────
+@app.route("/dashboard/commerce")
+@login_required
+def commerce_dashboard():
+    """Dashboard de vendas pelo WhatsApp"""
+    user = g.user
+    db = get_db()
+
+    # Estatísticas
+    total_sales = db.execute(
+        "SELECT COALESCE(SUM(total),0) as s FROM orders WHERE user_id=? AND payment_status='paid'",
+        (user["id"],)
+    ).fetchone()["s"]
+    total_orders = db.execute(
+        "SELECT COUNT(*) as c FROM orders WHERE user_id=? AND payment_status='paid'",
+        (user["id"],)
+    ).fetchone()["c"]
+    pending_orders = db.execute(
+        "SELECT COUNT(*) as c FROM orders WHERE user_id=? AND payment_status='pending'",
+        (user["id"],)
+    ).fetchone()["c"]
+
+    # Vendas do mês
+    month_sales = db.execute(
+        """SELECT COALESCE(SUM(total),0) as s FROM orders
+           WHERE user_id=? AND payment_status='paid'
+           AND date(paid_at) >= date('now', 'start of month')""",
+        (user["id"],)
+    ).fetchone()["s"]
+
+    avg_ticket = total_sales / total_orders if total_orders > 0 else 0
+
+    # Últimos pedidos
+    orders = db.execute(
+        """SELECT o.*, c.last_message
+           FROM orders o
+           LEFT JOIN conversations c ON o.conversation_id=c.id
+           WHERE o.user_id=?
+           ORDER BY o.created_at DESC LIMIT 20""",
+        (user["id"],)
+    ).fetchall()
+
+    orders_html = ""
+    if orders:
+        import json as json_mod
+        for o in orders:
+            status_cls = {
+                "paid": "badge-green",
+                "pending": "badge-orange",
+                "expired": "badge-red",
+                "cancelled": "badge-red"
+            }.get(o["payment_status"], "badge-orange")
+            status_label = {
+                "paid": "Pago",
+                "pending": "Aguardando",
+                "expired": "Expirado",
+                "cancelled": "Cancelado"
+            }.get(o["payment_status"], o["payment_status"])
+
+            try:
+                items = json_mod.loads(o["items"] or "[]")
+                items_str = ", ".join([f"{i['quantity']}x {i['name'][:30]}" for i in items[:3]])
+            except:
+                items_str = "—"
+
+            orders_html += f"""
+            <tr>
+                <td>#{o['id']}</td>
+                <td>{esc(o['customer_phone'][:13] if o['customer_phone'] else '')}</td>
+                <td style="font-size:12px">{esc(items_str)}</td>
+                <td><strong>R$ {o['total']:.2f}</strong></td>
+                <td><span class="badge {status_cls}">{status_label}</span></td>
+                <td style="font-size:12px;color:var(--text3)">{to_br_datetime(o['created_at'])}</td>
+            </tr>
+            """
+    else:
+        orders_html = '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:40px">Nenhum pedido ainda. Configure seus produtos com preço e ative o comércio.</td></tr>'
+
+    # Check MP configurado
+    mp_configured = bool(user["mp_access_token"])
+    commerce_active = bool(user["commerce_enabled"])
+
+    alert_html = ""
+    if not mp_configured:
+        alert_html = '<div class="alert alert-error">⚠️ Configure seu Mercado Pago em <a href="/dashboard/commerce/settings" style="color:var(--accent2)">Configurações</a> para começar a vender.</div>'
+    elif not commerce_active:
+        alert_html = '<div class="alert alert-warning">⏸️ Comércio desativado. <a href="/dashboard/commerce/settings" style="color:var(--accent2)">Ative nas configurações</a> para que a IA gere cobranças automáticas.</div>'
+
+    content = f"""<div class="container">
+        <div class="page-header fade-in">
+            <h1>🛒 Comércio no WhatsApp</h1>
+            <p>Venda direto pelo WhatsApp com PIX e cartão</p>
+        </div>
+        {alert_html}
+
+        <div class="grid-4 fade-in fade-in-1">
+            <div class="metric-card"><div style="font-size:24px">💰</div><div class="metric-value">R$ {total_sales:.2f}</div><div class="metric-label">Total vendido</div></div>
+            <div class="metric-card"><div style="font-size:24px">📅</div><div class="metric-value">R$ {month_sales:.2f}</div><div class="metric-label">Este mês</div></div>
+            <div class="metric-card"><div style="font-size:24px">📦</div><div class="metric-value">{total_orders}</div><div class="metric-label">Pedidos pagos</div></div>
+            <div class="metric-card"><div style="font-size:24px">⏳</div><div class="metric-value" style="color:var(--orange)">{pending_orders}</div><div class="metric-label">Aguardando pagamento</div></div>
+        </div>
+
+        <div class="grid-2 fade-in fade-in-2" style="margin-top:24px">
+            <div class="card">
+                <div class="card-header"><span class="card-title">🚀 Ações rápidas</span></div>
+                <a href="/dashboard/gallery" class="btn btn-primary" style="width:100%;margin-bottom:8px;display:block;text-align:center;text-decoration:none">📦 Gerenciar produtos e preços</a>
+                <a href="/dashboard/commerce/settings" class="btn" style="width:100%;background:rgba(255,255,255,0.05);margin-bottom:8px;display:block;text-align:center;text-decoration:none">⚙️ Configurar Mercado Pago</a>
+                <a href="/dashboard/commerce/orders" class="btn" style="width:100%;background:rgba(255,255,255,0.05);display:block;text-align:center;text-decoration:none">📋 Ver todos os pedidos</a>
+            </div>
+            <div class="card">
+                <div class="card-header"><span class="card-title">📊 Performance</span></div>
+                <div style="padding:16px 0">
+                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+                        <span style="color:var(--text2)">Ticket médio</span>
+                        <strong>R$ {avg_ticket:.2f}</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+                        <span style="color:var(--text2)">Taxa de conversão</span>
+                        <strong>{(total_orders/(total_orders+pending_orders)*100 if (total_orders+pending_orders) > 0 else 0):.1f}%</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;padding:8px 0">
+                        <span style="color:var(--text2)">Comércio ativo</span>
+                        <strong style="color:{'var(--green2)' if commerce_active else 'var(--orange)'}">{'✅ Sim' if commerce_active else '⏸️ Não'}</strong>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card fade-in fade-in-3" style="margin-top:24px">
+            <div class="card-header"><span class="card-title">📋 Pedidos recentes</span></div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr><th>#</th><th>Cliente</th><th>Itens</th><th>Total</th><th>Status</th><th>Data</th></tr>
+                    </thead>
+                    <tbody>{orders_html}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>"""
+    return base_html("Comércio", content, dict(user))
+
+
+@app.route("/dashboard/commerce/settings", methods=["GET", "POST"])
+@login_required
+def commerce_settings():
+    """Configurações de comércio (Mercado Pago)"""
+    user = g.user
+    db = get_db()
+    msg = ""
+
+    if request.method == "POST":
+        db.execute(
+            """UPDATE users SET
+                mp_access_token=?,
+                mp_public_key=?,
+                commerce_enabled=?,
+                auto_payment_enabled=?
+               WHERE id=?""",
+            (
+                request.form.get("mp_access_token", "").strip(),
+                request.form.get("mp_public_key", "").strip(),
+                1 if request.form.get("commerce_enabled") else 0,
+                1 if request.form.get("auto_payment_enabled") else 0,
+                user["id"]
+            )
+        )
+        db.commit()
+        user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        msg = '<div class="alert alert-success">✅ Configurações salvas!</div>'
+
+    content = f"""<div class="container">
+        <div class="page-header fade-in">
+            <h1>⚙️ Configurações de Comércio</h1>
+            <p>Conecte seu Mercado Pago para vender direto pelo WhatsApp</p>
+        </div>
+        {msg}
+
+        <div class="card fade-in fade-in-1" style="margin-bottom:24px">
+            <div class="card-header"><span class="card-title">💳 Credenciais Mercado Pago</span></div>
+            <p style="color:var(--text3);font-size:13px;margin-bottom:20px">
+                Obtenha suas credenciais em <a href="https://www.mercadopago.com.br/developers/panel/app" target="_blank" style="color:var(--accent2)">Mercado Pago Developers →</a>
+                <br>Cadastre uma aplicação e copie o <strong>Access Token</strong> de produção.
+            </p>
+            <form method="POST">{csrf_field()}
+                <div class="form-group">
+                    <label class="form-label">Access Token (produção)</label>
+                    <input type="text" name="mp_access_token" class="form-input"
+                           value="{esc(user['mp_access_token'] or '')}"
+                           placeholder="APP_USR-...">
+                    <small style="color:var(--text3)">Começa com APP_USR- (produção) ou TEST- (teste)</small>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Public Key (opcional)</label>
+                    <input type="text" name="mp_public_key" class="form-input"
+                           value="{esc(user['mp_public_key'] or '')}"
+                           placeholder="APP_USR-...">
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" style="display:inline-flex;align-items:center;gap:10px;cursor:pointer;padding:14px;background:rgba(0,200,150,0.05);border:1px solid rgba(0,200,150,0.2);border-radius:8px;width:100%">
+                        <input type="checkbox" name="commerce_enabled" value="1" {'checked' if user['commerce_enabled'] else ''} style="width:18px;height:18px">
+                        <div>
+                            <strong>Ativar comércio via WhatsApp</strong>
+                            <p style="margin:4px 0 0;font-size:12px;color:var(--text3)">Quando o cliente pedir para comprar, a IA gera cobrança automática.</p>
+                        </div>
+                    </label>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" style="display:inline-flex;align-items:center;gap:10px;cursor:pointer;padding:14px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.2);border-radius:8px;width:100%">
+                        <input type="checkbox" name="auto_payment_enabled" value="1" {'checked' if user['auto_payment_enabled'] else ''} style="width:18px;height:18px">
+                        <div>
+                            <strong>Geração automática de PIX + link de cartão</strong>
+                            <p style="margin:4px 0 0;font-size:12px;color:var(--text3)">A IA envia PIX e link de checkout juntos. Desative se quiser só PIX.</p>
+                        </div>
+                    </label>
+                </div>
+
+                <button type="submit" class="btn btn-primary">💾 Salvar</button>
+            </form>
+        </div>
+
+        <div class="card fade-in fade-in-2">
+            <div class="card-header"><span class="card-title">📖 Como funciona</span></div>
+            <div style="color:var(--text2);font-size:14px;line-height:1.7">
+                <p><strong>1.</strong> Cadastre produtos com preço na <a href="/dashboard/gallery" style="color:var(--accent2)">Galeria</a>.</p>
+                <p><strong>2.</strong> Quando cliente disser "quero comprar X", a IA identifica automaticamente.</p>
+                <p><strong>3.</strong> Sistema gera PIX + link de cartão via Mercado Pago.</p>
+                <p><strong>4.</strong> Envia mensagem formatada com todas opções.</p>
+                <p><strong>5.</strong> Quando cliente pagar, Mercado Pago avisa o sistema automaticamente.</p>
+                <p><strong>6.</strong> Bot confirma pagamento no WhatsApp instantaneamente.</p>
+            </div>
+        </div>
+    </div>"""
+    return base_html("Comércio — Config", content, dict(user))
+
+
+@app.route("/dashboard/commerce/orders")
+@login_required
+def commerce_orders():
+    """Lista completa de pedidos"""
+    user = g.user
+    db = get_db()
+    orders = db.execute(
+        "SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC",
+        (user["id"],)
+    ).fetchall()
+
+    rows = ""
+    import json as json_mod
+    for o in orders:
+        status_cls = {"paid":"badge-green","pending":"badge-orange","expired":"badge-red"}.get(o["payment_status"],"badge-orange")
+        status_label = {"paid":"Pago","pending":"Aguardando","expired":"Expirado"}.get(o["payment_status"],o["payment_status"])
+        try:
+            items = json_mod.loads(o["items"] or "[]")
+            items_str = ", ".join([f"{i['quantity']}x {i['name'][:30]}" for i in items])
+        except:
+            items_str = "—"
+        rows += f"""<tr>
+            <td>#{o['id']}</td>
+            <td>{esc(o['customer_phone'] or '')}</td>
+            <td style="font-size:12px;max-width:300px">{esc(items_str)}</td>
+            <td><strong>R$ {o['total']:.2f}</strong></td>
+            <td><span class="badge {status_cls}">{status_label}</span></td>
+            <td style="font-size:12px">{to_br_datetime(o['created_at'])}</td>
+            <td style="font-size:12px">{to_br_datetime(o['paid_at']) if o['paid_at'] else '—'}</td>
+        </tr>"""
+
+    content = f"""<div class="container">
+        <div class="page-header"><h1>Pedidos ({len(orders)})</h1></div>
+        <div class="card"><div class="table-wrap"><table>
+            <thead><tr><th>#</th><th>Cliente</th><th>Itens</th><th>Total</th><th>Status</th><th>Criado</th><th>Pago</th></tr></thead>
+            <tbody>{rows or '<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:40px">Nenhum pedido</td></tr>'}</tbody>
+        </table></div></div>
+    </div>"""
+    return base_html("Pedidos", content, dict(user))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CAMPANHAS / BROADCAST — Envio em massa
+# ═══════════════════════════════════════════════════════════════
+
+def run_campaign(campaign_id):
+    """Processa uma campanha enviando mensagens com rate limit"""
+    try:
+        import time as t_mod
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+
+        campaign = db_conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+        if not campaign:
+            db_conn.close()
+            return
+
+        user = db_conn.execute("SELECT * FROM users WHERE id=?", (campaign["user_id"],)).fetchone()
+        if not user:
+            db_conn.close()
+            return
+
+        # Atualiza status
+        db_conn.execute(
+            "UPDATE campaigns SET status='running', started_at=datetime('now') WHERE id=?",
+            (campaign_id,)
+        )
+        db_conn.commit()
+
+        contacts = db_conn.execute(
+            "SELECT * FROM campaign_contacts WHERE campaign_id=? AND status='pending'",
+            (campaign_id,)
+        ).fetchall()
+
+        sent = 0
+        failed = 0
+
+        for contact in contacts:
+            # Personaliza a mensagem com variáveis
+            msg = campaign["message"]
+            try:
+                import json as json_mod
+                variables = json_mod.loads(contact["variables"] or "{}")
+                for k, v in variables.items():
+                    msg = msg.replace(f"{{{k}}}", str(v))
+                msg = msg.replace("{nome}", contact["name"] or "")
+                msg = msg.replace("{telefone}", contact["phone"] or "")
+            except:
+                pass
+
+            # Envia via WhatsApp
+            try:
+                result = send_whatsapp_message(
+                    user["whatsapp_phone_id"],
+                    user["whatsapp_token"],
+                    contact["phone"],
+                    msg
+                )
+                if result:
+                    db_conn.execute(
+                        "UPDATE campaign_contacts SET status='sent', sent_at=datetime('now') WHERE id=?",
+                        (contact["id"],)
+                    )
+                    sent += 1
+                else:
+                    db_conn.execute(
+                        "UPDATE campaign_contacts SET status='failed', error='send_error' WHERE id=?",
+                        (contact["id"],)
+                    )
+                    failed += 1
+            except Exception as e:
+                db_conn.execute(
+                    "UPDATE campaign_contacts SET status='failed', error=? WHERE id=?",
+                    (str(e)[:200], contact["id"])
+                )
+                failed += 1
+
+            # Atualiza contadores a cada 10 envios
+            if (sent + failed) % 10 == 0:
+                db_conn.execute(
+                    "UPDATE campaigns SET sent_count=?, failed_count=? WHERE id=?",
+                    (sent, failed, campaign_id)
+                )
+                db_conn.commit()
+
+            # Rate limit: 1 mensagem a cada 2 segundos (30/min)
+            t_mod.sleep(2)
+
+        # Finaliza campanha
+        db_conn.execute(
+            "UPDATE campaigns SET sent_count=?, failed_count=?, status='completed', completed_at=datetime('now') WHERE id=?",
+            (sent, failed, campaign_id)
+        )
+        db_conn.commit()
+        db_conn.close()
+        print(f"[CAMPAIGN] #{campaign_id} completa: {sent} enviadas, {failed} falhas")
+    except Exception as e:
+        print(f"[CAMPAIGN] Erro: {e}")
+
+
+@app.route("/dashboard/campaigns")
+@login_required
+def campaigns_dashboard():
+    """Dashboard de campanhas"""
+    user = g.user
+    db = get_db()
+
+    campaigns = db.execute(
+        "SELECT * FROM campaigns WHERE user_id=? ORDER BY created_at DESC LIMIT 30",
+        (user["id"],)
+    ).fetchall()
+
+    total_sent = db.execute(
+        "SELECT COALESCE(SUM(sent_count),0) as s FROM campaigns WHERE user_id=?",
+        (user["id"],)
+    ).fetchone()["s"]
+
+    rows = ""
+    for c in campaigns:
+        status_cls = {
+            "draft": "badge-gray",
+            "scheduled": "badge-orange",
+            "running": "badge-blue",
+            "completed": "badge-green",
+            "failed": "badge-red"
+        }.get(c["status"], "badge-gray")
+        status_label = {
+            "draft": "Rascunho",
+            "scheduled": "Agendada",
+            "running": "Em execução",
+            "completed": "Completa",
+            "failed": "Falhou"
+        }.get(c["status"], c["status"])
+
+        progress = 0
+        if c["total_contacts"] > 0:
+            progress = int((c["sent_count"] / c["total_contacts"]) * 100)
+
+        actions = ""
+        if c["status"] == "draft":
+            actions = f'<form method="POST" action="/dashboard/campaigns/{c["id"]}/start" style="display:inline">{csrf_field()}<button class="btn btn-success btn-sm">▶ Iniciar</button></form>'
+
+        rows += f"""<tr>
+            <td><strong>{esc(c['name'])}</strong></td>
+            <td>{c['total_contacts']}</td>
+            <td>{c['sent_count']}</td>
+            <td>{c['failed_count']}</td>
+            <td><div style="background:rgba(255,255,255,0.05);border-radius:6px;height:8px;overflow:hidden"><div style="background:var(--accent2);height:100%;width:{progress}%"></div></div><small style="color:var(--text3)">{progress}%</small></td>
+            <td><span class="badge {status_cls}">{status_label}</span></td>
+            <td style="font-size:12px">{to_br_datetime(c['created_at'])}</td>
+            <td>{actions}</td>
+        </tr>"""
+
+    content = f"""<div class="container">
+        <div class="page-header fade-in">
+            <h1>📢 Campanhas</h1>
+            <p>Envie mensagens em massa via WhatsApp (broadcast)</p>
+        </div>
+
+        <div class="grid-3 fade-in fade-in-1">
+            <div class="metric-card"><div style="font-size:24px">📢</div><div class="metric-value">{len(campaigns)}</div><div class="metric-label">Campanhas</div></div>
+            <div class="metric-card"><div style="font-size:24px">📤</div><div class="metric-value">{total_sent}</div><div class="metric-label">Mensagens enviadas</div></div>
+            <div class="metric-card"><div style="font-size:24px">✉️</div><div class="metric-value">1/2s</div><div class="metric-label">Rate limit seguro</div></div>
+        </div>
+
+        <div style="margin:24px 0"><a href="/dashboard/campaigns/new" class="btn btn-primary">➕ Nova campanha</a></div>
+
+        <div class="card fade-in fade-in-2">
+            <div class="card-header"><span class="card-title">Todas as campanhas</span></div>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Nome</th><th>Contatos</th><th>Enviadas</th><th>Falhas</th><th>Progresso</th><th>Status</th><th>Criada</th><th>Ação</th></tr></thead>
+                    <tbody>{rows or '<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:40px">Nenhuma campanha criada</td></tr>'}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="alert alert-warning" style="margin-top:24px">
+            ⚠️ <strong>Importante:</strong> Respeite as regras da Meta. Mensagens em massa para contatos sem interação em 24h precisam de <strong>template aprovado</strong>.
+            Excesso de bloqueios pode pausar sua conta.
+        </div>
+    </div>"""
+    return base_html("Campanhas", content, dict(user))
+
+
+@app.route("/dashboard/campaigns/new", methods=["GET", "POST"])
+@login_required
+def campaign_new():
+    """Criar nova campanha"""
+    user = g.user
+    db = get_db()
+    msg = ""
+
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        message = request.form.get("message", "").strip()
+        contacts_raw = request.form.get("contacts", "").strip()
+
+        if not name or not message or not contacts_raw:
+            msg = '<div class="alert alert-error">Preencha todos os campos</div>'
+        else:
+            # Processa lista de contatos (uma por linha: telefone,nome)
+            contacts_list = []
+            for line in contacts_raw.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                phone = parts[0]
+                name_c = parts[1] if len(parts) > 1 else ""
+                # Limpa telefone (só dígitos)
+                import re as re_mod
+                phone = re_mod.sub(r'\D', '', phone)
+                if len(phone) >= 10:
+                    # Adiciona 55 se não tiver
+                    if not phone.startswith("55"):
+                        phone = "55" + phone
+                    contacts_list.append({"phone": phone, "name": name_c})
+
+            if not contacts_list:
+                msg = '<div class="alert alert-error">Nenhum contato válido encontrado. Use formato: telefone,nome (um por linha)</div>'
+            else:
+                cur = db.execute(
+                    """INSERT INTO campaigns (user_id, name, message, total_contacts, status)
+                       VALUES (?,?,?,?,?)""",
+                    (user["id"], name, message, len(contacts_list), "draft")
+                )
+                cid = cur.lastrowid
+                for c in contacts_list:
+                    db.execute(
+                        "INSERT INTO campaign_contacts (campaign_id, phone, name, status) VALUES (?,?,?,?)",
+                        (cid, c["phone"], c["name"], "pending")
+                    )
+                db.commit()
+                return redirect(f"/dashboard/campaigns?created={cid}")
+
+    content = f"""<div class="container">
+        <div class="page-header"><h1>➕ Nova campanha</h1></div>
+        {msg}
+        <form method="POST" class="card">{csrf_field()}
+            <div class="form-group">
+                <label class="form-label">Nome da campanha *</label>
+                <input type="text" name="name" class="form-input" required placeholder="Ex: Black Friday — Oferta Especial">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Mensagem *</label>
+                <textarea name="message" class="form-input" rows="5" required placeholder="Olá {{nome}}! Temos uma oferta especial para você..."></textarea>
+                <small style="color:var(--text3)">Use <code>{{nome}}</code> para personalizar com o nome do contato.</small>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Lista de contatos *</label>
+                <textarea name="contacts" class="form-input" rows="10" required
+                    placeholder="5585999999999,João&#10;5585988888888,Maria&#10;..."></textarea>
+                <small style="color:var(--text3)">Um contato por linha. Formato: <code>telefone,nome</code> (nome opcional).</small>
+            </div>
+            <button type="submit" class="btn btn-primary">Criar campanha (rascunho)</button>
+            <a href="/dashboard/campaigns" class="btn" style="background:rgba(255,255,255,0.05);margin-left:8px">Cancelar</a>
+        </form>
+    </div>"""
+    return base_html("Nova campanha", content, dict(user))
+
+
+@app.route("/dashboard/campaigns/<int:cid>/start", methods=["POST"])
+@login_required
+def campaign_start(cid):
+    """Inicia envio da campanha em background"""
+    user = g.user
+    db = get_db()
+    campaign = db.execute(
+        "SELECT * FROM campaigns WHERE id=? AND user_id=?",
+        (cid, user["id"])
+    ).fetchone()
+    if campaign and campaign["status"] == "draft":
+        import threading
+        threading.Thread(target=run_campaign, args=(cid,), daemon=True).start()
+    return redirect("/dashboard/campaigns")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CONTATOS / CRM — Gestão de contatos e segmentação
+# ═══════════════════════════════════════════════════════════════
+
+@app.route("/dashboard/contacts")
+@login_required
+def contacts_dashboard():
+    """Lista de contatos"""
+    user = g.user
+    db = get_db()
+
+    # Sincroniza contatos das conversas
+    db.execute(
+        """INSERT OR IGNORE INTO contacts (user_id, phone, name, created_at, last_contact_at)
+           SELECT DISTINCT user_id, customer_phone, customer_name, datetime('now'), last_message_at
+           FROM conversations WHERE user_id=? AND customer_phone NOT IN
+           (SELECT phone FROM contacts WHERE user_id=?)""",
+        (user["id"], user["id"])
+    )
+    db.commit()
+
+    contacts = db.execute(
+        "SELECT * FROM contacts WHERE user_id=? ORDER BY last_contact_at DESC LIMIT 200",
+        (user["id"],)
+    ).fetchall()
+
+    rows = ""
+    for c in contacts:
+        stage_cls = {"lead":"badge-gray","customer":"badge-green","vip":"badge-purple","inactive":"badge-red"}.get(c["lifecycle_stage"],"badge-gray")
+        rows += f"""<tr>
+            <td><strong>{esc(c['name'] or 'Sem nome')}</strong></td>
+            <td>{esc(c['phone'])}</td>
+            <td><span class="badge {stage_cls}">{esc(c['lifecycle_stage'])}</span></td>
+            <td style="font-size:12px">{esc(c['tags'][:50] if c['tags'] else '—')}</td>
+            <td>{c['total_orders']}</td>
+            <td><strong>R$ {c['total_spent']:.2f}</strong></td>
+            <td style="font-size:12px">{to_br_datetime(c['last_contact_at']) if c['last_contact_at'] else '—'}</td>
+        </tr>"""
+
+    content = f"""<div class="container">
+        <div class="page-header"><h1>👥 Contatos ({len(contacts)})</h1><p>Todos os contatos que conversaram com você</p></div>
+        <div class="card"><div class="table-wrap"><table>
+            <thead><tr><th>Nome</th><th>Telefone</th><th>Estágio</th><th>Tags</th><th>Pedidos</th><th>Gasto total</th><th>Último contato</th></tr></thead>
+            <tbody>{rows or '<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:40px">Nenhum contato</td></tr>'}</tbody>
+        </table></div></div>
+    </div>"""
+    return base_html("Contatos", content, dict(user))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PIPELINE / FUNIL — Kanban de oportunidades
+# ═══════════════════════════════════════════════════════════════
+
+@app.route("/dashboard/pipeline")
+@login_required
+def pipeline_dashboard():
+    """Kanban de funil de vendas"""
+    user = g.user
+    db = get_db()
+
+    # Cria estágios padrão se não existir nenhum
+    stages = db.execute("SELECT * FROM pipeline_stages WHERE user_id=? ORDER BY position", (user["id"],)).fetchall()
+    if not stages:
+        default_stages = [
+            ("Novo lead", "#6366f1", 0),
+            ("Em contato", "#f59e0b", 1),
+            ("Negociando", "#3b82f6", 2),
+            ("Fechado - Ganho", "#10b981", 3),
+            ("Fechado - Perdido", "#ef4444", 4)
+        ]
+        for name, color, pos in default_stages:
+            db.execute(
+                "INSERT INTO pipeline_stages (user_id, name, color, position) VALUES (?,?,?,?)",
+                (user["id"], name, color, pos)
+            )
+        db.commit()
+        stages = db.execute("SELECT * FROM pipeline_stages WHERE user_id=? ORDER BY position", (user["id"],)).fetchall()
+
+    # Monta colunas
+    columns_html = ""
+    total_value = 0
+    for stage in stages:
+        cards = db.execute(
+            "SELECT * FROM pipeline_cards WHERE user_id=? AND stage_id=? ORDER BY position",
+            (user["id"], stage["id"])
+        ).fetchall()
+
+        stage_value = sum(c["value"] for c in cards)
+        total_value += stage_value if "Ganho" in stage["name"] else 0
+
+        cards_html = ""
+        for card in cards:
+            cards_html += f"""
+            <div class="card" style="padding:14px;margin-bottom:10px;background:rgba(255,255,255,0.03);border-left:3px solid {stage['color']};cursor:pointer">
+                <strong style="font-size:14px;display:block;margin-bottom:4px">{esc(card['title'])}</strong>
+                {f'<div style="color:var(--green2);font-size:13px;margin-bottom:4px">💰 R$ {card["value"]:.2f}</div>' if card['value'] > 0 else ''}
+                {f'<div style="color:var(--text3);font-size:11px">{esc(card["notes"][:60])}</div>' if card['notes'] else ''}
+            </div>
+            """
+
+        columns_html += f"""
+        <div style="flex:1;min-width:250px;background:rgba(255,255,255,0.02);border-radius:12px;padding:16px;border-top:3px solid {stage['color']}">
+            <div style="display:flex;justify-content:space-between;margin-bottom:12px">
+                <strong>{esc(stage['name'])}</strong>
+                <span style="background:rgba(255,255,255,0.05);padding:2px 8px;border-radius:10px;font-size:11px;color:var(--text3)">{len(cards)}</span>
+            </div>
+            {f'<div style="color:var(--text3);font-size:11px;margin-bottom:12px">R$ {stage_value:.2f} em oportunidades</div>' if stage_value > 0 else ''}
+            <div>{cards_html or '<p style="color:var(--text3);font-size:12px;text-align:center;padding:20px">Arraste cards para cá</p>'}</div>
+        </div>
+        """
+
+    content = f"""<div class="container">
+        <div class="page-header"><h1>🎯 Funil de vendas</h1><p>Acompanhe suas oportunidades em tempo real — R$ {total_value:.2f} ganhos</p></div>
+        <div style="display:flex;gap:16px;overflow-x:auto;padding-bottom:20px">
+            {columns_html}
+        </div>
+        <div class="alert alert-info" style="margin-top:20px">
+            💡 <strong>Em breve:</strong> Arrastar-e-soltar para mover cards entre etapas. Por ora, os cards são criados automaticamente quando IA identifica uma oportunidade.
+        </div>
+    </div>"""
+    return base_html("Pipeline", content, dict(user))
+
+
 def fetch_weather(message):
     """Busca previsão do tempo usando Open-Meteo (grátis, sem API key, confiável)"""
     try:
@@ -4358,16 +5830,32 @@ def gallery():
     if products:
         for p in products:
             img_url = f"/media/gallery/{p['id']}"
+            price_html = f'<div style="background:rgba(16,185,129,0.15);color:#10b981;padding:4px 10px;border-radius:6px;display:inline-block;font-weight:600;font-size:13px;margin-bottom:8px">💰 R$ {(p["price"] or 0):.2f}</div>' if (p.get("price") or 0) > 0 else '<div style="background:rgba(239,68,68,0.15);color:#ef4444;padding:4px 10px;border-radius:6px;display:inline-block;font-size:12px;margin-bottom:8px">⚠️ Sem preço</div>'
+            stock_html = ''
+            if p.get("stock", -1) >= 0:
+                stock_html = f'<div style="color:var(--text3);font-size:11px;margin-bottom:8px">Estoque: <strong>{p["stock"]}</strong></div>'
             products_html += f"""
             <div class="card" style="padding:16px">
                 <img src="{img_url}" style="width:100%;height:180px;object-fit:cover;border-radius:8px;margin-bottom:12px" alt="{esc(p['name'])}">
-                <h3 style="font-size:16px;margin-bottom:4px;color:var(--text)">{esc(p['name'])}</h3>
+                <h3 style="font-size:16px;margin-bottom:6px;color:var(--text)">{esc(p['name'])}</h3>
+                {price_html}
+                {stock_html}
                 <p style="font-size:13px;color:var(--text3);margin-bottom:8px">{esc(p['description'] or 'Sem descrição')}</p>
-                <p style="font-size:12px;color:var(--accent2);margin-bottom:12px"><strong>Palavras-chave:</strong> {esc(p['keywords'] or 'nenhuma')}</p>
-                <form method="POST" action="/dashboard/gallery/delete" style="margin:0">{csrf_field()}
-                    <input type="hidden" name="id" value="{int(p['id'])}">
-                    <button type="submit" class="btn" style="background:rgba(239,68,68,0.2);color:#ef4444;width:100%;font-size:13px">🗑️ Excluir</button>
-                </form>
+                <p style="font-size:12px;color:var(--accent2);margin-bottom:12px"><strong>Keywords:</strong> {esc(p['keywords'] or 'nenhuma')}</p>
+                <div style="display:flex;gap:6px">
+                    <form method="POST" action="/dashboard/gallery/{p['id']}/update-price" style="flex:1;margin:0">{csrf_field()}
+                        <div style="display:flex;gap:4px">
+                            <input type="number" step="0.01" name="price" value="{p.get('price', 0) or 0}"
+                                   style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.1);padding:6px 8px;border-radius:6px;color:var(--text);width:70%;font-size:12px"
+                                   placeholder="Preço">
+                            <button type="submit" class="btn btn-sm" style="background:var(--accent2);color:white;width:30%;font-size:11px;padding:6px">💾</button>
+                        </div>
+                    </form>
+                    <form method="POST" action="/dashboard/gallery/delete" style="margin:0">{csrf_field()}
+                        <input type="hidden" name="id" value="{int(p['id'])}">
+                        <button type="submit" class="btn btn-sm" style="background:rgba(239,68,68,0.2);color:#ef4444;font-size:11px;padding:6px 10px">🗑️</button>
+                    </form>
+                </div>
             </div>
             """
     else:
@@ -4376,12 +5864,12 @@ def gallery():
     content = f"""<div class="container">
         <div class="page-header fade-in">
             <h1>Galeria de Produtos 📸</h1>
-            <p>Cadastre fotos de produtos/serviços. Quando um cliente pedir, a IA envia automaticamente.</p>
+            <p>Cadastre fotos de produtos/serviços com preço. A IA envia e gera cobrança automática!</p>
         </div>
         {alert}
 
         <div class="card fade-in fade-in-1" style="margin-bottom:24px">
-            <div class="card-header"><span class="card-title">➕ Adicionar nova foto</span></div>
+            <div class="card-header"><span class="card-title">➕ Adicionar novo produto</span></div>
             <form method="POST" action="/dashboard/gallery/upload" enctype="multipart/form-data">{csrf_field()}
                 <div class="grid-2">
                     <div class="form-group">
@@ -4393,9 +5881,24 @@ def gallery():
                         <input type="text" name="keywords" class="form-input" placeholder="Ex: pizza, calabresa, calabreza, peperoni" required maxlength="300">
                     </div>
                 </div>
+                <div class="grid-3">
+                    <div class="form-group">
+                        <label class="form-label">💰 Preço (R$) *</label>
+                        <input type="number" name="price" class="form-input" step="0.01" min="0" placeholder="49.90">
+                        <small style="color:var(--text3)">Coloque 0 se não for para vender direto</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">📦 Estoque</label>
+                        <input type="number" name="stock" class="form-input" placeholder="Deixe vazio p/ ilimitado" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Categoria</label>
+                        <input type="text" name="category" class="form-input" placeholder="Ex: Pizzas">
+                    </div>
+                </div>
                 <div class="form-group">
-                    <label class="form-label">Descrição (opcional)</label>
-                    <textarea name="description" class="form-input" rows="2" placeholder="Ex: Pizza grande de calabresa com cebola, mussarela e orégano - R$ 49,90" maxlength="500"></textarea>
+                    <label class="form-label">Descrição</label>
+                    <textarea name="description" class="form-input" rows="2" placeholder="Ex: Pizza grande de calabresa com cebola, mussarela e orégano" maxlength="500"></textarea>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Imagem (JPG ou PNG, máx 5MB) *</label>
@@ -4414,6 +5917,24 @@ def gallery():
         </div>
     </div>"""
     return base_html("Galeria", content, dict(user))
+
+
+@app.route("/dashboard/gallery/<int:pid>/update-price", methods=["POST"])
+@login_required
+def gallery_update_price(pid):
+    """Atualiza o preço de um produto"""
+    user = g.user
+    db = get_db()
+    try:
+        price = float(request.form.get("price", "0").replace(",", "."))
+        db.execute(
+            "UPDATE product_gallery SET price=? WHERE id=? AND user_id=?",
+            (price, pid, user["id"])
+        )
+        db.commit()
+    except:
+        pass
+    return redirect("/dashboard/gallery?ok=Preço%20atualizado")
 
 
 @app.route("/dashboard/gallery/upload", methods=["POST"])
@@ -4457,9 +5978,22 @@ def gallery_upload():
 
     # Salva no banco
     db = get_db()
+    try:
+        price = float(request.form.get("price", "0").replace(",", "."))
+    except:
+        price = 0
+    try:
+        stock_raw = request.form.get("stock", "").strip()
+        stock = int(stock_raw) if stock_raw else -1
+    except:
+        stock = -1
+    category = request.form.get("category", "").strip()
+
     db.execute(
-        "INSERT INTO product_gallery (user_id, name, keywords, description, file_path, file_type) VALUES (?,?,?,?,?,?)",
-        (user["id"], name, keywords, description, file_path, file.content_type)
+        """INSERT INTO product_gallery
+           (user_id, name, keywords, description, file_path, file_type, price, stock, category, active)
+           VALUES (?,?,?,?,?,?,?,?,?,1)""",
+        (user["id"], name, keywords, description, file_path, file.content_type, price, stock, category)
     )
     db.commit()
 
@@ -4680,6 +6214,7 @@ def admin_users():
                         <option value="starter" {'selected' if u['plan']=='starter' else ''}>Starter</option>
                         <option value="pro" {'selected' if u['plan']=='pro' else ''}>Pro</option>
                         <option value="business" {'selected' if u['plan']=='business' else ''}>Business</option>
+                        <option value="agency" {'selected' if u['plan']=='agency' else ''}>Agência</option>
                     </select>
                 </form>
                 <form method="POST" action="/admin/users/{u['id']}/toggle" style="display:inline">
@@ -4723,6 +6258,7 @@ def admin_users():
                             <option value="starter">Starter</option>
                             <option value="pro">Pro</option>
                             <option value="business" selected>Business</option>
+                            <option value="agency">Agência</option>
                         </select>
                     </div>
                 </div>

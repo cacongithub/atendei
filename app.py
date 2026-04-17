@@ -397,15 +397,56 @@ def init_db():
         created_at TEXT DEFAULT (datetime('now')),
         FOREIGN KEY (user_id) REFERENCES users(id)
     );
+    CREATE TABLE IF NOT EXISTS social_media_library (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        file_path TEXT NOT NULL,
+        file_type TEXT DEFAULT 'image/jpeg',
+        media_type TEXT DEFAULT 'photo',
+        theme TEXT DEFAULT 'geral',
+        description TEXT DEFAULT '',
+        times_used INTEGER DEFAULT 0,
+        last_used_at TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS scheduled_posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        media_id INTEGER,
+        caption TEXT DEFAULT '',
+        hashtags TEXT DEFAULT '',
+        status TEXT DEFAULT 'pending',
+        scheduled_for TEXT DEFAULT '',
+        approved_at TEXT DEFAULT '',
+        posted_at TEXT DEFAULT '',
+        platforms TEXT DEFAULT 'manual',
+        telegram_message_id TEXT DEFAULT '',
+        rejection_reason TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (media_id) REFERENCES social_media_library(id)
+    );
     """)
     # ── MIGRAÇÃO AUTOMÁTICA ──
     migrations = [
         ("users", "is_active", "INTEGER DEFAULT 1"),
         ("users", "last_login", "TEXT DEFAULT ''"),
         ("users", "email_verified", "INTEGER DEFAULT 0"),
+        ("users", "instagram_page_id", "TEXT DEFAULT ''"),
+        ("users", "instagram_token", "TEXT DEFAULT ''"),
+        ("users", "messenger_page_id", "TEXT DEFAULT ''"),
+        ("users", "messenger_token", "TEXT DEFAULT ''"),
+        ("users", "telegram_bot_token", "TEXT DEFAULT ''"),
+        ("users", "telegram_chat_id", "TEXT DEFAULT ''"),
+        ("users", "social_post_time", "TEXT DEFAULT '09:00'"),
+        ("users", "social_auto_enabled", "INTEGER DEFAULT 0"),
+        ("users", "social_post_tone", "TEXT DEFAULT 'profissional'"),
+        ("users", "social_business_context", "TEXT DEFAULT ''"),
         ("conversations", "satisfaction_rating", "INTEGER DEFAULT 0"),
         ("conversations", "tags", "TEXT DEFAULT ''"),
         ("conversations", "notes", "TEXT DEFAULT ''"),
+        ("conversations", "channel", "TEXT DEFAULT 'whatsapp'"),
         ("messages", "media_url", "TEXT DEFAULT ''"),
     ]
     for table, column, col_type in migrations:
@@ -1160,6 +1201,7 @@ def base_html(title, content, user=None):
                 <a href="/dashboard/training" class="nav-link">Treinamento</a>
                 <a href="/dashboard/quick-replies" class="nav-link">Respostas rápidas</a>
                 <a href="/dashboard/gallery" class="nav-link">Galeria</a>
+                <a href="/dashboard/social" class="nav-link">📸 Agência</a>
                 <a href="/dashboard/settings" class="nav-link">Config</a>
                 <a href="/dashboard/billing" class="nav-link nav-link-accent">Plano</a>
             </div>
@@ -1373,11 +1415,12 @@ def landing():
     </div></nav>
 
     <div class="hero fade-in">
-        <h1>Seu atendente de vendas<br><span class="gradient">com inteligência artificial</span></h1>
-        <p>Automatize seu WhatsApp com IA treinável. Entende texto, áudio, imagens e documentos. Responda clientes 24/7.</p>
+        <h1>Atendente + Agência Digital<br><span class="gradient">com inteligência artificial</span></h1>
+        <p>Automatize seu WhatsApp com IA treinável E crie conteúdo diário automaticamente para suas redes sociais. Tudo em um só lugar.</p>
         <div class="hero-badges">
             <span class="hero-badge">✓ WhatsApp Business API</span>
-            <span class="hero-badge">✓ IA com Voz</span>
+            <span class="hero-badge">✓ Posts automáticos com IA</span>
+            <span class="hero-badge">✓ Aprovação por Telegram</span>
             <span class="hero-badge">✓ 7 dias grátis</span>
         </div>
         <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
@@ -1393,6 +1436,60 @@ def landing():
         <div class="feature-card fade-in fade-in-1"><div class="feature-icon">📄</div><h3>Lê PDFs</h3><p>Extrai e processa texto de documentos. Orçamentos, contratos e mais.</p></div>
         <div class="feature-card fade-in fade-in-2"><div class="feature-icon">📊</div><h3>Painel Completo</h3><p>Conversas em tempo real, métricas de atendimento e controle total.</p></div>
         <div class="feature-card fade-in fade-in-3"><div class="feature-icon">⚡</div><h3>Respostas Rápidas</h3><p>Atalhos para mensagens frequentes. Atenda em segundos.</p></div>
+    </div>
+
+    <div style="padding:80px 24px 40px;background:linear-gradient(135deg,rgba(99,102,241,0.08),rgba(168,85,247,0.08));border-radius:24px;margin:40px 24px;max-width:1200px;margin-left:auto;margin-right:auto">
+        <div style="text-align:center;max-width:800px;margin:0 auto">
+            <p style="color:var(--accent2);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">🚀 Novidade</p>
+            <h2 style="font-size:36px;margin-bottom:16px;letter-spacing:-0.5px">Agência Digital com IA</h2>
+            <p style="color:var(--text2);font-size:17px;margin-bottom:40px;line-height:1.6">
+                Economize R$ 2.000-5.000/mês que pagaria para uma agência.<br>
+                Nossa IA cria posts diários para suas redes sociais e te envia pelo Telegram para aprovar.
+            </p>
+        </div>
+        <div class="grid-3" style="max-width:1000px;margin:0 auto;gap:24px">
+            <div class="card fade-in fade-in-1" style="padding:28px;text-align:left">
+                <div style="font-size:32px;margin-bottom:12px">🖼️</div>
+                <h3 style="margin-bottom:8px">Biblioteca de mídia</h3>
+                <p style="color:var(--text2);font-size:14px;line-height:1.6">Envie fotos e vídeos do seu negócio. A IA escolhe a melhor para cada dia e tema (produto, bastidor, motivacional).</p>
+            </div>
+            <div class="card fade-in fade-in-2" style="padding:28px;text-align:left">
+                <div style="font-size:32px;margin-bottom:12px">✨</div>
+                <h3 style="margin-bottom:8px">Legendas geradas por IA</h3>
+                <p style="color:var(--text2);font-size:14px;line-height:1.6">Claude analisa a imagem, entende seu negócio e cria legendas envolventes com hashtags relevantes. Tom personalizado.</p>
+            </div>
+            <div class="card fade-in fade-in-3" style="padding:28px;text-align:left">
+                <div style="font-size:32px;margin-bottom:12px">📱</div>
+                <h3 style="margin-bottom:8px">Aprovação por Telegram</h3>
+                <p style="color:var(--text2);font-size:14px;line-height:1.6">Receba a sugestão de post direto no seu Telegram. Aprove com 1 clique ou rejeite se preferir algo diferente.</p>
+            </div>
+        </div>
+        <div style="text-align:center;margin-top:40px">
+            <a href="/register" class="btn btn-primary btn-lg">Experimente grátis por 7 dias →</a>
+        </div>
+    </div>
+
+    <div id="channels" style="padding:80px 24px 40px;max-width:1100px;margin:0 auto;text-align:center">
+        <p style="color:var(--accent2);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">Multicanal</p>
+        <h2 style="font-size:32px;margin-bottom:12px;letter-spacing:-0.5px">Um atendente, todos os canais</h2>
+        <p style="color:var(--text2);font-size:16px;margin-bottom:40px">Seu cliente fala por qualquer canal, sua IA responde do mesmo jeito.</p>
+        <div class="grid-3" style="gap:20px">
+            <div class="card fade-in fade-in-1" style="padding:24px">
+                <div style="font-size:36px;margin-bottom:12px">🟢</div>
+                <h3 style="margin-bottom:8px">WhatsApp</h3>
+                <p style="color:var(--text2);font-size:13px">Canal principal. Texto, áudio, imagens, PDFs, localização.</p>
+            </div>
+            <div class="card fade-in fade-in-2" style="padding:24px">
+                <div style="font-size:36px;margin-bottom:12px">📷</div>
+                <h3 style="margin-bottom:8px">Instagram Direct</h3>
+                <p style="color:var(--text2);font-size:13px">Atende mensagens diretas do Instagram na mesma interface.</p>
+            </div>
+            <div class="card fade-in fade-in-3" style="padding:24px">
+                <div style="font-size:36px;margin-bottom:12px">💬</div>
+                <h3 style="margin-bottom:8px">Messenger</h3>
+                <p style="color:var(--text2);font-size:13px">Mensagens da sua página do Facebook respondidas automaticamente.</p>
+            </div>
+        </div>
     </div>
 
     <div style="text-align:center;padding:40px 24px 20px">
@@ -1622,13 +1719,20 @@ def conversations():
     sidebar_items = ""
     first_id = None
     msgs_html = ""
+    channel_icons = {"whatsapp": "🟢", "instagram": "📷", "messenger": "💬"}
     for c in convos:
         if not first_id: first_id = c["id"]
         active = "active" if c["id"] == first_id else ""
         name = esc(c["customer_name"] or c["customer_phone"])
         preview = esc((c["last_msg"] or "Sem mensagens")[:50])
         date = esc(to_br_date(c["last_message_at"]))
-        sidebar_items += f'<div class="chat-item {active}" onclick="loadConversation({int(c["id"])},this)"><span class="chat-item-time">{date}</span><div class="chat-item-name">{name}</div><div class="chat-item-preview">{preview}</div></div>'
+        # Canal: whatsapp por padrão (para conversas antigas)
+        try:
+            channel = c["channel"] or "whatsapp"
+        except (KeyError, IndexError):
+            channel = "whatsapp"
+        icon = channel_icons.get(channel, "🟢")
+        sidebar_items += f'<div class="chat-item {active}" onclick="loadConversation({int(c["id"])},this)"><span class="chat-item-time">{icon} {date}</span><div class="chat-item-name">{name}</div><div class="chat-item-preview">{preview}</div></div>'
 
     if first_id:
         messages = db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (first_id,)).fetchall()
@@ -2075,10 +2179,25 @@ def upload_profile_photo():
 def settings():
     user = g.user; db = get_db(); msg = ""
     if request.method == "POST":
-        db.execute("""UPDATE users SET whatsapp_phone_id=?,whatsapp_token=?,business_hours=?,auto_reply_off_hours=?,name=?,company=?,phone=? WHERE id=?""",
-            (request.form.get("whatsapp_phone_id","").strip(), request.form.get("whatsapp_token","").strip(),
-             request.form.get("business_hours","08:00-18:00").strip(), request.form.get("auto_reply_off_hours","").strip(),
-             request.form.get("name","").strip(), request.form.get("company","").strip(), request.form.get("phone","").strip(), user["id"]))
+        db.execute("""UPDATE users SET 
+            whatsapp_phone_id=?, whatsapp_token=?,
+            instagram_page_id=?, instagram_token=?,
+            messenger_page_id=?, messenger_token=?,
+            business_hours=?, auto_reply_off_hours=?, 
+            name=?, company=?, phone=? 
+            WHERE id=?""",
+            (request.form.get("whatsapp_phone_id","").strip(),
+             request.form.get("whatsapp_token","").strip(),
+             request.form.get("instagram_page_id","").strip(),
+             request.form.get("instagram_token","").strip(),
+             request.form.get("messenger_page_id","").strip(),
+             request.form.get("messenger_token","").strip(),
+             request.form.get("business_hours","08:00-18:00").strip(),
+             request.form.get("auto_reply_off_hours","").strip(),
+             request.form.get("name","").strip(),
+             request.form.get("company","").strip(),
+             request.form.get("phone","").strip(),
+             user["id"]))
         db.commit(); msg = '<div class="alert alert-success">Configurações salvas!</div>'
         user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
 
@@ -2145,9 +2264,65 @@ def settings():
             </script></div>
         <div><div class="card fade-in fade-in-2" style="margin-bottom:24px"><div class="card-header"><span class="card-title">Webhook URL</span></div>
             <p style="color:var(--text2);font-size:14px;margin-bottom:12px">Configure no Meta Business:</p>
-            <div style="background:var(--bg4);padding:12px 16px;border-radius:var(--radius-sm);font-family:var(--mono);font-size:13px;word-break:break-all;color:var(--accent2)">{e_webhook}</div>
+            <p style="color:var(--text3);font-size:12px;margin-bottom:4px">📱 WhatsApp:</p>
+            <div style="background:var(--bg4);padding:10px 14px;border-radius:var(--radius-sm);font-family:var(--mono);font-size:12px;word-break:break-all;color:var(--accent2);margin-bottom:8px">{e_webhook}</div>
+            <p style="color:var(--text3);font-size:12px;margin-bottom:4px">📷 Instagram:</p>
+            <div style="background:var(--bg4);padding:10px 14px;border-radius:var(--radius-sm);font-family:var(--mono);font-size:12px;word-break:break-all;color:var(--accent2);margin-bottom:8px">{esc(base)}/webhook/instagram/{user['id']}</div>
+            <p style="color:var(--text3);font-size:12px;margin-bottom:4px">💬 Messenger:</p>
+            <div style="background:var(--bg4);padding:10px 14px;border-radius:var(--radius-sm);font-family:var(--mono);font-size:12px;word-break:break-all;color:var(--accent2);margin-bottom:8px">{esc(base)}/webhook/messenger/{user['id']}</div>
             <p style="color:var(--text3);font-size:12px;margin-top:8px">Token: <code style="color:var(--accent2)">{e_verify}</code></p></div>
-        <div class="card fade-in fade-in-3"><div class="card-header"><span class="card-title">Mídias suportadas</span></div>
+
+        <div class="card fade-in fade-in-3" style="margin-bottom:24px">
+            <div class="card-header"><span class="card-title">📷 Instagram Direct</span></div>
+            <p style="color:var(--text3);font-size:13px;margin-bottom:12px">Conecte sua conta Instagram Business/Creator para responder mensagens Direct automaticamente.</p>
+            <form method="POST">{csrf_field()}
+                <input type="hidden" name="name" value="{u_name}">
+                <input type="hidden" name="company" value="{u_company}">
+                <input type="hidden" name="phone" value="{u_phone}">
+                <input type="hidden" name="business_hours" value="{u_hours}">
+                <input type="hidden" name="auto_reply_off_hours" value="{u_reply}">
+                <input type="hidden" name="whatsapp_phone_id" value="{u_wa_id}">
+                <input type="hidden" name="whatsapp_token" value="{u_wa_token}">
+                <input type="hidden" name="messenger_page_id" value="{esc(user['messenger_page_id'] or '')}">
+                <input type="hidden" name="messenger_token" value="{esc(user['messenger_token'] or '')}">
+                <div class="form-group">
+                    <label class="form-label">Instagram Page ID</label>
+                    <input type="text" name="instagram_page_id" class="form-input" value="{esc(user['instagram_page_id'] or '')}" placeholder="ID da página conectada ao Instagram" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Instagram Access Token</label>
+                    <input type="text" name="instagram_token" class="form-input" value="{esc(user['instagram_token'] or '')}" placeholder="Token da Page com permissões Instagram" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                </div>
+                <button type="submit" class="btn btn-primary">Salvar Instagram</button>
+            </form>
+        </div>
+
+        <div class="card fade-in fade-in-4" style="margin-bottom:24px">
+            <div class="card-header"><span class="card-title">💬 Facebook Messenger</span></div>
+            <p style="color:var(--text3);font-size:13px;margin-bottom:12px">Conecte sua página do Facebook para responder mensagens do Messenger automaticamente.</p>
+            <form method="POST">{csrf_field()}
+                <input type="hidden" name="name" value="{u_name}">
+                <input type="hidden" name="company" value="{u_company}">
+                <input type="hidden" name="phone" value="{u_phone}">
+                <input type="hidden" name="business_hours" value="{u_hours}">
+                <input type="hidden" name="auto_reply_off_hours" value="{u_reply}">
+                <input type="hidden" name="whatsapp_phone_id" value="{u_wa_id}">
+                <input type="hidden" name="whatsapp_token" value="{u_wa_token}">
+                <input type="hidden" name="instagram_page_id" value="{esc(user['instagram_page_id'] or '')}">
+                <input type="hidden" name="instagram_token" value="{esc(user['instagram_token'] or '')}">
+                <div class="form-group">
+                    <label class="form-label">Page ID do Facebook</label>
+                    <input type="text" name="messenger_page_id" class="form-input" value="{esc(user['messenger_page_id'] or '')}" placeholder="ID da página do Facebook" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Page Access Token</label>
+                    <input type="text" name="messenger_token" class="form-input" value="{esc(user['messenger_token'] or '')}" placeholder="Token da Page com permissão pages_messaging" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                </div>
+                <button type="submit" class="btn btn-primary">Salvar Messenger</button>
+            </form>
+        </div>
+
+        <div class="card fade-in fade-in-5"><div class="card-header"><span class="card-title">Mídias suportadas</span></div>
             <div style="color:var(--text2);font-size:14px;line-height:1.8">
                 <p>✅ <strong style="color:var(--text)">Texto</strong> — lê e responde normalmente</p>
                 <p>✅ <strong style="color:var(--text)">Áudio</strong> — transcreve com Groq/Whisper e responde por voz</p>
@@ -2542,6 +2717,960 @@ def whatsapp_webhook(user_id):
     except Exception as e:
         print(f"Webhook error: {e}")
     return jsonify({"status":"ok"}), 200
+
+
+# ═══════════════════════════════════════════════════════════════
+#  INSTAGRAM DIRECT — Webhook e envio de mensagens
+# ═══════════════════════════════════════════════════════════════
+
+def send_instagram_message(page_id, token, recipient_id, message):
+    """Envia mensagem via Instagram Direct"""
+    if not page_id or not token:
+        log_debug("[IG SEND] Página ID ou token vazio")
+        return False
+    try:
+        import requests as req
+        url = f"https://graph.facebook.com/v18.0/{page_id}/messages"
+        params = {"access_token": token}
+        payload = {
+            "recipient": {"id": recipient_id},
+            "message": {"text": message[:1000]},  # Instagram limit
+            "messaging_type": "RESPONSE"
+        }
+        resp = req.post(url, params=params, json=payload, timeout=15)
+        if resp.status_code == 200:
+            print(f"[IG SEND] ✓ Enviado para {recipient_id}")
+            return True
+        print(f"[IG SEND] Erro {resp.status_code}: {resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[IG SEND] Exceção: {e}")
+        return False
+
+
+@app.route("/webhook/instagram/<int:user_id>", methods=["GET", "POST"])
+def webhook_instagram(user_id):
+    """Webhook do Instagram Direct"""
+    # Verificação inicial (quando Meta conecta)
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        verify_token = get_setting("WHATSAPP_VERIFY_TOKEN", WHATSAPP_VERIFY_TOKEN)
+        if mode == "subscribe" and token == verify_token:
+            return challenge, 200
+        return "Unauthorized", 403
+
+    # Valida assinatura em produção
+    app_secret = get_setting("WHATSAPP_APP_SECRET", "")
+    is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+    if app_secret:
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        if not verify_whatsapp_signature(request.get_data(), signature, app_secret):
+            print(f"[IG WEBHOOK] Assinatura inválida")
+            return jsonify({"status":"invalid signature"}), 403
+    elif not is_dev:
+        return jsonify({"status":"APP_SECRET required"}), 503
+
+    data = request.json or {}
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+        user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user:
+            db_conn.close()
+            return jsonify({"status":"user not found"}), 404
+
+        # Instagram envia messaging events
+        for entry in data.get("entry", []):
+            for event in entry.get("messaging", []):
+                sender_id = event.get("sender", {}).get("id", "")
+                if not sender_id or sender_id == user["instagram_page_id"]:
+                    continue  # Ignora echo da própria página
+
+                msg = event.get("message", {})
+                if not msg or msg.get("is_echo"):
+                    continue
+
+                message_text = msg.get("text", "")
+                if not message_text:
+                    # Mensagem não é texto (imagem, sticker, etc) — ignora por ora
+                    continue
+
+                # Busca ou cria conversa
+                conv = db_conn.execute(
+                    "SELECT * FROM conversations WHERE user_id=? AND customer_phone=? AND channel='instagram'",
+                    (user_id, sender_id)
+                ).fetchone()
+
+                if not conv:
+                    db_conn.execute(
+                        "INSERT INTO conversations (user_id, customer_phone, customer_name, channel, last_message_at) VALUES (?,?,?,?,datetime('now'))",
+                        (user_id, sender_id, f"IG: {sender_id[:10]}", "instagram")
+                    )
+                    db_conn.commit()
+                    conv = db_conn.execute(
+                        "SELECT * FROM conversations WHERE user_id=? AND customer_phone=? AND channel='instagram'",
+                        (user_id, sender_id)
+                    ).fetchone()
+
+                # Salva mensagem do cliente
+                db_conn.execute(
+                    "INSERT INTO messages (conversation_id, sender, content, msg_type) VALUES (?,?,?,?)",
+                    (conv["id"], "customer", message_text, "text")
+                )
+                db_conn.execute(
+                    "UPDATE conversations SET last_message_at=datetime('now') WHERE id=?",
+                    (conv["id"],)
+                )
+                db_conn.commit()
+
+                if conv["is_human_takeover"]:
+                    continue
+
+                # Gera resposta com IA
+                ai_response = generate_ai_response(user, conv["id"], message_text, db_conn)
+
+                # Salva resposta do bot
+                db_conn.execute(
+                    "INSERT INTO messages (conversation_id, sender, content, msg_type) VALUES (?,?,?,?)",
+                    (conv["id"], "bot", ai_response, "text")
+                )
+                db_conn.execute(
+                    "UPDATE users SET msgs_used=msgs_used+1 WHERE id=?",
+                    (user_id,)
+                )
+                db_conn.commit()
+
+                # Envia resposta no Instagram
+                send_instagram_message(
+                    user["instagram_page_id"],
+                    user["instagram_token"],
+                    sender_id,
+                    ai_response
+                )
+        db_conn.close()
+    except Exception as e:
+        print(f"[IG WEBHOOK] Erro: {e}")
+    return jsonify({"status":"ok"}), 200
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MESSENGER (Facebook) — Webhook e envio de mensagens
+# ═══════════════════════════════════════════════════════════════
+
+def send_messenger_message(page_id, token, recipient_id, message):
+    """Envia mensagem via Facebook Messenger"""
+    if not page_id or not token:
+        return False
+    try:
+        import requests as req
+        url = f"https://graph.facebook.com/v18.0/{page_id}/messages"
+        params = {"access_token": token}
+        payload = {
+            "recipient": {"id": recipient_id},
+            "message": {"text": message[:2000]},
+            "messaging_type": "RESPONSE"
+        }
+        resp = req.post(url, params=params, json=payload, timeout=15)
+        if resp.status_code == 200:
+            print(f"[MSG SEND] ✓ Enviado para {recipient_id}")
+            return True
+        print(f"[MSG SEND] Erro {resp.status_code}: {resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[MSG SEND] Exceção: {e}")
+        return False
+
+
+@app.route("/webhook/messenger/<int:user_id>", methods=["GET", "POST"])
+def webhook_messenger(user_id):
+    """Webhook do Facebook Messenger"""
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        verify_token = get_setting("WHATSAPP_VERIFY_TOKEN", WHATSAPP_VERIFY_TOKEN)
+        if mode == "subscribe" and token == verify_token:
+            return challenge, 200
+        return "Unauthorized", 403
+
+    # Valida assinatura
+    app_secret = get_setting("WHATSAPP_APP_SECRET", "")
+    is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+    if app_secret:
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        if not verify_whatsapp_signature(request.get_data(), signature, app_secret):
+            return jsonify({"status":"invalid signature"}), 403
+    elif not is_dev:
+        return jsonify({"status":"APP_SECRET required"}), 503
+
+    data = request.json or {}
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+        user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user:
+            db_conn.close()
+            return jsonify({"status":"user not found"}), 404
+
+        for entry in data.get("entry", []):
+            for event in entry.get("messaging", []):
+                sender_id = event.get("sender", {}).get("id", "")
+                if not sender_id or sender_id == user["messenger_page_id"]:
+                    continue
+
+                msg = event.get("message", {})
+                if not msg or msg.get("is_echo"):
+                    continue
+
+                message_text = msg.get("text", "")
+                if not message_text:
+                    continue
+
+                # Busca ou cria conversa
+                conv = db_conn.execute(
+                    "SELECT * FROM conversations WHERE user_id=? AND customer_phone=? AND channel='messenger'",
+                    (user_id, sender_id)
+                ).fetchone()
+
+                if not conv:
+                    db_conn.execute(
+                        "INSERT INTO conversations (user_id, customer_phone, customer_name, channel, last_message_at) VALUES (?,?,?,?,datetime('now'))",
+                        (user_id, sender_id, f"FB: {sender_id[:10]}", "messenger")
+                    )
+                    db_conn.commit()
+                    conv = db_conn.execute(
+                        "SELECT * FROM conversations WHERE user_id=? AND customer_phone=? AND channel='messenger'",
+                        (user_id, sender_id)
+                    ).fetchone()
+
+                db_conn.execute(
+                    "INSERT INTO messages (conversation_id, sender, content, msg_type) VALUES (?,?,?,?)",
+                    (conv["id"], "customer", message_text, "text")
+                )
+                db_conn.execute(
+                    "UPDATE conversations SET last_message_at=datetime('now') WHERE id=?",
+                    (conv["id"],)
+                )
+                db_conn.commit()
+
+                if conv["is_human_takeover"]:
+                    continue
+
+                ai_response = generate_ai_response(user, conv["id"], message_text, db_conn)
+
+                db_conn.execute(
+                    "INSERT INTO messages (conversation_id, sender, content, msg_type) VALUES (?,?,?,?)",
+                    (conv["id"], "bot", ai_response, "text")
+                )
+                db_conn.execute(
+                    "UPDATE users SET msgs_used=msgs_used+1 WHERE id=?",
+                    (user_id,)
+                )
+                db_conn.commit()
+
+                send_messenger_message(
+                    user["messenger_page_id"],
+                    user["messenger_token"],
+                    sender_id,
+                    ai_response
+                )
+        db_conn.close()
+    except Exception as e:
+        print(f"[MSG WEBHOOK] Erro: {e}")
+    return jsonify({"status":"ok"}), 200
+
+
+# ═══════════════════════════════════════════════════════════════
+#  AGÊNCIA DIGITAL — Biblioteca de mídia + IA + Telegram
+# ═══════════════════════════════════════════════════════════════
+
+def send_telegram_message(bot_token, chat_id, text, parse_mode="HTML"):
+    """Envia mensagem de texto via Telegram Bot"""
+    if not bot_token or not chat_id:
+        return None
+    try:
+        import requests as req
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text[:4000],
+            "parse_mode": parse_mode
+        }
+        resp = req.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            return resp.json().get("result", {}).get("message_id")
+        print(f"[TG] Erro {resp.status_code}: {resp.text[:200]}")
+        return None
+    except Exception as e:
+        print(f"[TG] Exceção: {e}")
+        return None
+
+
+def send_telegram_photo(bot_token, chat_id, photo_path, caption="", reply_markup=None):
+    """Envia foto via Telegram Bot com botões de aprovação"""
+    if not bot_token or not chat_id:
+        return None
+    try:
+        import requests as req, json as json_mod
+        url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            data = {
+                "chat_id": chat_id,
+                "caption": caption[:1024],
+                "parse_mode": "HTML"
+            }
+            if reply_markup:
+                data["reply_markup"] = json_mod.dumps(reply_markup)
+            resp = req.post(url, files=files, data=data, timeout=30)
+        if resp.status_code == 200:
+            return resp.json().get("result", {}).get("message_id")
+        print(f"[TG PHOTO] Erro {resp.status_code}: {resp.text[:200]}")
+        return None
+    except Exception as e:
+        print(f"[TG PHOTO] Exceção: {e}")
+        return None
+
+
+def generate_social_caption(user, media_description, theme="geral"):
+    """Usa Claude para gerar legenda + hashtags para post"""
+    try:
+        import requests as req
+        api_key = get_setting("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return None
+
+        business_context = user["social_business_context"] or user["ai_system_prompt"] or ""
+        tone = user["social_post_tone"] or "profissional"
+
+        prompt = f"""Você é um especialista em redes sociais. Crie uma legenda para post no Instagram/Facebook.
+
+CONTEXTO DO NEGÓCIO:
+{business_context}
+
+TEMA DA IMAGEM: {theme}
+DESCRIÇÃO DA IMAGEM: {media_description or 'Imagem promocional'}
+
+TOM: {tone}
+
+REGRAS:
+- Legenda envolvente, máximo 150 palavras
+- Comece com um gancho (pergunta, fato, emoji)
+- Inclua call-to-action natural no final
+- 8 a 12 hashtags relevantes ao final
+- Use emojis com moderação (2-4 no total)
+- Linguagem brasileira, natural
+
+FORMATO DA RESPOSTA (exato):
+LEGENDA: [texto da legenda aqui]
+HASHTAGS: #tag1 #tag2 #tag3 ...
+
+Responda apenas com a LEGENDA e HASHTAGS, nada mais."""
+
+        resp = req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 500,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if resp.status_code != 200:
+            print(f"[SOCIAL AI] Erro: {resp.status_code}")
+            return None
+
+        text = resp.json()["content"][0]["text"]
+        # Parse da resposta
+        caption = ""
+        hashtags = ""
+        for line in text.split("\n"):
+            if line.startswith("LEGENDA:"):
+                caption = line.replace("LEGENDA:", "").strip()
+            elif line.startswith("HASHTAGS:"):
+                hashtags = line.replace("HASHTAGS:", "").strip()
+            elif caption and not line.startswith("HASHTAGS:") and not hashtags:
+                # Continua a legenda se está em múltiplas linhas
+                caption += "\n" + line.strip()
+
+        # Fallback: se não conseguir parsear, usa tudo como caption
+        if not caption:
+            caption = text[:500]
+
+        return {"caption": caption.strip(), "hashtags": hashtags.strip()}
+    except Exception as e:
+        print(f"[SOCIAL AI] Exceção: {e}")
+        return None
+
+
+def describe_image_for_caption(image_path):
+    """Usa Claude Vision para descrever a imagem (ajuda a gerar legenda contextual)"""
+    try:
+        import base64 as b64, requests as req
+        api_key = get_setting("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return ""
+
+        with open(image_path, "rb") as f:
+            image_data = b64.b64encode(f.read()).decode("utf-8")
+
+        ext = image_path.lower().split(".")[-1]
+        media_type = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+
+        resp = req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
+                    {"type": "text", "text": "Descreva esta imagem em uma frase curta em português, focando em elementos que podem inspirar uma legenda de rede social. Máximo 30 palavras."}
+                ]}]
+            },
+            timeout=30
+        )
+        if resp.status_code == 200:
+            return resp.json()["content"][0]["text"]
+        return ""
+    except Exception as e:
+        print(f"[VISION] Erro: {e}")
+        return ""
+
+
+def create_social_post(user_id, media_id=None):
+    """Cria um post: escolhe mídia, gera legenda, envia para Telegram aprovar"""
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+
+        user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user:
+            db_conn.close()
+            return None
+
+        # Se não especificou media_id, escolhe a menos usada
+        if media_id:
+            media = db_conn.execute(
+                "SELECT * FROM social_media_library WHERE id=? AND user_id=?",
+                (media_id, user_id)
+            ).fetchone()
+        else:
+            media = db_conn.execute(
+                """SELECT * FROM social_media_library
+                   WHERE user_id=?
+                   ORDER BY times_used ASC, last_used_at ASC
+                   LIMIT 1""",
+                (user_id,)
+            ).fetchone()
+
+        if not media:
+            db_conn.close()
+            print(f"[SOCIAL] Usuário {user_id} sem mídia na biblioteca")
+            return None
+
+        # Descreve a imagem com IA
+        description = describe_image_for_caption(media["file_path"])
+
+        # Gera legenda + hashtags
+        ai_result = generate_social_caption(user, description, media["theme"])
+        if not ai_result:
+            db_conn.close()
+            return None
+
+        caption = ai_result["caption"]
+        hashtags = ai_result["hashtags"]
+
+        # Cria registro do post
+        cur = db_conn.execute(
+            """INSERT INTO scheduled_posts
+               (user_id, media_id, caption, hashtags, status, scheduled_for)
+               VALUES (?,?,?,?,?,?)""",
+            (user_id, media["id"], caption, hashtags, "pending",
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        post_id = cur.lastrowid
+        db_conn.commit()
+
+        # Envia para aprovação via Telegram
+        if user["telegram_bot_token"] and user["telegram_chat_id"]:
+            full_text = f"{caption}\n\n{hashtags}"
+            message = (
+                f"📸 <b>Sugestão de post</b>\n\n"
+                f"{full_text}\n\n"
+                f"<i>Post ID: {post_id}</i>\n"
+                f"Aprove pela interface web ou responda aqui."
+            )
+            msg_id = send_telegram_photo(
+                user["telegram_bot_token"],
+                user["telegram_chat_id"],
+                media["file_path"],
+                caption=full_text[:1000],
+                reply_markup={
+                    "inline_keyboard": [[
+                        {"text": "✅ Aprovar", "callback_data": f"approve_{post_id}"},
+                        {"text": "❌ Rejeitar", "callback_data": f"reject_{post_id}"}
+                    ]]
+                }
+            )
+            if msg_id:
+                db_conn.execute(
+                    "UPDATE scheduled_posts SET telegram_message_id=? WHERE id=?",
+                    (str(msg_id), post_id)
+                )
+                db_conn.commit()
+
+        db_conn.close()
+        return post_id
+    except Exception as e:
+        print(f"[SOCIAL] Erro create_social_post: {e}")
+        return None
+
+
+# ─── ROTAS: BIBLIOTECA DE MÍDIA ──────────────────────────────
+@app.route("/dashboard/social")
+@login_required
+def social_dashboard():
+    """Dashboard principal da agência digital"""
+    user = g.user
+    db = get_db()
+
+    # Estatísticas
+    total_media = db.execute(
+        "SELECT COUNT(*) as c FROM social_media_library WHERE user_id=?", (user["id"],)
+    ).fetchone()["c"]
+    total_posts = db.execute(
+        "SELECT COUNT(*) as c FROM scheduled_posts WHERE user_id=?", (user["id"],)
+    ).fetchone()["c"]
+    pending = db.execute(
+        "SELECT COUNT(*) as c FROM scheduled_posts WHERE user_id=? AND status='pending'", (user["id"],)
+    ).fetchone()["c"]
+    approved = db.execute(
+        "SELECT COUNT(*) as c FROM scheduled_posts WHERE user_id=? AND status='approved'", (user["id"],)
+    ).fetchone()["c"]
+
+    # Mídia recente
+    media_items = db.execute(
+        "SELECT * FROM social_media_library WHERE user_id=? ORDER BY created_at DESC LIMIT 8",
+        (user["id"],)
+    ).fetchall()
+
+    media_html = ""
+    if media_items:
+        for m in media_items:
+            img_url = f"/media/social/{m['id']}"
+            media_html += f"""
+            <div class="card" style="padding:12px">
+                <img src="{img_url}" style="width:100%;height:140px;object-fit:cover;border-radius:8px;margin-bottom:8px" alt="">
+                <p style="font-size:12px;color:var(--text3);margin:0">{esc(m['theme'])} · usada {m['times_used']}x</p>
+            </div>
+            """
+    else:
+        media_html = '<p style="color:var(--text3);grid-column:1/-1;text-align:center;padding:40px">Nenhuma mídia cadastrada ainda.</p>'
+
+    # Posts recentes
+    posts = db.execute(
+        """SELECT sp.*, sml.file_path FROM scheduled_posts sp
+           LEFT JOIN social_media_library sml ON sp.media_id=sml.id
+           WHERE sp.user_id=? ORDER BY sp.created_at DESC LIMIT 10""",
+        (user["id"],)
+    ).fetchall()
+
+    posts_html = ""
+    if posts:
+        for p in posts:
+            status_cls = {
+                "pending": "badge-orange",
+                "approved": "badge-green",
+                "rejected": "badge-red",
+                "posted": "badge-purple"
+            }.get(p["status"], "badge-orange")
+            status_label = {
+                "pending": "Aguardando aprovação",
+                "approved": "Aprovado",
+                "rejected": "Rejeitado",
+                "posted": "Publicado"
+            }.get(p["status"], p["status"])
+
+            img_tag = ""
+            if p["media_id"]:
+                img_tag = f'<img src="/media/social/{p["media_id"]}" style="width:80px;height:80px;object-fit:cover;border-radius:6px;margin-right:12px">'
+
+            posts_html += f"""
+            <div style="display:flex;padding:12px;border-bottom:1px solid rgba(255,255,255,0.06);align-items:flex-start">
+                {img_tag}
+                <div style="flex:1">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                        <span class="badge {status_cls}">{status_label}</span>
+                        <span style="color:var(--text3);font-size:11px">{to_br_datetime(p['created_at'])}</span>
+                    </div>
+                    <p style="color:var(--text2);font-size:13px;margin:0 0 4px 0;line-height:1.4">{esc(p['caption'][:160])}{'...' if len(p['caption'] or '') > 160 else ''}</p>
+                    <p style="color:var(--accent2);font-size:11px;margin:0">{esc(p['hashtags'][:120])}</p>
+                    <div style="margin-top:8px;display:flex;gap:8px">
+                        {'<form method="POST" action="/dashboard/social/posts/' + str(p['id']) + '/approve" style="display:inline">' + csrf_field() + '<button type="submit" class="btn btn-success btn-sm">✅ Aprovar</button></form>' if p['status']=='pending' else ''}
+                        {'<form method="POST" action="/dashboard/social/posts/' + str(p['id']) + '/reject" style="display:inline">' + csrf_field() + '<button type="submit" class="btn btn-danger btn-sm">❌ Rejeitar</button></form>' if p['status']=='pending' else ''}
+                    </div>
+                </div>
+            </div>
+            """
+    else:
+        posts_html = '<p style="color:var(--text3);text-align:center;padding:40px">Nenhum post gerado ainda. Cadastre mídias e clique em "Gerar post agora".</p>'
+
+    content = f"""<div class="container">
+        <div class="page-header fade-in">
+            <h1>📸 Agência Digital</h1>
+            <p>Sistema automatizado de criação de conteúdo com IA + aprovação por Telegram</p>
+        </div>
+
+        <div class="grid-4 fade-in fade-in-1">
+            <div class="metric-card"><div style="font-size:24px">🖼️</div><div class="metric-value">{total_media}</div><div class="metric-label">Mídias cadastradas</div></div>
+            <div class="metric-card"><div style="font-size:24px">📝</div><div class="metric-value">{total_posts}</div><div class="metric-label">Posts gerados</div></div>
+            <div class="metric-card"><div style="font-size:24px">⏳</div><div class="metric-value" style="color:var(--orange)">{pending}</div><div class="metric-label">Aguardando aprovação</div></div>
+            <div class="metric-card"><div style="font-size:24px">✅</div><div class="metric-value" style="color:var(--green2)">{approved}</div><div class="metric-label">Aprovados</div></div>
+        </div>
+
+        <div class="grid-2 fade-in fade-in-2">
+            <div class="card">
+                <div class="card-header"><span class="card-title">🚀 Ações rápidas</span></div>
+                <form method="POST" action="/dashboard/social/generate" style="margin-bottom:12px">{csrf_field()}
+                    <button type="submit" class="btn btn-primary" style="width:100%">✨ Gerar novo post agora</button>
+                </form>
+                <a href="/dashboard/social/library" class="btn" style="width:100%;background:rgba(255,255,255,0.05);margin-bottom:12px;display:block;text-align:center;text-decoration:none">📤 Gerenciar biblioteca de mídia</a>
+                <a href="/dashboard/social/settings" class="btn" style="width:100%;background:rgba(255,255,255,0.05);display:block;text-align:center;text-decoration:none">⚙️ Configurações e Telegram</a>
+            </div>
+            <div class="card">
+                <div class="card-header"><span class="card-title">📚 Mídias recentes</span></div>
+                <div class="grid-4" style="gap:8px">
+                    {media_html}
+                </div>
+            </div>
+        </div>
+
+        <div class="card fade-in fade-in-3" style="margin-top:24px">
+            <div class="card-header"><span class="card-title">📋 Histórico de posts</span></div>
+            <div>{posts_html}</div>
+        </div>
+    </div>"""
+    return base_html("Agência Digital", content, dict(user))
+
+
+@app.route("/dashboard/social/library", methods=["GET", "POST"])
+@login_required
+def social_library():
+    """Gerenciar biblioteca de mídia"""
+    user = g.user
+    db = get_db()
+    msg = ""
+
+    if request.method == "POST":
+        if "photo" in request.files:
+            file = request.files["photo"]
+            if file.filename:
+                allowed = {"image/jpeg", "image/png", "image/jpg"}
+                if file.content_type in allowed:
+                    image_bytes = file.read()
+                    if len(image_bytes) <= 10 * 1024 * 1024:
+                        lib_dir = os.path.join(MEDIA_FOLDER, "social")
+                        os.makedirs(lib_dir, exist_ok=True)
+                        ext = "jpg" if "jpeg" in file.content_type else "png"
+                        ts = int(time.time() * 1000)
+                        fname = f"user{user['id']}_{ts}.{ext}"
+                        fpath = os.path.join(lib_dir, fname)
+                        with open(fpath, "wb") as f:
+                            f.write(image_bytes)
+                        theme = request.form.get("theme", "geral")
+                        description = request.form.get("description", "")
+                        db.execute(
+                            """INSERT INTO social_media_library
+                               (user_id, file_path, file_type, theme, description)
+                               VALUES (?,?,?,?,?)""",
+                            (user["id"], fpath, file.content_type, theme, description)
+                        )
+                        db.commit()
+                        msg = '<div class="alert alert-success">✅ Mídia adicionada!</div>'
+                    else:
+                        msg = '<div class="alert alert-error">Arquivo maior que 10MB</div>'
+                else:
+                    msg = '<div class="alert alert-error">Apenas JPG ou PNG</div>'
+
+    items = db.execute(
+        "SELECT * FROM social_media_library WHERE user_id=? ORDER BY created_at DESC",
+        (user["id"],)
+    ).fetchall()
+
+    items_html = ""
+    if items:
+        for m in items:
+            img_url = f"/media/social/{m['id']}"
+            items_html += f"""
+            <div class="card" style="padding:12px">
+                <img src="{img_url}" style="width:100%;height:160px;object-fit:cover;border-radius:8px;margin-bottom:8px" alt="">
+                <p style="font-size:13px;color:var(--text);margin:0 0 4px 0;font-weight:500">{esc(m['theme'])}</p>
+                <p style="font-size:11px;color:var(--text3);margin:0 0 8px 0">Usada {m['times_used']}x</p>
+                {('<p style="font-size:11px;color:var(--text2);margin:0 0 8px 0">' + esc(m['description'][:80]) + '</p>') if m['description'] else ''}
+                <form method="POST" action="/dashboard/social/library/{m['id']}/delete" style="margin:0">{csrf_field()}
+                    <button type="submit" class="btn btn-sm" style="background:rgba(239,68,68,0.2);color:#ef4444;width:100%;font-size:12px">🗑️ Excluir</button>
+                </form>
+            </div>
+            """
+    else:
+        items_html = '<p style="color:var(--text3);grid-column:1/-1;text-align:center;padding:40px">Nenhuma mídia cadastrada. Use o formulário acima para enviar.</p>'
+
+    content = f"""<div class="container">
+        <div class="page-header fade-in">
+            <h1>🖼️ Biblioteca de Mídia</h1>
+            <p>Cadastre fotos que a IA usará para gerar posts automaticamente</p>
+        </div>
+        {msg}
+
+        <div class="card fade-in fade-in-1" style="margin-bottom:24px">
+            <div class="card-header"><span class="card-title">📤 Adicionar nova mídia</span></div>
+            <form method="POST" enctype="multipart/form-data">{csrf_field()}
+                <div class="grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Tema da imagem *</label>
+                        <select name="theme" class="form-input" required>
+                            <option value="produto">Produto / Serviço</option>
+                            <option value="motivacional">Motivacional</option>
+                            <option value="bastidores">Bastidores</option>
+                            <option value="dica">Dica / Educacional</option>
+                            <option value="depoimento">Depoimento / Cliente</option>
+                            <option value="promocao">Promoção</option>
+                            <option value="evento">Evento / Data comemorativa</option>
+                            <option value="geral">Geral</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Imagem (JPG/PNG, máx 10MB) *</label>
+                        <input type="file" name="photo" accept="image/jpeg,image/png" required
+                            style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08);padding:10px;border-radius:8px;color:var(--text);width:100%">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Descrição (opcional — ajuda a IA gerar legenda melhor)</label>
+                    <textarea name="description" class="form-input" rows="2" placeholder="Ex: Mesa posta para jantar romântico, detalhes em dourado"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">📤 Adicionar à biblioteca</button>
+            </form>
+        </div>
+
+        <div class="card fade-in fade-in-2">
+            <div class="card-header"><span class="card-title">📸 Mídias cadastradas ({len(items)})</span></div>
+            <div class="grid-4" style="gap:16px">{items_html}</div>
+        </div>
+    </div>"""
+    return base_html("Biblioteca", content, dict(user))
+
+
+@app.route("/dashboard/social/library/<int:media_id>/delete", methods=["POST"])
+@login_required
+def social_library_delete(media_id):
+    user = g.user
+    db = get_db()
+    item = db.execute(
+        "SELECT * FROM social_media_library WHERE id=? AND user_id=?",
+        (media_id, user["id"])
+    ).fetchone()
+    if item:
+        try:
+            if os.path.exists(item["file_path"]):
+                os.remove(item["file_path"])
+        except Exception:
+            pass
+        db.execute("DELETE FROM social_media_library WHERE id=?", (media_id,))
+        db.commit()
+    return redirect("/dashboard/social/library")
+
+
+@app.route("/media/social/<int:media_id>")
+@login_required
+def serve_social_media(media_id):
+    user = g.user
+    db = get_db()
+    m = db.execute(
+        "SELECT * FROM social_media_library WHERE id=? AND user_id=?",
+        (media_id, user["id"])
+    ).fetchone()
+    if not m or not os.path.exists(m["file_path"]):
+        return "Não encontrado", 404
+    return send_file(m["file_path"], mimetype=m["file_type"])
+
+
+@app.route("/dashboard/social/generate", methods=["POST"])
+@login_required
+def social_generate():
+    """Gera um post novo agora"""
+    user = g.user
+    post_id = create_social_post(user["id"])
+    if post_id:
+        return redirect(f"/dashboard/social?ok=1")
+    return redirect("/dashboard/social?err=no_media")
+
+
+@app.route("/dashboard/social/posts/<int:post_id>/approve", methods=["POST"])
+@login_required
+def social_approve_post(post_id):
+    user = g.user
+    db = get_db()
+    post = db.execute(
+        "SELECT * FROM scheduled_posts WHERE id=? AND user_id=?",
+        (post_id, user["id"])
+    ).fetchone()
+    if post:
+        db.execute(
+            "UPDATE scheduled_posts SET status='approved', approved_at=datetime('now') WHERE id=?",
+            (post_id,)
+        )
+        # Incrementa uso da mídia
+        if post["media_id"]:
+            db.execute(
+                "UPDATE social_media_library SET times_used=times_used+1, last_used_at=datetime('now') WHERE id=?",
+                (post["media_id"],)
+            )
+        db.commit()
+        # Notifica via Telegram se configurado
+        if user["telegram_bot_token"] and user["telegram_chat_id"]:
+            send_telegram_message(
+                user["telegram_bot_token"],
+                user["telegram_chat_id"],
+                f"✅ <b>Post #{post_id} aprovado!</b>\n\nCaption e imagem prontas para publicação."
+            )
+    return redirect("/dashboard/social")
+
+
+@app.route("/dashboard/social/posts/<int:post_id>/reject", methods=["POST"])
+@login_required
+def social_reject_post(post_id):
+    user = g.user
+    db = get_db()
+    db.execute(
+        "UPDATE scheduled_posts SET status='rejected' WHERE id=? AND user_id=?",
+        (post_id, user["id"])
+    )
+    db.commit()
+    return redirect("/dashboard/social")
+
+
+@app.route("/dashboard/social/settings", methods=["GET", "POST"])
+@login_required
+def social_settings():
+    user = g.user
+    db = get_db()
+    msg = ""
+
+    if request.method == "POST":
+        db.execute(
+            """UPDATE users SET
+                telegram_bot_token=?,
+                telegram_chat_id=?,
+                social_post_time=?,
+                social_auto_enabled=?,
+                social_post_tone=?,
+                social_business_context=?
+               WHERE id=?""",
+            (
+                request.form.get("telegram_bot_token", "").strip(),
+                request.form.get("telegram_chat_id", "").strip(),
+                request.form.get("social_post_time", "09:00").strip(),
+                1 if request.form.get("social_auto_enabled") else 0,
+                request.form.get("social_post_tone", "profissional"),
+                request.form.get("social_business_context", "").strip(),
+                user["id"]
+            )
+        )
+        db.commit()
+        user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        msg = '<div class="alert alert-success">✅ Configurações salvas!</div>'
+
+    # Testa Telegram se configurado
+    if request.args.get("test_telegram") == "1":
+        if user["telegram_bot_token"] and user["telegram_chat_id"]:
+            result = send_telegram_message(
+                user["telegram_bot_token"],
+                user["telegram_chat_id"],
+                "🎉 <b>Telegram conectado!</b>\n\nSeu atendente.online está pronto para enviar posts para aprovação aqui."
+            )
+            if result:
+                msg = '<div class="alert alert-success">✅ Mensagem de teste enviada com sucesso!</div>'
+            else:
+                msg = '<div class="alert alert-error">❌ Não consegui enviar. Verifique Token e Chat ID.</div>'
+
+    content = f"""<div class="container">
+        <div class="page-header fade-in">
+            <h1>⚙️ Configurações da Agência</h1>
+            <p>Configure o Telegram Bot e comportamento dos posts</p>
+        </div>
+        {msg}
+
+        <div class="grid-2">
+            <div class="card fade-in fade-in-1">
+                <div class="card-header"><span class="card-title">📱 Telegram Bot</span></div>
+                <p style="color:var(--text3);font-size:13px;margin-bottom:16px">
+                    Posts serão enviados para o Telegram para sua aprovação.
+                    <br><a href="https://telegram.me/BotFather" target="_blank" style="color:var(--accent2)">Como criar um bot no Telegram →</a>
+                </p>
+                <form method="POST">{csrf_field()}
+                    <div class="form-group">
+                        <label class="form-label">Bot Token</label>
+                        <input type="text" name="telegram_bot_token" class="form-input" value="{esc(user['telegram_bot_token'] or '')}" placeholder="123456:ABC-DEF...">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Chat ID (seu)</label>
+                        <input type="text" name="telegram_chat_id" class="form-input" value="{esc(user['telegram_chat_id'] or '')}" placeholder="123456789">
+                        <small style="color:var(--text3)">Acesse <a href="https://telegram.me/userinfobot" target="_blank" style="color:var(--accent2)">@userinfobot</a> para descobrir seu chat ID</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Horário diário para gerar post</label>
+                        <input type="time" name="social_post_time" class="form-input" value="{esc(user['social_post_time'] or '09:00')}">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            <input type="checkbox" name="social_auto_enabled" value="1" {'checked' if user['social_auto_enabled'] else ''}>
+                            Gerar post automaticamente todo dia neste horário
+                        </label>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary">Salvar</button>
+                    <a href="/dashboard/social/settings?test_telegram=1" class="btn" style="background:rgba(255,255,255,0.05);margin-left:8px">Testar Telegram</a>
+                </form>
+            </div>
+
+            <div class="card fade-in fade-in-2">
+                <div class="card-header"><span class="card-title">🤖 Personalidade da IA</span></div>
+                <form method="POST">{csrf_field()}
+                    <input type="hidden" name="telegram_bot_token" value="{esc(user['telegram_bot_token'] or '')}">
+                    <input type="hidden" name="telegram_chat_id" value="{esc(user['telegram_chat_id'] or '')}">
+                    <input type="hidden" name="social_post_time" value="{esc(user['social_post_time'] or '09:00')}">
+                    <input type="hidden" name="social_auto_enabled" value="{'1' if user['social_auto_enabled'] else ''}">
+
+                    <div class="form-group">
+                        <label class="form-label">Tom dos posts</label>
+                        <select name="social_post_tone" class="form-input">
+                            <option value="profissional" {'selected' if user['social_post_tone']=='profissional' else ''}>Profissional</option>
+                            <option value="descontraido" {'selected' if user['social_post_tone']=='descontraido' else ''}>Descontraído</option>
+                            <option value="inspirador" {'selected' if user['social_post_tone']=='inspirador' else ''}>Inspirador</option>
+                            <option value="humoristico" {'selected' if user['social_post_tone']=='humoristico' else ''}>Humorístico</option>
+                            <option value="elegante" {'selected' if user['social_post_tone']=='elegante' else ''}>Elegante / Sofisticado</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Contexto do negócio para a IA</label>
+                        <textarea name="social_business_context" class="form-input" rows="6" placeholder="Ex: Somos uma pizzaria no Centro de Fortaleza, especializada em pizzas artesanais de massa fina. Atendemos das 18h às 23h, temos delivery próprio. Nosso público é casal 25-40 anos.">{esc(user['social_business_context'] or '')}</textarea>
+                        <small style="color:var(--text3)">A IA usará isso para criar legendas alinhadas com seu negócio</small>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary">Salvar</button>
+                </form>
+            </div>
+        </div>
+    </div>"""
+    return base_html("Configurações Agência", content, dict(user))
 
 
 def fetch_weather(message):

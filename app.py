@@ -2717,12 +2717,20 @@ def generate_ai_response(user, conversation_id, message, db_conn):
     history = list(reversed(db_conn.execute("SELECT sender,content FROM messages WHERE conversation_id=? ORDER BY created_at DESC LIMIT 10", (conversation_id,)).fetchall()))
     kb_items = db_conn.execute("SELECT title,content FROM knowledge_base WHERE user_id=? LIMIT 20", (user["id"],)).fetchall()
     qr_items = db_conn.execute("SELECT shortcut,content FROM quick_replies WHERE user_id=? LIMIT 20", (user["id"],)).fetchall()
-    
+    gallery_items = db_conn.execute("SELECT name,keywords,description FROM product_gallery WHERE user_id=?", (user["id"],)).fetchall()
+
     kb_context = "\n".join([f"- {i['title']}: {i['content']}" for i in kb_items])
     qr_context = "\n".join([f"- /{q['shortcut']}: {q['content']}" for q in qr_items])
-    
+    gallery_context = "\n".join([f"- {g['name']}: {g['description'] or 'sem descrição'}" for g in gallery_items])
+
     tone_map = {"profissional":"Profissional mas acessível.","descontraido":"Descontraído, com emojis moderados.","formal":"Formal e respeitoso.","amigavel":"Amigável e caloroso."}
-    
+
+    # Verifica se a mensagem vai disparar envio automático de foto
+    matched_product = find_matching_product(user["id"], message)
+    gallery_note = ""
+    if matched_product:
+        gallery_note = f"\n\n⚠️ IMPORTANTE: O sistema JÁ VAI ENVIAR automaticamente a foto de '{matched_product['name']}' para o cliente junto com sua resposta. NÃO diga que não pode enviar foto. NÃO mencione que vai enviar a foto (ela já está sendo enviada). Apenas responda normalmente descrevendo o produto ou confirmando o pedido."
+
     system_prompt = f"""{user['ai_system_prompt']}
 
 Tom: {tone_map.get(user['ai_tone'],'Profissional.')}
@@ -2733,15 +2741,19 @@ INFORMAÇÕES DO NEGÓCIO:
 RESPOSTAS RÁPIDAS DISPONÍVEIS:
 {qr_context or 'Nenhuma.'}
 
+FOTOS DE PRODUTOS DISPONÍVEIS (enviadas automaticamente quando o cliente pedir):
+{gallery_context or 'Nenhuma foto cadastrada.'}
+
 REGRAS:
 - Responda de forma breve (máx 3 parágrafos curtos)
 - Não invente informações sobre produtos ou preços
 - Se não souber, diga que vai verificar
 - Horário: {user['business_hours']}
+- IMPORTANTE: O sistema CONSEGUE enviar fotos de produtos automaticamente através da galeria cadastrada acima. Se o cliente pedir foto de um produto que está na lista, NÃO diga que não pode enviar foto — o sistema envia automaticamente. Apenas descreva o produto ou fale sobre ele.
 - Se o cliente enviar áudio, você receberá a transcrição marcada como [MENSAGEM DE ÁUDIO DO CLIENTE]. Responda de forma conversacional e natural, como se estivesse falando (a resposta será convertida em áudio). NÃO use formatação como asteriscos, bullets, listas numeradas ou markdown. Escreva em frases corridas e naturais. Seja breve, no máximo 3 frases.
 - Se o cliente enviar imagem, você receberá a descrição da imagem
 - Se o cliente enviar PDF, você receberá o texto extraído
-- Se o cliente perguntar sobre tempo/clima, você receberá dados reais marcados como [DADOS DO CLIMA ATUALIZADOS]. Use esses dados para responder com precisão.
+- Se o cliente perguntar sobre tempo/clima, você receberá dados reais marcados como [DADOS DO CLIMA ATUALIZADOS]. Use esses dados para responder com precisão.{gallery_note}
 """
 
     api_messages = [{"role":"assistant" if h["sender"]=="bot" else "user","content":h["content"]} for h in history]
@@ -3365,15 +3377,101 @@ def admin_users():
             <td style="font-size:12px;color:var(--text3)">{(u['created_at'] or '')[:10]}</td>
             <td style="font-size:12px;color:var(--text3)">{(u['last_login'] or 'Nunca')[:10]}</td>
             <td>
+                <form method="POST" action="/admin/users/{u['id']}/change-plan" style="display:inline;margin-right:4px">
+                    {csrf_field()}
+                    <select name="plan" onchange="this.form.submit()" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.1);color:var(--text);padding:4px 8px;border-radius:6px;font-size:12px">
+                        <option value="starter" {'selected' if u['plan']=='starter' else ''}>Starter</option>
+                        <option value="pro" {'selected' if u['plan']=='pro' else ''}>Pro</option>
+                        <option value="business" {'selected' if u['plan']=='business' else ''}>Business</option>
+                    </select>
+                </form>
                 <form method="POST" action="/admin/users/{u['id']}/toggle" style="display:inline">
+                    {csrf_field()}
                     <button type="submit" class="btn {'btn-danger' if u['is_active'] else 'btn-success'} btn-sm">{'Desativar' if u['is_active'] else 'Ativar'}</button>
                 </form>
             </td></tr>"""
 
     content = f"""<div class="container"><div class="page-header"><h1>Clientes ({len(users)})</h1><p>Todos os clientes cadastrados no sistema</p></div>
+
+        <div class="card" style="margin-bottom:24px">
+            <div class="card-header"><span class="card-title">➕ Criar cliente manualmente (sem verificação de email)</span></div>
+            <p style="color:var(--text3);font-size:13px;margin-bottom:16px">Use para criar contas de teste ou contornar problemas com SMTP. A conta é criada já verificada e ativa.</p>
+            <form method="POST" action="/admin/users/create">{csrf_field()}
+                <div class="grid-3">
+                    <div class="form-group">
+                        <label class="form-label">Nome *</label>
+                        <input type="text" name="name" class="form-input" required placeholder="Nome completo">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Email *</label>
+                        <input type="email" name="email" class="form-input" required placeholder="email@exemplo.com">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Senha *</label>
+                        <input type="text" name="password" class="form-input" required placeholder="senha forte">
+                    </div>
+                </div>
+                <div class="grid-3">
+                    <div class="form-group">
+                        <label class="form-label">Empresa</label>
+                        <input type="text" name="company" class="form-input" placeholder="Nome da empresa">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Telefone</label>
+                        <input type="text" name="phone" class="form-input" placeholder="+55 11 99999-9999">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Plano</label>
+                        <select name="plan" class="form-input">
+                            <option value="starter">Starter</option>
+                            <option value="pro">Pro</option>
+                            <option value="business" selected>Business</option>
+                        </select>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-success">✅ Criar cliente</button>
+            </form>
+        </div>
+
         <div class="card"><div class="table-wrap"><table><thead><tr><th>Cliente</th><th>Empresa</th><th>Plano</th><th>Status</th><th>Msgs</th><th>Conversas</th><th>Cadastro</th><th>Último login</th><th>Ação</th></tr></thead>
         <tbody>{rows}</tbody></table></div></div></div>"""
     return admin_html("Clientes", content)
+
+
+@app.route("/admin/users/create", methods=["POST"])
+@admin_required
+def admin_create_user():
+    """Cria usuário manualmente, já verificado e ativo"""
+    db = get_db()
+    name = request.form.get("name", "").strip()
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "").strip()
+    company = request.form.get("company", "").strip()
+    phone = request.form.get("phone", "").strip()
+    plan = request.form.get("plan", "business")
+
+    if not name or not email or not password:
+        return redirect("/admin/users")
+
+    # Verifica se já existe
+    existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+    if existing:
+        return redirect("/admin/users?error=existe")
+
+    # Pega limite do plano
+    plan_info = PLANS.get(plan, PLANS["starter"])
+    msgs_limit = plan_info.get("msgs", 500)
+
+    # Cria usuário já verificado e ativo
+    trial_ends = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+    db.execute("""INSERT INTO users
+        (email, password_hash, name, company, phone, plan, plan_status, 
+         msgs_limit, msgs_used, trial_ends_at, email_verified, is_active)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (email, hash_password(password), name, company, phone, plan,
+         "active", msgs_limit, 0, trial_ends, 1, 1))
+    db.commit()
+    return redirect("/admin/users")
 
 
 @app.route("/admin/users/<int:uid>/toggle", methods=["POST"])
@@ -3385,6 +3483,26 @@ def admin_toggle_user(uid):
         new_status = 0 if user["is_active"] else 1
         db.execute("UPDATE users SET is_active=? WHERE id=?", (new_status, uid))
         db.commit()
+    return redirect("/admin/users")
+
+
+@app.route("/admin/users/<int:uid>/change-plan", methods=["POST"])
+@admin_required
+def admin_change_plan(uid):
+    """Muda o plano de um usuário e ativa a assinatura"""
+    db = get_db()
+    new_plan = request.form.get("plan", "starter")
+    if new_plan not in PLANS:
+        return redirect("/admin/users")
+
+    plan_info = PLANS[new_plan]
+    msgs_limit = plan_info.get("msgs", 500)
+
+    db.execute(
+        "UPDATE users SET plan=?, plan_status='active', msgs_limit=?, email_verified=1, is_active=1 WHERE id=?",
+        (new_plan, msgs_limit, uid)
+    )
+    db.commit()
     return redirect("/admin/users")
 
 

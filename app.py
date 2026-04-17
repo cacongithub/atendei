@@ -443,6 +443,9 @@ def init_db():
         ("users", "social_auto_enabled", "INTEGER DEFAULT 0"),
         ("users", "social_post_tone", "TEXT DEFAULT 'profissional'"),
         ("users", "social_business_context", "TEXT DEFAULT ''"),
+        ("users", "social_post_days", "TEXT DEFAULT '1,2,3,4,5'"),
+        ("users", "social_post_times", "TEXT DEFAULT '09:00'"),
+        ("users", "social_last_run", "TEXT DEFAULT ''"),
         ("conversations", "satisfaction_rating", "INTEGER DEFAULT 0"),
         ("conversations", "tags", "TEXT DEFAULT ''"),
         ("conversations", "notes", "TEXT DEFAULT ''"),
@@ -3562,11 +3565,28 @@ def social_settings():
     msg = ""
 
     if request.method == "POST":
+        # Dias da semana selecionados (1=Seg, 2=Ter, ..., 7=Dom)
+        days_selected = request.form.getlist("post_days")
+        days_csv = ",".join(sorted(days_selected)) if days_selected else ""
+
+        # Múltiplos horários (pode ser "09:00,14:00,18:00")
+        times_raw = request.form.get("social_post_times", "09:00").strip()
+        # Valida formato HH:MM separados por vírgula
+        import re as re_mod
+        times_list = []
+        for t in times_raw.split(","):
+            t = t.strip()
+            if re_mod.match(r'^\d{1,2}:\d{2}$', t):
+                times_list.append(t)
+        times_csv = ",".join(times_list) if times_list else "09:00"
+
         db.execute(
             """UPDATE users SET
                 telegram_bot_token=?,
                 telegram_chat_id=?,
                 social_post_time=?,
+                social_post_times=?,
+                social_post_days=?,
                 social_auto_enabled=?,
                 social_post_tone=?,
                 social_business_context=?
@@ -3574,7 +3594,9 @@ def social_settings():
             (
                 request.form.get("telegram_bot_token", "").strip(),
                 request.form.get("telegram_chat_id", "").strip(),
-                request.form.get("social_post_time", "09:00").strip(),
+                times_list[0] if times_list else "09:00",
+                times_csv,
+                days_csv,
                 1 if request.form.get("social_auto_enabled") else 0,
                 request.form.get("social_post_tone", "profissional"),
                 request.form.get("social_business_context", "").strip(),
@@ -3598,21 +3620,75 @@ def social_settings():
             else:
                 msg = '<div class="alert alert-error">❌ Não consegui enviar. Verifique Token e Chat ID.</div>'
 
+    # Monta os checkboxes dos dias da semana
+    current_days = (user["social_post_days"] or "1,2,3,4,5").split(",")
+    days_labels = [
+        ("1", "Seg"), ("2", "Ter"), ("3", "Qua"), ("4", "Qui"),
+        ("5", "Sex"), ("6", "Sáb"), ("7", "Dom")
+    ]
+    days_checkboxes = ""
+    for day_num, day_label in days_labels:
+        checked = "checked" if day_num in current_days else ""
+        days_checkboxes += f"""
+        <label style="display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,0.04);padding:8px 14px;border-radius:8px;cursor:pointer;border:1px solid rgba(255,255,255,0.06);font-size:13px">
+            <input type="checkbox" name="post_days" value="{day_num}" {checked} style="margin:0">
+            {day_label}
+        </label>
+        """
+
+    current_times = user["social_post_times"] or "09:00"
+
+    # Calcula próximos agendamentos para mostrar preview
+    next_schedule_html = ""
+    if user["social_auto_enabled"] and current_days[0]:
+        from datetime import datetime as dt_mod, timedelta as td_mod
+        now = dt_mod.now()
+        upcoming = []
+        times_arr = [t.strip() for t in current_times.split(",") if t.strip()]
+        day_names_pt = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+
+        for i in range(14):  # próximos 14 dias
+            check_date = now + td_mod(days=i)
+            weekday = check_date.isoweekday()  # 1=Seg, 7=Dom
+            if str(weekday) in current_days:
+                for t in times_arr:
+                    try:
+                        h, m = t.split(":")
+                        scheduled = check_date.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                        if scheduled > now:
+                            upcoming.append((scheduled, day_names_pt[weekday-1]))
+                    except:
+                        pass
+            if len(upcoming) >= 5:
+                break
+        upcoming = sorted(upcoming)[:5]
+
+        if upcoming:
+            items = ""
+            for dt, day_name in upcoming:
+                items += f'<li style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05);color:var(--text2);font-size:13px">📅 {day_name}, {dt.strftime("%d/%m")} às {dt.strftime("%H:%M")}</li>'
+            next_schedule_html = f"""
+            <div class="card" style="margin-top:16px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.2)">
+                <div class="card-header"><span class="card-title" style="color:var(--accent2)">📆 Próximos 5 agendamentos</span></div>
+                <ul style="list-style:none;padding:0;margin:0">{items}</ul>
+            </div>
+            """
+
     content = f"""<div class="container">
         <div class="page-header fade-in">
             <h1>⚙️ Configurações da Agência</h1>
-            <p>Configure o Telegram Bot e comportamento dos posts</p>
+            <p>Configure Telegram, agenda de publicações e personalidade da IA</p>
         </div>
         {msg}
 
-        <div class="grid-2">
-            <div class="card fade-in fade-in-1">
-                <div class="card-header"><span class="card-title">📱 Telegram Bot</span></div>
-                <p style="color:var(--text3);font-size:13px;margin-bottom:16px">
-                    Posts serão enviados para o Telegram para sua aprovação.
-                    <br><a href="https://telegram.me/BotFather" target="_blank" style="color:var(--accent2)">Como criar um bot no Telegram →</a>
-                </p>
-                <form method="POST">{csrf_field()}
+        <form method="POST">{csrf_field()}
+            <div class="grid-2" style="margin-bottom:24px">
+                <div class="card fade-in fade-in-1">
+                    <div class="card-header"><span class="card-title">📱 Telegram Bot</span></div>
+                    <p style="color:var(--text3);font-size:13px;margin-bottom:16px">
+                        Posts serão enviados para o Telegram para sua aprovação.
+                        <br><a href="https://telegram.me/BotFather" target="_blank" style="color:var(--accent2)">Como criar um bot no Telegram →</a>
+                    </p>
                     <div class="form-group">
                         <label class="form-label">Bot Token</label>
                         <input type="text" name="telegram_bot_token" class="form-input" value="{esc(user['telegram_bot_token'] or '')}" placeholder="123456:ABC-DEF...">
@@ -3622,32 +3698,10 @@ def social_settings():
                         <input type="text" name="telegram_chat_id" class="form-input" value="{esc(user['telegram_chat_id'] or '')}" placeholder="123456789">
                         <small style="color:var(--text3)">Acesse <a href="https://telegram.me/userinfobot" target="_blank" style="color:var(--accent2)">@userinfobot</a> para descobrir seu chat ID</small>
                     </div>
+                </div>
 
-                    <div class="form-group">
-                        <label class="form-label">Horário diário para gerar post</label>
-                        <input type="time" name="social_post_time" class="form-input" value="{esc(user['social_post_time'] or '09:00')}">
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">
-                            <input type="checkbox" name="social_auto_enabled" value="1" {'checked' if user['social_auto_enabled'] else ''}>
-                            Gerar post automaticamente todo dia neste horário
-                        </label>
-                    </div>
-
-                    <button type="submit" class="btn btn-primary">Salvar</button>
-                    <a href="/dashboard/social/settings?test_telegram=1" class="btn" style="background:rgba(255,255,255,0.05);margin-left:8px">Testar Telegram</a>
-                </form>
-            </div>
-
-            <div class="card fade-in fade-in-2">
-                <div class="card-header"><span class="card-title">🤖 Personalidade da IA</span></div>
-                <form method="POST">{csrf_field()}
-                    <input type="hidden" name="telegram_bot_token" value="{esc(user['telegram_bot_token'] or '')}">
-                    <input type="hidden" name="telegram_chat_id" value="{esc(user['telegram_chat_id'] or '')}">
-                    <input type="hidden" name="social_post_time" value="{esc(user['social_post_time'] or '09:00')}">
-                    <input type="hidden" name="social_auto_enabled" value="{'1' if user['social_auto_enabled'] else ''}">
-
+                <div class="card fade-in fade-in-2">
+                    <div class="card-header"><span class="card-title">🤖 Personalidade da IA</span></div>
                     <div class="form-group">
                         <label class="form-label">Tom dos posts</label>
                         <select name="social_post_tone" class="form-input">
@@ -3658,19 +3712,133 @@ def social_settings():
                             <option value="elegante" {'selected' if user['social_post_tone']=='elegante' else ''}>Elegante / Sofisticado</option>
                         </select>
                     </div>
-
                     <div class="form-group">
                         <label class="form-label">Contexto do negócio para a IA</label>
-                        <textarea name="social_business_context" class="form-input" rows="6" placeholder="Ex: Somos uma pizzaria no Centro de Fortaleza, especializada em pizzas artesanais de massa fina. Atendemos das 18h às 23h, temos delivery próprio. Nosso público é casal 25-40 anos.">{esc(user['social_business_context'] or '')}</textarea>
+                        <textarea name="social_business_context" class="form-input" rows="6" placeholder="Ex: Somos uma pizzaria no Centro de Fortaleza...">{esc(user['social_business_context'] or '')}</textarea>
                         <small style="color:var(--text3)">A IA usará isso para criar legendas alinhadas com seu negócio</small>
                     </div>
-
-                    <button type="submit" class="btn btn-primary">Salvar</button>
-                </form>
+                </div>
             </div>
-        </div>
+
+            <div class="card fade-in fade-in-3" style="margin-bottom:24px">
+                <div class="card-header"><span class="card-title">📆 Agenda de publicações</span></div>
+                <p style="color:var(--text3);font-size:13px;margin-bottom:20px">
+                    Configure quais dias e horários a IA deve gerar posts automaticamente para sua aprovação.
+                </p>
+
+                <div class="form-group">
+                    <label class="form-label" style="margin-bottom:12px">Dias da semana</label>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        {days_checkboxes}
+                    </div>
+                    <small style="color:var(--text3);display:block;margin-top:8px">Selecione os dias em que quer gerar posts.</small>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Horários (separados por vírgula, formato HH:MM)</label>
+                    <input type="text" name="social_post_times" class="form-input"
+                           value="{esc(current_times)}"
+                           placeholder="09:00, 14:00, 18:00">
+                    <small style="color:var(--text3);display:block;margin-top:4px">
+                        Exemplo: <code style="background:rgba(255,255,255,0.05);padding:2px 6px;border-radius:4px">09:00, 14:00, 18:00</code>
+                        (gera 3 posts por dia). Deixe só um horário para 1 post por dia.
+                    </small>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" style="display:inline-flex;align-items:center;gap:10px;cursor:pointer;padding:12px;background:rgba(0,200,150,0.05);border:1px solid rgba(0,200,150,0.2);border-radius:8px;width:100%">
+                        <input type="checkbox" name="social_auto_enabled" value="1" {'checked' if user['social_auto_enabled'] else ''} style="width:18px;height:18px">
+                        <div>
+                            <strong>Ativar geração automática de posts</strong>
+                            <p style="margin:4px 0 0;font-size:12px;color:var(--text3)">Quando ativado, a IA gera posts nos dias e horários selecionados acima.</p>
+                        </div>
+                    </label>
+                </div>
+
+                {next_schedule_html}
+            </div>
+
+            <div style="display:flex;gap:12px;justify-content:flex-end">
+                <a href="/dashboard/social/settings?test_telegram=1" class="btn" style="background:rgba(255,255,255,0.05)">🧪 Testar Telegram</a>
+                <button type="submit" class="btn btn-primary">💾 Salvar configurações</button>
+            </div>
+        </form>
     </div>"""
     return base_html("Configurações Agência", content, dict(user))
+
+
+def run_social_scheduler():
+    """Executa o scheduler de posts automáticos (chamado a cada minuto)"""
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+
+        now = datetime.now()
+        current_time = now.strftime("%H:%M")
+        current_weekday = str(now.isoweekday())  # 1=Seg, 7=Dom
+        current_minute = now.strftime("%Y-%m-%d %H:%M")
+
+        # Busca usuários com auto ativado
+        users = db_conn.execute(
+            """SELECT * FROM users
+               WHERE social_auto_enabled=1
+               AND is_active=1
+               AND social_post_days!=''
+               AND social_post_times!=''"""
+        ).fetchall()
+
+        for user in users:
+            # Verifica se é dia certo
+            post_days = (user["social_post_days"] or "").split(",")
+            if current_weekday not in post_days:
+                continue
+
+            # Verifica se é horário certo
+            post_times = (user["social_post_times"] or "").split(",")
+            post_times_clean = [t.strip() for t in post_times]
+            if current_time not in post_times_clean:
+                continue
+
+            # Evita duplicação: checa se já gerou neste minuto
+            if user["social_last_run"] == current_minute:
+                continue
+
+            print(f"[SCHEDULER] Gerando post para user {user['id']} ({user['email']}) às {current_time}")
+
+            # Marca última execução
+            db_conn.execute(
+                "UPDATE users SET social_last_run=? WHERE id=?",
+                (current_minute, user["id"])
+            )
+            db_conn.commit()
+
+            # Gera o post (chama em thread separada para não bloquear)
+            import threading
+            threading.Thread(target=create_social_post, args=(user["id"],), daemon=True).start()
+
+        db_conn.close()
+    except Exception as e:
+        print(f"[SCHEDULER] Erro: {e}")
+
+
+def start_social_scheduler():
+    """Inicia o scheduler em background (executa a cada minuto)"""
+    import threading
+    def loop():
+        import time as t_mod
+        while True:
+            try:
+                run_social_scheduler()
+            except Exception as e:
+                print(f"[SCHEDULER LOOP] Erro: {e}")
+            # Espera até o próximo minuto
+            now = datetime.now()
+            sleep_seconds = 60 - now.second
+            t_mod.sleep(sleep_seconds)
+
+    scheduler_thread = threading.Thread(target=loop, daemon=True)
+    scheduler_thread.start()
+    print("[SCHEDULER] Scheduler de posts iniciado (roda a cada minuto)")
 
 
 def fetch_weather(message):
@@ -5003,6 +5171,12 @@ check_production_requirements()
 # Inicializa o banco sempre (necessário para gunicorn no Railway)
 init_db()
 migrate_encrypt_existing_secrets()
+
+# Inicia scheduler de posts da agência (em background)
+try:
+    start_social_scheduler()
+except Exception as e:
+    print(f"[SCHEDULER] Não foi possível iniciar: {e}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))

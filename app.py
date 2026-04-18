@@ -592,6 +592,26 @@ def init_db():
         created_at TEXT DEFAULT (datetime('now')),
         FOREIGN KEY (owner_id) REFERENCES users(id)
     );
+    CREATE TABLE IF NOT EXISTS webhook_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        source TEXT NOT NULL,
+        error_type TEXT DEFAULT '',
+        error_message TEXT DEFAULT '',
+        payload_preview TEXT DEFAULT '',
+        resolved INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS admin_audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action TEXT NOT NULL,
+        target_type TEXT DEFAULT '',
+        target_id TEXT DEFAULT '',
+        ip_address TEXT DEFAULT '',
+        user_agent TEXT DEFAULT '',
+        details TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
     CREATE TABLE IF NOT EXISTS social_media_library (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -695,9 +715,16 @@ def _assert_crypto_available():
 
 
 def _encrypt_value(plaintext):
-    """Criptografa valor usando Fernet (AES-128-CBC + HMAC-SHA256). Falha em produção se cryptography não instalada."""
+    """Criptografa valor usando Fernet (AES-128-CBC + HMAC-SHA256). Falha em produção se cryptography não instalada.
+    Idempotente: se já estiver criptografado (fer:v1:), retorna o mesmo valor."""
     if not plaintext:
         return ""
+    # IDEMPOTÊNCIA: não re-criptografar valor já criptografado
+    if isinstance(plaintext, str) and plaintext.startswith("fer:v1:"):
+        return plaintext
+    # Também evita re-encrypt de formato antigo (será migrado automaticamente)
+    if isinstance(plaintext, str) and plaintext.startswith("enc:v1:"):
+        return plaintext
     fernet = _get_fernet()
     if not fernet:
         _assert_crypto_available()
@@ -734,6 +761,238 @@ def _decrypt_value(encrypted):
     return encrypted
 
 
+# Campos de usuário que contêm tokens/segredos e devem ser criptografados
+USER_ENCRYPTED_FIELDS = {
+    "whatsapp_token",
+    "mp_access_token",
+    "instagram_token",
+    "messenger_token",
+    "telegram_bot_token",
+}
+
+
+def generate_totp_secret():
+    """Gera novo segredo TOTP (base32)"""
+    try:
+        import pyotp
+        return pyotp.random_base32()
+    except ImportError:
+        print("[2FA] pyotp não instalado")
+        return None
+
+
+def generate_totp_uri(secret, issuer="atendente.online", account="admin"):
+    """Gera URI otpauth para QR Code do Google Authenticator/Authy"""
+    try:
+        import pyotp
+        totp = pyotp.TOTP(secret)
+        return totp.provisioning_uri(name=account, issuer_name=issuer)
+    except ImportError:
+        return None
+
+
+def generate_totp_qr_base64(uri):
+    """Gera QR Code em base64 (data URI) para embed em HTML"""
+    try:
+        import qrcode
+        import io as io_mod
+        import base64 as b64_mod
+        qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=8, border=2)
+        qr.add_data(uri)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io_mod.BytesIO()
+        img.save(buf, format='PNG')
+        return "data:image/png;base64," + b64_mod.b64encode(buf.getvalue()).decode('ascii')
+    except Exception as e:
+        print(f"[2FA] Erro gerando QR: {e}")
+        return None
+
+
+def verify_totp_code(secret, code):
+    """Valida código TOTP (6 dígitos). Aceita ±30s de clock skew."""
+    if not secret or not code:
+        return False
+    try:
+        import pyotp
+        code = str(code).replace(" ", "").strip()
+        if not code.isdigit() or len(code) != 6:
+            return False
+        totp = pyotp.TOTP(secret)
+        return totp.verify(code, valid_window=1)
+    except Exception as e:
+        print(f"[2FA] Erro validando TOTP: {e}")
+        return False
+
+
+def generate_backup_codes(n=8):
+    """Gera códigos de backup para recuperação se perder celular."""
+    import secrets as secrets_mod
+    codes = []
+    for _ in range(n):
+        # Formato: XXXX-XXXX (8 chars alfanuméricos)
+        code = secrets_mod.token_hex(4).upper()
+        codes.append(f"{code[:4]}-{code[4:]}")
+    return codes
+
+
+def is_admin_2fa_enabled():
+    """Verifica se admin configurou 2FA.
+    MECANISMO DE EMERGÊNCIA: se env var ADMIN_2FA_DISABLE_EMERGENCY=1, desabilita 2FA temporariamente.
+    Use APENAS se perder celular e backup codes. Depois, configure de novo."""
+    if os.getenv("ADMIN_2FA_DISABLE_EMERGENCY", "").strip() == "1":
+        print("[2FA] ⚠️ EMERGÊNCIA: 2FA bypassed via ADMIN_2FA_DISABLE_EMERGENCY")
+        return False
+    return bool(get_setting("ADMIN_TOTP_SECRET", ""))
+
+
+def log_admin_action(action, target_type="", target_id="", details=""):
+    """Registra ação admin para auditoria"""
+    try:
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()[:45]
+        ua = (request.headers.get('User-Agent') or '')[:200]
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.execute(
+            """INSERT INTO admin_audit_log (action, target_type, target_id, ip_address, user_agent, details)
+               VALUES (?,?,?,?,?,?)""",
+            (action[:100], str(target_type)[:50], str(target_id)[:50], ip, ua, str(details)[:500])
+        )
+        db_conn.commit()
+        db_conn.close()
+    except Exception as e:
+        print(f"[AUDIT] Falha ao registrar: {e}")
+
+
+def validate_mp_signature(request_obj, webhook_secret=None):
+    """Valida a assinatura do webhook Mercado Pago.
+    Docs: https://www.mercadopago.com.br/developers/en/docs/your-integrations/notifications/webhooks
+    
+    COMPORTAMENTO:
+    - Produção SEM MP_WEBHOOK_SECRET → REJEITA (retorna False)
+    - Dev (FLASK_ENV=development) SEM secret → aceita com warning
+    - Secret configurado → valida HMAC-SHA256, retorna True/False
+    """
+    import hmac as hmac_mod, hashlib as hashlib_mod
+    if not webhook_secret:
+        webhook_secret = get_setting("MP_WEBHOOK_SECRET", os.getenv("MP_WEBHOOK_SECRET", ""))
+
+    is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+
+    # Sem secret = FALHA em produção, aceita em dev
+    if not webhook_secret:
+        if is_dev:
+            print("[MP SIG] ⚠️ DEV: MP_WEBHOOK_SECRET não configurado — aceito sem validação")
+            return True
+        # Produção: REJEITA
+        print("[MP SIG] ❌ PRODUÇÃO: MP_WEBHOOK_SECRET não configurado. Webhook rejeitado.")
+        print("[MP SIG] Configure em /admin/api-settings → MP Webhook Secret")
+        return False
+
+    signature_header = request_obj.headers.get("x-signature", "")
+    request_id = request_obj.headers.get("x-request-id", "")
+
+    if not signature_header:
+        print("[MP SIG] Rejeitado: x-signature ausente")
+        return False
+
+    parts = dict(p.split("=", 1) for p in signature_header.split(",") if "=" in p)
+    ts = parts.get("ts", "")
+    received_hash = parts.get("v1", "")
+
+    if not ts or not received_hash:
+        print("[MP SIG] Rejeitado: header malformado")
+        return False
+
+    try:
+        data = request_obj.json or {}
+        data_id = str(data.get("data", {}).get("id", ""))
+    except:
+        data_id = ""
+
+    manifest = f"id:{data_id};request-id:{request_id};ts:{ts};"
+    expected_hash = hmac_mod.new(
+        webhook_secret.encode("utf-8"),
+        manifest.encode("utf-8"),
+        hashlib_mod.sha256
+    ).hexdigest()
+
+    if not hmac_mod.compare_digest(expected_hash, received_hash):
+        print(f"[MP SIG] Rejeitado: hash inválido (data_id={data_id})")
+        return False
+
+    return True
+
+
+def mask_secret(value, show_last=4):
+    """Mascara um segredo para exibição segura na UI.
+    Exemplo: 'ABC123XYZ789' -> '••••••••••9789' (mostra só últimos 4 chars)"""
+    if not value:
+        return ""
+    # Se veio criptografado, descriptografa primeiro
+    if isinstance(value, str) and value.startswith("fer:v1:"):
+        try:
+            value = _decrypt_value(value)
+        except:
+            return "••••••••••"
+    if not value or len(value) < 6:
+        return "••••••••••"
+    if len(value) <= show_last + 2:
+        return "•" * (len(value) - 2) + value[-2:]
+    return "•" * 10 + value[-show_last:]
+
+
+def decrypt_user_row(user):
+    """Retorna uma cópia do user com tokens descriptografados. Aceita dict ou Row."""
+    if user is None:
+        return None
+    # Converte Row para dict para permitir modificação
+    try:
+        user_dict = dict(user)
+    except (TypeError, ValueError):
+        return user
+    for field in USER_ENCRYPTED_FIELDS:
+        if field in user_dict and user_dict[field]:
+            user_dict[field] = _decrypt_value(user_dict[field])
+    return user_dict
+
+
+def migrate_encrypt_user_tokens():
+    """Migra tokens por usuário em texto puro para formato Fernet criptografado.
+    Roda uma vez no startup — identifica linhas não-criptografadas e criptografa."""
+    try:
+        db = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+        rows = db.execute(f"SELECT id, {', '.join(USER_ENCRYPTED_FIELDS)} FROM users").fetchall()
+        fernet = _get_fernet()
+        if not fernet:
+            db.close()
+            return
+        migrated = 0
+        for row in rows:
+            updates = {}
+            for field in USER_ENCRYPTED_FIELDS:
+                val = row[field]
+                if not val:
+                    continue
+                if isinstance(val, str) and val.startswith("fer:v1:"):
+                    continue  # Já criptografado
+                # Criptografa
+                encrypted = _encrypt_value(val)
+                if encrypted != val:
+                    updates[field] = encrypted
+            if updates:
+                set_clause = ", ".join([f"{k}=?" for k in updates.keys()])
+                params = list(updates.values()) + [row["id"]]
+                db.execute(f"UPDATE users SET {set_clause} WHERE id=?", params)
+                migrated += 1
+        if migrated > 0:
+            db.commit()
+            print(f"[CRYPTO] Migração: {migrated} usuário(s) com tokens criptografados")
+        db.close()
+    except Exception as e:
+        print(f"[CRYPTO] Erro na migração de tokens: {e}")
+
+
 def _decrypt_legacy(encrypted):
     """Descriptografa formato antigo (XOR + HMAC) para migração"""
     try:
@@ -763,8 +1022,9 @@ def _decrypt_legacy(encrypted):
 # Chaves/tokens que precisam ser criptografados no banco
 SENSITIVE_SETTINGS = {
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY",
-    "MERCADOPAGO_ACCESS_TOKEN", "RESEND_API_KEY",
-    "WHATSAPP_APP_SECRET", "SMTP_PASSWORD"
+    "MERCADOPAGO_ACCESS_TOKEN", "MP_WEBHOOK_SECRET", "RESEND_API_KEY",
+    "WHATSAPP_APP_SECRET", "SMTP_PASSWORD",
+    "ADMIN_TOTP_SECRET", "ADMIN_BACKUP_CODES"
 }
 
 
@@ -895,14 +1155,87 @@ def csrf_protect():
         if not token or token != session.get('_csrf_token'):
             abort(403)
 
+def log_webhook_error(source, user_id, error_type, error_message, payload=None):
+    """Registra erro de webhook para revisão posterior no admin.
+    Não falha se o DB estiver down — só imprime no log."""
+    try:
+        preview = ""
+        if payload:
+            try:
+                import json as json_mod
+                preview = json_mod.dumps(payload, ensure_ascii=False)[:500]
+            except:
+                preview = str(payload)[:500]
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.execute(
+            """INSERT INTO webhook_errors
+               (user_id, source, error_type, error_message, payload_preview)
+               VALUES (?,?,?,?,?)""",
+            (user_id, source, error_type, str(error_message)[:500], preview)
+        )
+        db_conn.commit()
+        db_conn.close()
+    except Exception as e:
+        print(f"[WEBHOOK ERROR LOG] Falhou: {e}")
+
+
 def hash_password(pw):
     salt = secrets.token_hex(16)
     h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100000)
     return f"{salt}:{h.hex()}"
 
+
+def validate_and_normalize_image(image_bytes, max_width=2048, max_height=2048):
+    """Valida que os bytes são uma imagem real usando Pillow + normaliza tamanho.
+    Retorna (bytes_normalizados, content_type) ou (None, None) se inválido.
+    Protege contra upload de arquivos maliciosos disfarçados de imagem."""
+    try:
+        from PIL import Image
+        import io as io_mod
+
+        # Abre e valida que é imagem real (não só pelo mime type)
+        img = Image.open(io_mod.BytesIO(image_bytes))
+        img.verify()  # Primeira passada — detecta corrupção
+
+        # Reabre (verify consome o stream)
+        img = Image.open(io_mod.BytesIO(image_bytes))
+
+        # Remove metadados EXIF potencialmente sensíveis
+        img_format = img.format
+        if img_format not in ("JPEG", "PNG", "WEBP"):
+            return None, None
+
+        # Redimensiona se muito grande
+        if img.width > max_width or img.height > max_height:
+            img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+
+        # Converte para RGB se for RGBA (para JPEG)
+        if img_format == "JPEG" and img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+
+        # Re-salva limpo (sem EXIF, sem exploits)
+        output = io_mod.BytesIO()
+        save_format = "JPEG" if img_format == "JPEG" else "PNG"
+        save_kwargs = {"quality": 85, "optimize": True} if save_format == "JPEG" else {"optimize": True}
+        img.save(output, format=save_format, **save_kwargs)
+        output.seek(0)
+
+        content_type = f"image/{save_format.lower()}"
+        return output.read(), content_type
+    except Exception as e:
+        print(f"[IMAGE VALIDATION] Rejeitado: {e}")
+        return None, None
+
+
 def check_password(pw, stored):
-    salt, h = stored.split(":")
-    return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100000).hex() == h
+    try:
+        salt, h = stored.split(":")
+        computed = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100000).hex()
+        # Uso hmac.compare_digest para comparação timing-safe (proteção contra ataques de timing)
+        import hmac as hmac_mod
+        return hmac_mod.compare_digest(computed, h)
+    except (ValueError, AttributeError):
+        return False
 
 def login_required(f):
     @wraps(f)
@@ -917,7 +1250,8 @@ def login_required(f):
         if not dict(user).get("is_active", 1):
             session.clear()
             return redirect("/login?error=Conta+desativada.+Entre+em+contato+com+o+suporte.")
-        g.user = user
+        # Descriptografa tokens sensíveis transparentemente
+        g.user = decrypt_user_row(user)
         return f(*args, **kwargs)
     return decorated
 
@@ -1237,19 +1571,37 @@ a{color:var(--accent2);text-decoration:none}
 a:hover{color:#5eead4}
 
 .nav-main{background:rgba(10,14,20,0.9);border-bottom:1px solid rgba(255,255,255,0.06);position:sticky;top:0;z-index:100;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
-.nav-inner{max-width:1200px;margin:0 auto;padding:0 24px;height:76px;display:flex;align-items:center;justify-content:space-between}
+.nav-inner{max-width:1400px;margin:0 auto;padding:0 20px;height:68px;display:flex;align-items:center;justify-content:space-between;gap:12px}
 .logo{font-size:22px;font-weight:700;color:var(--text);letter-spacing:-0.5px}
 .logo span{color:var(--accent)}
-.nav-logo-img{height:56px;width:auto;display:block;transition:transform 0.2s}
+.nav-logo-img{height:44px;width:auto;display:block;transition:transform 0.2s;flex-shrink:0}
 .nav-logo-img:hover{transform:scale(1.03)}
-.nav-links{display:flex;gap:4px}
-.nav-link{padding:8px 16px;border-radius:var(--radius-sm);color:var(--text2);font-size:14px;font-weight:500;transition:all 0.2s}
+.nav-links{display:flex;gap:2px;flex:1;justify-content:center;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-ms-overflow-style:none}
+.nav-links::-webkit-scrollbar{display:none}
+.nav-link{padding:7px 12px;border-radius:var(--radius-sm);color:var(--text2);font-size:13px;font-weight:500;transition:all 0.2s;white-space:nowrap;flex-shrink:0}
 .nav-link:hover{color:var(--text);background:var(--bg3)}
 .nav-link-accent{color:var(--accent2)!important}
-.nav-user{display:flex;align-items:center;gap:12px;font-size:13px}
-.user-plan{background:var(--accent-glow);color:var(--accent2);padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px}
-.user-name{color:var(--text2)}
-.btn-logout{color:var(--text3);font-size:12px;padding:4px 8px}
+.nav-user{display:flex;align-items:center;gap:8px;font-size:12px;flex-shrink:0}
+.user-plan{background:var(--accent-glow);color:var(--accent2);padding:3px 8px;border-radius:20px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px}
+.user-name{color:var(--text2);font-size:12px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btn-logout{color:var(--text3);font-size:11px;padding:3px 6px}
+
+/* Mobile toggle (menu hamburguer) */
+.nav-toggle{display:none;background:none;border:none;color:var(--text);font-size:24px;cursor:pointer;padding:4px 8px}
+
+@media(max-width:1200px){
+    .nav-link{padding:7px 10px;font-size:12px}
+    .user-name{display:none}
+}
+@media(max-width:900px){
+    .nav-inner{padding:0 16px;height:60px}
+    .nav-logo-img{height:36px}
+    .nav-links{display:none;position:absolute;top:60px;left:0;right:0;background:var(--bg);border-bottom:1px solid rgba(255,255,255,0.08);padding:12px;flex-direction:column;box-shadow:0 8px 24px rgba(0,0,0,0.4);overflow-x:hidden}
+    .nav-links.open{display:flex}
+    .nav-link{padding:12px 16px;font-size:14px;width:100%;text-align:left}
+    .nav-toggle{display:block}
+    .user-plan{display:none}
+}
 
 .container{max-width:1200px;margin:0 auto;padding:32px 24px}
 .page-header{margin-bottom:32px}
@@ -1390,7 +1742,6 @@ tr:hover td{background:rgba(255,255,255,0.02)}
     .features-grid{grid-template-columns:1fr}
     .hero h1{font-size:32px}
     .chat-sidebar{width:100%}
-    .nav-links{display:none}
 }
 """
 
@@ -1402,10 +1753,11 @@ def base_html(title, content, user=None):
         plan_name = PLANS.get(user['plan'],{}).get('name','')
         nav = f"""<nav class="nav-main"><div class="nav-inner">
             <a href="/dashboard"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" class="nav-logo-img"></a>
+            <button class="nav-toggle" onclick="document.querySelector('.nav-links').classList.toggle('open')" aria-label="Menu">☰</button>
             <div class="nav-links">
                 <a href="/dashboard" class="nav-link">Dashboard</a>
                 <a href="/dashboard/conversations" class="nav-link">Conversas</a>
-                <a href="/dashboard/training" class="nav-link">Treinamento</a>
+                <a href="/dashboard/training" class="nav-link">Treino</a>
                 <a href="/dashboard/gallery" class="nav-link">Galeria</a>
                 <a href="/dashboard/commerce" class="nav-link">🛒 Vendas</a>
                 <a href="/dashboard/campaigns" class="nav-link">📢 Campanhas</a>
@@ -1430,12 +1782,16 @@ def base_html(title, content, user=None):
 def admin_html(title, content):
     nav = f"""<nav class="nav-main admin-nav"><div class="nav-inner">
         <a href="/admin" style="display:flex;align-items:center;gap:10px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" class="nav-logo-img"><span class="admin-badge">ADMIN</span></a>
+        <button class="nav-toggle" onclick="document.querySelector('.admin-nav .nav-links').classList.toggle('open')" aria-label="Menu">☰</button>
         <div class="nav-links">
             <a href="/admin" class="nav-link">Dashboard</a>
             <a href="/admin/users" class="nav-link">Clientes</a>
             <a href="/admin/payments" class="nav-link">Pagamentos</a>
-            <a href="/admin/usage" class="nav-link">Uso de API</a>
+            <a href="/admin/usage" class="nav-link">Uso API</a>
             <a href="/admin/logs" class="nav-link">Logs</a>
+            <a href="/admin/audit-log" class="nav-link">📋 Auditoria</a>
+            <a href="/admin/webhook-errors" class="nav-link">🚨 Erros</a>
+            <a href="/admin/2fa" class="nav-link">🔐 2FA</a>
             <a href="/admin/api-settings" class="nav-link nav-link-accent">APIs</a>
         </div>
         <div class="nav-user">
@@ -1847,6 +2203,7 @@ def landing():
     <footer style="text-align:center;padding:40px 24px;border-top:1px solid rgba(255,255,255,0.06);color:var(--text3);font-size:13px">
         <p>© 2026 atendente.online — Todos os direitos reservados</p>
         <p style="margin-top:8px"><a href="/privacy">Política de Privacidade</a> · <a href="/terms">Termos de Serviço</a></p>
+        <p style="margin-top:12px;color:var(--text3);font-size:12px">Desenvolvido por <strong style="color:var(--text2)">Clériston Almeida Capistrano</strong> · <a href="mailto:contato@atendente.online" style="color:var(--accent2)">contato@atendente.online</a></p>
     </footer>"""
     return base_html("Atendente IA para WhatsApp", content)
 
@@ -2450,7 +2807,8 @@ def upload_whatsapp_profile_photo(phone_id, token, image_bytes, mime_type="image
 @app.route("/dashboard/settings/upload-photo", methods=["POST"])
 @login_required
 def upload_profile_photo():
-    """Endpoint para upload de foto de perfil do WhatsApp"""
+    """Endpoint para upload de foto de perfil do WhatsApp.
+    Valida imagem com Pillow e remove metadados EXIF."""
     user = g.user
     if not user["whatsapp_phone_id"] or not user["whatsapp_token"]:
         return redirect("/dashboard/settings?photo_error=" + "Configure%20Phone%20ID%20e%20Token%20primeiro")
@@ -2462,11 +2820,6 @@ def upload_profile_photo():
     if file.filename == "":
         return redirect("/dashboard/settings?photo_error=" + "Arquivo%20vazio")
 
-    # Valida tipo
-    allowed_types = {"image/jpeg", "image/png", "image/jpg"}
-    if file.content_type not in allowed_types:
-        return redirect("/dashboard/settings?photo_error=" + "Apenas%20JPG%20ou%20PNG")
-
     # Lê bytes
     image_bytes = file.read()
     if len(image_bytes) > 5 * 1024 * 1024:
@@ -2475,12 +2828,17 @@ def upload_profile_photo():
     if len(image_bytes) < 100:
         return redirect("/dashboard/settings?photo_error=" + "Arquivo%20muito%20pequeno")
 
-    # Upload para o Meta
+    # VALIDAÇÃO REAL com Pillow — rejeita arquivos maliciosos disfarçados
+    validated_bytes, real_content_type = validate_and_normalize_image(image_bytes)
+    if validated_bytes is None:
+        return redirect("/dashboard/settings?photo_error=" + "Arquivo%20inv%C3%A1lido%20ou%20corrompido.%20Envie%20JPG%20ou%20PNG%20real.")
+
+    # Upload para o Meta com bytes normalizados
     success, message = upload_whatsapp_profile_photo(
         user["whatsapp_phone_id"],
         user["whatsapp_token"],
-        image_bytes,
-        file.content_type
+        validated_bytes,
+        real_content_type
     )
 
     if success:
@@ -2495,6 +2853,19 @@ def upload_profile_photo():
 def settings():
     user = g.user; db = get_db(); msg = ""
     if request.method == "POST":
+        # "Manter atual se vazio": se o usuário enviou campo vazio mas já tinha token, mantém o que estava
+        wa_token_input = request.form.get("whatsapp_token","").strip()
+        ig_token_input = request.form.get("instagram_token","").strip()
+        msg_token_input = request.form.get("messenger_token","").strip()
+
+        # Se campo veio vazio, lê o valor ATUAL do banco (criptografado) e mantém
+        raw_current = db.execute("SELECT whatsapp_token, instagram_token, messenger_token FROM users WHERE id=?", (user["id"],)).fetchone()
+
+        # Se usuário enviou novo token, criptografa; se vazio, mantém atual (já criptografado)
+        wa_token_final = _encrypt_value(wa_token_input) if wa_token_input else (raw_current["whatsapp_token"] or "")
+        ig_token_final = _encrypt_value(ig_token_input) if ig_token_input else (raw_current["instagram_token"] or "")
+        msg_token_final = _encrypt_value(msg_token_input) if msg_token_input else (raw_current["messenger_token"] or "")
+
         db.execute("""UPDATE users SET 
             whatsapp_phone_id=?, whatsapp_token=?,
             instagram_page_id=?, instagram_token=?,
@@ -2503,11 +2874,11 @@ def settings():
             name=?, company=?, phone=? 
             WHERE id=?""",
             (request.form.get("whatsapp_phone_id","").strip(),
-             request.form.get("whatsapp_token","").strip(),
+             wa_token_final,
              request.form.get("instagram_page_id","").strip(),
-             request.form.get("instagram_token","").strip(),
+             ig_token_final,
              request.form.get("messenger_page_id","").strip(),
-             request.form.get("messenger_token","").strip(),
+             msg_token_final,
              request.form.get("business_hours","08:00-18:00").strip(),
              request.form.get("auto_reply_off_hours","").strip(),
              request.form.get("name","").strip(),
@@ -2536,9 +2907,17 @@ def settings():
     u_hours = esc(user['business_hours'])
     u_reply = esc(user['auto_reply_off_hours'])
     u_wa_id = esc(user['whatsapp_phone_id'] or '')
-    u_wa_token = esc(user['whatsapp_token'] or '')
+    u_wa_token_mask = mask_secret(user['whatsapp_token'] or '')
+    u_wa_token_configured = bool(user['whatsapp_token'])
+    u_ig_token_mask = mask_secret(user['instagram_token'] or '')
+    u_ig_token_configured = bool(user['instagram_token'])
+    u_msg_token_mask = mask_secret(user['messenger_token'] or '')
+    u_msg_token_configured = bool(user['messenger_token'])
     e_webhook = esc(webhook_url)
     e_verify = esc(wa_verify)
+    # Placeholder específico: se já configurado, mostra máscara; senão, mostra instrução
+    wa_placeholder = u_wa_token_mask if u_wa_token_configured else "Cole aqui o Access Token"
+    wa_help = '<small style="color:var(--green2);font-size:11px">✓ Token configurado. Deixe em branco para manter o atual ou cole um novo para substituir.</small>' if u_wa_token_configured else ''
     content = f"""<div class="container"><div class="page-header fade-in"><h1>Configurações ⚙️</h1></div>{msg}{photo_msg}
         <div class="grid-2"><div class="card fade-in fade-in-1"><div class="card-header"><span class="card-title">Perfil e WhatsApp</span></div>
             <form method="POST">{csrf_field()}
@@ -2548,7 +2927,7 @@ def settings():
             <div class="form-group"><label class="form-label">Horário de atendimento</label><input type="text" name="business_hours" class="form-input" value="{u_hours}"></div>
             <div class="form-group"><label class="form-label">Resposta fora do horário</label><textarea name="auto_reply_off_hours" class="form-input" rows="3">{u_reply}</textarea></div>
             <div class="form-group"><label class="form-label">WhatsApp Phone ID</label><input type="text" id="wp_phone_id" name="whatsapp_phone_id" class="form-input" value="{u_wa_id}" placeholder="Cole aqui o Phone Number ID" autocomplete="off" style="background:#2a2a3a;border:2px solid #00c896;color:#fff;cursor:text"></div>
-            <div class="form-group"><label class="form-label">WhatsApp Token</label><input type="text" id="wp_token" name="whatsapp_token" class="form-input" value="{u_wa_token}" placeholder="Cole aqui o Access Token" autocomplete="off" style="background:#2a2a3a;border:2px solid #00c896;color:#fff;cursor:text"></div>
+            <div class="form-group"><label class="form-label">WhatsApp Token 🔒</label><input type="password" id="wp_token" name="whatsapp_token" class="form-input" value="" placeholder="{esc(wa_placeholder)}" autocomplete="off" style="background:#2a2a3a;border:2px solid #00c896;color:#fff;cursor:text">{wa_help}</div>
             <button type="submit" class="btn btn-primary">Salvar</button></form>
 
             <div style="margin-top:24px;padding-top:24px;border-top:1px solid rgba(255,255,255,0.06)">
@@ -2598,16 +2977,15 @@ def settings():
                 <input type="hidden" name="business_hours" value="{u_hours}">
                 <input type="hidden" name="auto_reply_off_hours" value="{u_reply}">
                 <input type="hidden" name="whatsapp_phone_id" value="{u_wa_id}">
-                <input type="hidden" name="whatsapp_token" value="{u_wa_token}">
                 <input type="hidden" name="messenger_page_id" value="{esc(user['messenger_page_id'] or '')}">
-                <input type="hidden" name="messenger_token" value="{esc(user['messenger_token'] or '')}">
                 <div class="form-group">
                     <label class="form-label">Instagram Page ID</label>
                     <input type="text" name="instagram_page_id" class="form-input" value="{esc(user['instagram_page_id'] or '')}" placeholder="ID da página conectada ao Instagram" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Instagram Access Token</label>
-                    <input type="text" name="instagram_token" class="form-input" value="{esc(user['instagram_token'] or '')}" placeholder="Token da Page com permissões Instagram" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                    <label class="form-label">Instagram Access Token 🔒</label>
+                    <input type="password" name="instagram_token" class="form-input" value="" placeholder="{esc(mask_secret(user['instagram_token'] or '')) if user['instagram_token'] else 'Token da Page com permissões Instagram'}" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                    {'<small style="color:var(--green2);font-size:11px">✓ Token configurado. Deixe em branco para manter.</small>' if user['instagram_token'] else ''}
                 </div>
                 <button type="submit" class="btn btn-primary">Salvar Instagram</button>
             </form>
@@ -2623,16 +3001,15 @@ def settings():
                 <input type="hidden" name="business_hours" value="{u_hours}">
                 <input type="hidden" name="auto_reply_off_hours" value="{u_reply}">
                 <input type="hidden" name="whatsapp_phone_id" value="{u_wa_id}">
-                <input type="hidden" name="whatsapp_token" value="{u_wa_token}">
                 <input type="hidden" name="instagram_page_id" value="{esc(user['instagram_page_id'] or '')}">
-                <input type="hidden" name="instagram_token" value="{esc(user['instagram_token'] or '')}">
                 <div class="form-group">
                     <label class="form-label">Page ID do Facebook</label>
                     <input type="text" name="messenger_page_id" class="form-input" value="{esc(user['messenger_page_id'] or '')}" placeholder="ID da página do Facebook" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Page Access Token</label>
-                    <input type="text" name="messenger_token" class="form-input" value="{esc(user['messenger_token'] or '')}" placeholder="Token da Page com permissão pages_messaging" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                    <label class="form-label">Page Access Token 🔒</label>
+                    <input type="password" name="messenger_token" class="form-input" value="" placeholder="{esc(mask_secret(user['messenger_token'] or '')) if user['messenger_token'] else 'Token da Page com permissão pages_messaging'}" autocomplete="off" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.08)">
+                    {'<small style="color:var(--green2);font-size:11px">✓ Token configurado. Deixe em branco para manter.</small>' if user['messenger_token'] else ''}
                 </div>
                 <button type="submit" class="btn btn-primary">Salvar Messenger</button>
             </form>
@@ -2825,6 +3202,11 @@ def mp_callback():
 
 @app.route("/api/mercadopago/webhook", methods=["POST"])
 def mp_webhook():
+    # Valida assinatura — proteção contra fraude
+    if not validate_mp_signature(request):
+        log_webhook_error("mercadopago", None, "InvalidSignature", "Assinatura MP inválida", None)
+        return jsonify({"status": "invalid_signature"}), 401
+
     data = request.json or {}
     if data.get("type") == "payment":
         pid = data.get("data",{}).get("id")
@@ -3018,8 +3400,9 @@ def whatsapp_webhook(user_id):
     data = request.json or {}
     try:
         db_conn = sqlite3.connect(DATABASE); db_conn.row_factory = sqlite3.Row
-        user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        if not user: db_conn.close(); return jsonify({"status":"user not found"}), 404
+        raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not raw_user: db_conn.close(); return jsonify({"status":"user not found"}), 404
+        user = decrypt_user_row(raw_user)
 
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
@@ -3137,8 +3520,22 @@ def whatsapp_webhook(user_id):
                     if not audio_sent:
                         send_whatsapp_message(user["whatsapp_phone_id"], user["whatsapp_token"], sender_phone, ai_response)
         db_conn.close()
+    except sqlite3.OperationalError as e:
+        # Erro transitório de DB — Meta deve retentar
+        print(f"[WA WEBHOOK] DB error (retentativa necessária): {e}")
+        log_webhook_error("whatsapp", user_id, "DBOperationalError", str(e), data)
+        return jsonify({"status": "temporary_error"}), 500
+    except (ConnectionError, TimeoutError) as e:
+        # Erro de conexão com API externa — retentar
+        print(f"[WA WEBHOOK] Erro de conexão: {e}")
+        log_webhook_error("whatsapp", user_id, type(e).__name__, str(e), data)
+        return jsonify({"status": "temporary_error"}), 500
     except Exception as e:
-        print(f"Webhook error: {e}")
+        # Erro permanente — logamos mas respondemos 200 para Meta não retentar infinitamente
+        print(f"[WA WEBHOOK] Erro permanente: {e}")
+        import traceback
+        traceback.print_exc()
+        log_webhook_error("whatsapp", user_id, type(e).__name__, str(e), data)
     return jsonify({"status":"ok"}), 200
 
 
@@ -3199,10 +3596,11 @@ def webhook_instagram(user_id):
     try:
         db_conn = sqlite3.connect(DATABASE)
         db_conn.row_factory = sqlite3.Row
-        user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        if not user:
+        raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not raw_user:
             db_conn.close()
             return jsonify({"status":"user not found"}), 404
+        user = decrypt_user_row(raw_user)
 
         # Instagram envia messaging events
         for entry in data.get("entry", []):
@@ -3273,8 +3671,19 @@ def webhook_instagram(user_id):
                     ai_response
                 )
         db_conn.close()
+    except sqlite3.OperationalError as e:
+        print(f"[IG WEBHOOK] DB error: {e}")
+        log_webhook_error("instagram", user_id, "DBOperationalError", str(e), data)
+        return jsonify({"status": "temporary_error"}), 500
+    except (ConnectionError, TimeoutError) as e:
+        print(f"[IG WEBHOOK] Erro de conexão: {e}")
+        log_webhook_error("instagram", user_id, type(e).__name__, str(e), data)
+        return jsonify({"status": "temporary_error"}), 500
     except Exception as e:
-        print(f"[IG WEBHOOK] Erro: {e}")
+        print(f"[IG WEBHOOK] Erro permanente: {e}")
+        import traceback
+        traceback.print_exc()
+        log_webhook_error("instagram", user_id, type(e).__name__, str(e), data)
     return jsonify({"status":"ok"}), 200
 
 
@@ -3332,10 +3741,11 @@ def webhook_messenger(user_id):
     try:
         db_conn = sqlite3.connect(DATABASE)
         db_conn.row_factory = sqlite3.Row
-        user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        if not user:
+        raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not raw_user:
             db_conn.close()
             return jsonify({"status":"user not found"}), 404
+        user = decrypt_user_row(raw_user)
 
         for entry in data.get("entry", []):
             for event in entry.get("messaging", []):
@@ -3400,8 +3810,19 @@ def webhook_messenger(user_id):
                     ai_response
                 )
         db_conn.close()
+    except sqlite3.OperationalError as e:
+        print(f"[MSG WEBHOOK] DB error: {e}")
+        log_webhook_error("messenger", user_id, "DBOperationalError", str(e), data)
+        return jsonify({"status": "temporary_error"}), 500
+    except (ConnectionError, TimeoutError) as e:
+        print(f"[MSG WEBHOOK] Erro de conexão: {e}")
+        log_webhook_error("messenger", user_id, type(e).__name__, str(e), data)
+        return jsonify({"status": "temporary_error"}), 500
     except Exception as e:
-        print(f"[MSG WEBHOOK] Erro: {e}")
+        print(f"[MSG WEBHOOK] Erro permanente: {e}")
+        import traceback
+        traceback.print_exc()
+        log_webhook_error("messenger", user_id, type(e).__name__, str(e), data)
     return jsonify({"status":"ok"}), 200
 
 
@@ -3570,10 +3991,11 @@ def create_social_post(user_id, media_id=None):
         db_conn = sqlite3.connect(DATABASE)
         db_conn.row_factory = sqlite3.Row
 
-        user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        if not user:
+        raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not raw_user:
             db_conn.close()
             return None
+        user = decrypt_user_row(raw_user)
 
         # Se não especificou media_id, escolhe a menos usada
         if media_id:
@@ -3792,32 +4214,33 @@ def social_library():
         if "photo" in request.files:
             file = request.files["photo"]
             if file.filename:
-                allowed = {"image/jpeg", "image/png", "image/jpg"}
-                if file.content_type in allowed:
-                    image_bytes = file.read()
-                    if len(image_bytes) <= 10 * 1024 * 1024:
+                image_bytes = file.read()
+                if len(image_bytes) > 10 * 1024 * 1024:
+                    msg = '<div class="alert alert-error">Arquivo maior que 10MB</div>'
+                else:
+                    # Validação real com Pillow
+                    validated_bytes, real_ct = validate_and_normalize_image(image_bytes)
+                    if validated_bytes is None:
+                        msg = '<div class="alert alert-error">Arquivo inválido. Envie JPG ou PNG real.</div>'
+                    else:
                         lib_dir = os.path.join(MEDIA_FOLDER, "social")
                         os.makedirs(lib_dir, exist_ok=True)
-                        ext = "jpg" if "jpeg" in file.content_type else "png"
+                        ext = "jpg" if "jpeg" in real_ct else "png"
                         ts = int(time.time() * 1000)
                         fname = f"user{user['id']}_{ts}.{ext}"
                         fpath = os.path.join(lib_dir, fname)
                         with open(fpath, "wb") as f:
-                            f.write(image_bytes)
+                            f.write(validated_bytes)
                         theme = request.form.get("theme", "geral")
                         description = request.form.get("description", "")
                         db.execute(
                             """INSERT INTO social_media_library
                                (user_id, file_path, file_type, theme, description)
                                VALUES (?,?,?,?,?)""",
-                            (user["id"], fpath, file.content_type, theme, description)
+                            (user["id"], fpath, real_ct, theme, description)
                         )
                         db.commit()
                         msg = '<div class="alert alert-success">✅ Mídia adicionada!</div>'
-                    else:
-                        msg = '<div class="alert alert-error">Arquivo maior que 10MB</div>'
-                else:
-                    msg = '<div class="alert alert-error">Apenas JPG ou PNG</div>'
 
     items = db.execute(
         "SELECT * FROM social_media_library WHERE user_id=? ORDER BY created_at DESC",
@@ -4000,6 +4423,15 @@ def social_settings():
                 times_list.append(t)
         times_csv = ",".join(times_list) if times_list else "09:00"
 
+        tg_token_input = request.form.get("telegram_bot_token", "").strip()
+
+        # Se veio vazio, mantém token atual
+        if tg_token_input:
+            tg_token_final = _encrypt_value(tg_token_input)
+        else:
+            raw = db.execute("SELECT telegram_bot_token FROM users WHERE id=?", (user["id"],)).fetchone()
+            tg_token_final = raw["telegram_bot_token"] or ""
+
         db.execute(
             """UPDATE users SET
                 telegram_bot_token=?,
@@ -4012,7 +4444,7 @@ def social_settings():
                 social_business_context=?
                WHERE id=?""",
             (
-                request.form.get("telegram_bot_token", "").strip(),
+                tg_token_final,
                 request.form.get("telegram_chat_id", "").strip(),
                 times_list[0] if times_list else "09:00",
                 times_csv,
@@ -4024,7 +4456,8 @@ def social_settings():
             )
         )
         db.commit()
-        user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        raw_user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        user = decrypt_user_row(raw_user)
         msg = '<div class="alert alert-success">✅ Configurações salvas!</div>'
 
     # Testa Telegram se configurado
@@ -4110,8 +4543,9 @@ def social_settings():
                         <br><a href="https://telegram.me/BotFather" target="_blank" style="color:var(--accent2)">Como criar um bot no Telegram →</a>
                     </p>
                     <div class="form-group">
-                        <label class="form-label">Bot Token</label>
-                        <input type="text" name="telegram_bot_token" class="form-input" value="{esc(user['telegram_bot_token'] or '')}" placeholder="123456:ABC-DEF...">
+                        <label class="form-label">Bot Token 🔒</label>
+                        <input type="password" name="telegram_bot_token" class="form-input" value="" placeholder="{esc(mask_secret(user['telegram_bot_token'] or '')) if user['telegram_bot_token'] else '123456:ABC-DEF...'}" autocomplete="off">
+                        {f'<small style="color:var(--green2);font-size:11px">✓ Configurado. Deixe em branco para manter.</small>' if user['telegram_bot_token'] else ''}
                     </div>
                     <div class="form-group">
                         <label class="form-label">Chat ID (seu)</label>
@@ -4188,7 +4622,9 @@ def social_settings():
 
 
 def run_social_scheduler():
-    """Executa o scheduler de posts automáticos (chamado a cada minuto)"""
+    """Executa o scheduler de posts automáticos (chamado a cada minuto).
+    Usa UPDATE condicional como lock atômico — garante que apenas 1 worker dispara
+    o post mesmo com múltiplas instâncias Gunicorn."""
     try:
         db_conn = sqlite3.connect(DATABASE)
         db_conn.row_factory = sqlite3.Row
@@ -4219,18 +4655,20 @@ def run_social_scheduler():
             if current_time not in post_times_clean:
                 continue
 
-            # Evita duplicação: checa se já gerou neste minuto
-            if user["social_last_run"] == current_minute:
+            # Lock atômico: só dispara se conseguir atualizar (WHERE social_last_run != current_minute)
+            # Se outro worker já atualizou, o UPDATE retorna rowcount=0 e pulamos
+            cursor = db_conn.execute(
+                """UPDATE users SET social_last_run=?
+                   WHERE id=? AND (social_last_run IS NULL OR social_last_run != ?)""",
+                (current_minute, user["id"], current_minute)
+            )
+            db_conn.commit()
+
+            if cursor.rowcount == 0:
+                # Outro worker já pegou essa execução
                 continue
 
             print(f"[SCHEDULER] Gerando post para user {user['id']} ({user['email']}) às {current_time}")
-
-            # Marca última execução
-            db_conn.execute(
-                "UPDATE users SET social_last_run=? WHERE id=?",
-                (current_minute, user["id"])
-            )
-            db_conn.commit()
 
             # Gera o post (chama em thread separada para não bloquear)
             import threading
@@ -4433,53 +4871,153 @@ Responda apenas com o JSON:"""
 
 
 def create_order_from_intent(user, conversation_id, customer_phone, purchase_data):
-    """Cria pedido e gera cobrança PIX automaticamente"""
+    """Cria pedido e gera cobrança PIX automaticamente.
+    VALIDAÇÃO RIGOROSA:
+    - Preço SEMPRE do banco (nunca do que a IA retornou)
+    - Quantidade máx 100 por item
+    - Valor total entre R$ 1 e R$ 10.000 por pedido
+    - Verifica estoque se configurado
+    - Rejeita pedidos sem itens válidos
+    - Não cria pedidos duplicados (mesmo telefone + mesmos itens em < 2 min)
+    """
     try:
+        # Limites de segurança (evita abuso via prompt injection)
+        MAX_QTY_PER_ITEM = 100
+        MAX_ORDER_TOTAL = 10000.00
+        MIN_ORDER_TOTAL = 1.00
+        MAX_ITEMS_PER_ORDER = 20
+
         db_conn = sqlite3.connect(DATABASE)
         db_conn.row_factory = sqlite3.Row
+
+        # Anti-duplicidade: checa se criou pedido similar recentemente
+        recent_order = db_conn.execute(
+            """SELECT id FROM orders
+               WHERE user_id=? AND customer_phone=?
+               AND datetime(created_at) > datetime('now', '-2 minutes')
+               AND payment_status='pending'
+               ORDER BY id DESC LIMIT 1""",
+            (user["id"], customer_phone)
+        ).fetchone()
+        if recent_order:
+            print(f"[ORDER] Bloqueado pedido duplicado (order #{recent_order['id']} recente)")
+            db_conn.close()
+            return None
 
         items_detail = []
         total = 0
         items_json = []
+        rejected_items = []
 
-        for item in purchase_data.get("items", []):
+        # Valida input
+        raw_items = purchase_data.get("items", [])
+        if not raw_items or not isinstance(raw_items, list):
+            print("[ORDER] Rejeitado: sem items válidos")
+            db_conn.close()
+            return None
+
+        # Limite de itens por pedido
+        if len(raw_items) > MAX_ITEMS_PER_ORDER:
+            print(f"[ORDER] Rejeitado: mais de {MAX_ITEMS_PER_ORDER} itens")
+            log_webhook_error("commerce_ai", user["id"], "TooManyItems",
+                            f"Tentativa de pedido com {len(raw_items)} itens", purchase_data)
+            db_conn.close()
+            return None
+
+        for item in raw_items:
+            try:
+                pid = int(item.get("product_id", 0))
+            except (ValueError, TypeError):
+                rejected_items.append(f"product_id inválido: {item}")
+                continue
+
+            if pid <= 0:
+                continue
+
+            # SEMPRE busca do banco — NUNCA confia no que a IA disser sobre preço
             product = db_conn.execute(
-                "SELECT * FROM product_gallery WHERE id=? AND user_id=?",
-                (item["product_id"], user["id"])
+                "SELECT * FROM product_gallery WHERE id=? AND user_id=? AND active=1",
+                (pid, user["id"])
             ).fetchone()
             if not product:
+                rejected_items.append(f"produto {pid} não encontrado ou inativo")
                 continue
-            qty = int(item.get("quantity", 1))
-            subtotal = product["price"] * qty
+
+            price_from_db = float(product["price"] or 0)
+            if price_from_db <= 0:
+                rejected_items.append(f"{product['name']}: sem preço configurado")
+                continue
+
+            # Valida quantidade
+            try:
+                qty = int(item.get("quantity", 1))
+            except (ValueError, TypeError):
+                qty = 1
+            if qty < 1:
+                qty = 1
+            if qty > MAX_QTY_PER_ITEM:
+                rejected_items.append(f"{product['name']}: quantidade {qty} excede limite {MAX_QTY_PER_ITEM}")
+                qty = MAX_QTY_PER_ITEM
+                log_webhook_error("commerce_ai", user["id"], "QuantityCapped",
+                                f"Qty capped from {item.get('quantity')} to {MAX_QTY_PER_ITEM}", purchase_data)
+
+            # Verifica estoque se configurado (stock >= 0)
+            try:
+                stock = int(product["stock"]) if product["stock"] is not None else -1
+            except (ValueError, TypeError):
+                stock = -1
+            if stock >= 0 and qty > stock:
+                rejected_items.append(f"{product['name']}: estoque insuficiente (disponível: {stock})")
+                if stock == 0:
+                    continue
+                qty = stock  # Limita à quantidade disponível
+
+            subtotal = price_from_db * qty
             total += subtotal
             items_detail.append({
                 "name": product["name"],
                 "quantity": qty,
-                "price": product["price"],
+                "price": price_from_db,
                 "subtotal": subtotal
             })
             items_json.append({
                 "id": str(product["id"]),
                 "title": product["name"][:250],
                 "quantity": qty,
-                "unit_price": float(product["price"]),
+                "unit_price": price_from_db,
                 "currency_id": "BRL"
             })
 
-        if total <= 0:
+        # Valida total final
+        if total < MIN_ORDER_TOTAL:
+            print(f"[ORDER] Rejeitado: total R$ {total:.2f} abaixo do mínimo R$ {MIN_ORDER_TOTAL:.2f}")
+            db_conn.close()
+            return None
+
+        if total > MAX_ORDER_TOTAL:
+            print(f"[ORDER] Rejeitado: total R$ {total:.2f} acima do máximo R$ {MAX_ORDER_TOTAL:.2f}")
+            log_webhook_error("commerce_ai", user["id"], "TotalExceedsLimit",
+                            f"Total R$ {total:.2f} > limite R$ {MAX_ORDER_TOTAL:.2f}", purchase_data)
+            db_conn.close()
+            return None
+
+        if not items_detail:
+            print(f"[ORDER] Rejeitado: sem itens válidos. Rejeitados: {rejected_items}")
             db_conn.close()
             return None
 
         # Cria registro do pedido
         import json as json_mod
+        notes_text = "; ".join(rejected_items[:3]) if rejected_items else ""
         cur = db_conn.execute(
             """INSERT INTO orders
-               (user_id, conversation_id, customer_phone, items, total, payment_status, expires_at)
-               VALUES (?,?,?,?,?,?,?)""",
+               (user_id, conversation_id, customer_phone, items, total, payment_status, expires_at, notes)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (user["id"], conversation_id, customer_phone,
              json_mod.dumps(items_detail, ensure_ascii=False),
              total, "pending",
-             (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"))
+             (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
+             notes_text)
         )
         order_id = cur.lastrowid
         db_conn.commit()
@@ -4569,8 +5107,15 @@ Copie e cole este código no seu app do banco:
 # ─── ROTA: Webhook do Mercado Pago para confirmação de pagamento ───
 @app.route("/webhook/mp-commerce/<int:user_id>", methods=["POST"])
 def mp_commerce_webhook(user_id):
-    """Recebe notificação de pagamento do Mercado Pago"""
+    """Recebe notificação de pagamento do Mercado Pago.
+    Cada cliente pode ter seu próprio MP_WEBHOOK_SECRET (por enquanto usa global).
+    Em v2, adicionar coluna mp_webhook_secret por usuário."""
     try:
+        # Valida assinatura MP — impede fraude de pagamento
+        if not validate_mp_signature(request):
+            log_webhook_error("mercadopago", user_id, "InvalidSignature", "Assinatura MP inválida", None)
+            return jsonify({"status": "invalid_signature"}), 401
+
         data = request.json or {}
         payment_id = data.get("data", {}).get("id") or data.get("id")
 
@@ -4580,10 +5125,11 @@ def mp_commerce_webhook(user_id):
         db_conn = sqlite3.connect(DATABASE)
         db_conn.row_factory = sqlite3.Row
 
-        user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        if not user or not user["mp_access_token"]:
+        raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not raw_user or not raw_user["mp_access_token"]:
             db_conn.close()
             return jsonify({"status": "user_not_found"}), 404
+        user = decrypt_user_row(raw_user)
 
         # Consulta status do pagamento no MP
         import requests as req
@@ -4805,6 +5351,15 @@ def commerce_settings():
     msg = ""
 
     if request.method == "POST":
+        mp_token_input = request.form.get("mp_access_token", "").strip()
+
+        # Se veio vazio, mantém o atual
+        if mp_token_input:
+            mp_token_final = _encrypt_value(mp_token_input)
+        else:
+            raw = db.execute("SELECT mp_access_token FROM users WHERE id=?", (user["id"],)).fetchone()
+            mp_token_final = raw["mp_access_token"] or ""
+
         db.execute(
             """UPDATE users SET
                 mp_access_token=?,
@@ -4813,7 +5368,7 @@ def commerce_settings():
                 auto_payment_enabled=?
                WHERE id=?""",
             (
-                request.form.get("mp_access_token", "").strip(),
+                mp_token_final,
                 request.form.get("mp_public_key", "").strip(),
                 1 if request.form.get("commerce_enabled") else 0,
                 1 if request.form.get("auto_payment_enabled") else 0,
@@ -4821,7 +5376,9 @@ def commerce_settings():
             )
         )
         db.commit()
-        user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        # Re-carrega com descriptografia
+        raw_user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        user = decrypt_user_row(raw_user)
         msg = '<div class="alert alert-success">✅ Configurações salvas!</div>'
 
     content = f"""<div class="container">
@@ -4839,11 +5396,12 @@ def commerce_settings():
             </p>
             <form method="POST">{csrf_field()}
                 <div class="form-group">
-                    <label class="form-label">Access Token (produção)</label>
-                    <input type="text" name="mp_access_token" class="form-input"
-                           value="{esc(user['mp_access_token'] or '')}"
-                           placeholder="APP_USR-...">
-                    <small style="color:var(--text3)">Começa com APP_USR- (produção) ou TEST- (teste)</small>
+                    <label class="form-label">Access Token (produção) 🔒</label>
+                    <input type="password" name="mp_access_token" class="form-input"
+                           value=""
+                           placeholder="{esc(mask_secret(user['mp_access_token'] or '')) if user['mp_access_token'] else 'APP_USR-...'}"
+                           autocomplete="off">
+                    <small style="color:var(--text3)">{'✓ Token configurado. Deixe em branco para manter ou cole um novo para substituir.' if user['mp_access_token'] else 'Começa com APP_USR- (produção) ou TEST- (teste)'}</small>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Public Key (opcional)</label>
@@ -4948,7 +5506,7 @@ def run_campaign(campaign_id):
             db_conn.close()
             return
 
-        user = db_conn.execute("SELECT * FROM users WHERE id=?", (campaign["user_id"],)).fetchone()
+        user = decrypt_user_row(db_conn.execute("SELECT * FROM users WHERE id=?", (campaign["user_id"],)).fetchone())
         if not user:
             db_conn.close()
             return
@@ -6013,26 +6571,30 @@ def gallery_upload():
     if file.filename == "":
         return redirect("/dashboard/gallery?err=" + "Arquivo%20vazio")
 
-    allowed_types = {"image/jpeg", "image/png", "image/jpg"}
-    if file.content_type not in allowed_types:
-        return redirect("/dashboard/gallery?err=" + "Apenas%20JPG%20ou%20PNG")
-
     image_bytes = file.read()
     if len(image_bytes) > 5 * 1024 * 1024:
         return redirect("/dashboard/gallery?err=" + "M%C3%A1ximo%205MB")
+
+    # VALIDAÇÃO REAL com Pillow — rejeita arquivos falsificados
+    validated_bytes, real_content_type = validate_and_normalize_image(image_bytes)
+    if validated_bytes is None:
+        return redirect("/dashboard/gallery?err=" + "Arquivo%20inv%C3%A1lido%20ou%20corrompido.%20Envie%20JPG%20ou%20PNG%20real.")
 
     # Salva no diretório de mídia
     gallery_dir = os.path.join(MEDIA_FOLDER, "gallery")
     os.makedirs(gallery_dir, exist_ok=True)
 
-    # Nome único do arquivo
-    ext = "jpg" if "jpeg" in file.content_type else "png"
+    # Nome único do arquivo (usa content_type validado, não o do cliente)
+    ext = "jpg" if "jpeg" in real_content_type else "png"
     timestamp = int(time.time() * 1000)
     filename = f"user{user['id']}_{timestamp}.{ext}"
     file_path = os.path.join(gallery_dir, filename)
 
     with open(file_path, "wb") as f:
-        f.write(image_bytes)
+        f.write(validated_bytes)
+
+    # Atualiza content_type com o verificado
+    file_content_type = real_content_type
 
     # Salva no banco
     db = get_db()
@@ -6051,7 +6613,7 @@ def gallery_upload():
         """INSERT INTO product_gallery
            (user_id, name, keywords, description, file_path, file_type, price, stock, category, active)
            VALUES (?,?,?,?,?,?,?,?,?,1)""",
-        (user["id"], name, keywords, description, file_path, file.content_type, price, stock, category)
+        (user["id"], name, keywords, description, file_path, file_content_type, price, stock, category)
     )
     db.commit()
 
@@ -6138,36 +6700,111 @@ def send_whatsapp_audio(phone_id, token, to, audio_path):
 
 @app.route("/admin/login", methods=["GET","POST"])
 def admin_login():
+    """Login admin com suporte a 2FA (TOTP).
+    Fluxo:
+    1. Primeiro POST: valida email+senha. Se 2FA ativo, pede código. Senão, entra.
+    2. Segundo POST (com totp_code): valida código ou backup code.
+    """
     error = ""
     client_ip = request.remote_addr or "unknown"
+    step_2fa = session.get("admin_awaiting_2fa", False)
+
     if request.method == "POST":
         if not check_rate_limit(client_ip):
             error = "Muitas tentativas. Aguarde 5 minutos."
         elif not ADMIN_PASSWORD:
             error = "ADMIN_PASSWORD não configurada. Defina no Railway → Variables."
+        elif step_2fa:
+            # Etapa 2: validar código TOTP ou backup code
+            code = request.form.get("totp_code", "").strip()
+            totp_secret = get_setting("ADMIN_TOTP_SECRET", "")
+            code_ok = verify_totp_code(totp_secret, code)
+
+            # Se não for TOTP válido, tenta backup code
+            if not code_ok and code:
+                backup_codes_raw = get_setting("ADMIN_BACKUP_CODES", "")
+                if backup_codes_raw:
+                    codes = [c.strip() for c in backup_codes_raw.split(",") if c.strip()]
+                    code_upper = code.upper().replace(" ", "")
+                    if code_upper in codes:
+                        # Consome o backup code (uso único)
+                        codes.remove(code_upper)
+                        set_setting("ADMIN_BACKUP_CODES", ",".join(codes))
+                        code_ok = True
+                        log_admin_action("backup_code_used", details=f"Restantes: {len(codes)}")
+
+            if code_ok:
+                reset_login_attempts(client_ip)
+                session.pop("admin_awaiting_2fa", None)
+                session["is_admin"] = True
+                log_admin_action("login_success", details="2FA ok")
+                return redirect("/admin")
+            else:
+                record_login_attempt(client_ip)
+                error = "Código inválido. Tente novamente."
         elif request.form.get("email") == ADMIN_EMAIL and request.form.get("password") == ADMIN_PASSWORD:
-            reset_login_attempts(client_ip)
-            session["is_admin"] = True
-            return redirect("/admin")
+            # Etapa 1: senha OK. Precisa de 2FA?
+            if is_admin_2fa_enabled():
+                session["admin_awaiting_2fa"] = True
+                step_2fa = True
+                log_admin_action("password_ok_awaiting_2fa")
+            else:
+                # 2FA não configurado — entra direto (compatibilidade inicial)
+                reset_login_attempts(client_ip)
+                session["is_admin"] = True
+                log_admin_action("login_success", details="sem 2FA")
+                return redirect("/admin")
         else:
             record_login_attempt(client_ip)
             error = "Credenciais inválidas."
+            log_admin_action("login_failed", details=f"email={request.form.get('email','')[:50]}")
+
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
+
+    # Se estiver aguardando 2FA, mostra tela diferente
+    if step_2fa:
+        warning_2fa = '<div class="alert alert-info" style="margin-bottom:16px">🔐 Digite o código de 6 dígitos do seu app autenticador (Google Authenticator, Authy, etc)</div>'
+        form_body = f"""<form method="POST">{csrf_field()}
+            <div class="form-group">
+                <label class="form-label">Código 2FA (6 dígitos)</label>
+                <input type="text" name="totp_code" class="form-input" required maxlength="9" autocomplete="off" autofocus
+                       placeholder="000000" style="font-size:24px;letter-spacing:8px;text-align:center;font-family:monospace">
+                <small style="color:var(--text3);font-size:12px;margin-top:6px;display:block">Ou use um dos seus <strong>backup codes</strong> (formato XXXX-XXXX)</small>
+            </div>
+            <button type="submit" class="btn btn-primary btn-block btn-lg" style="background:var(--red)">Verificar</button>
+            <a href="/admin/login?reset=1" style="display:block;text-align:center;margin-top:12px;color:var(--text3);font-size:12px">Cancelar e voltar</a>
+        </form>"""
+    else:
+        warning_2fa = ''
+        if not is_admin_2fa_enabled():
+            warning_2fa = '<div class="alert alert-warning" style="margin-bottom:16px">⚠️ 2FA não configurado. Após o login, ative em <strong>Configurações 2FA</strong> para mais segurança.</div>'
+        form_body = f"""<form method="POST">{csrf_field()}
+            <div class="form-group"><label class="form-label">Email admin</label><input type="email" name="email" class="form-input" required autofocus></div>
+            <div class="form-group"><label class="form-label">Senha</label><input type="password" name="password" class="form-input" required></div>
+            <button type="submit" class="btn btn-primary btn-block btn-lg" style="background:var(--red)">Entrar</button>
+        </form>"""
+
+    # Limpar sessão 2FA se user cancelar
+    if request.args.get("reset") == "1":
+        session.pop("admin_awaiting_2fa", None)
+        return redirect("/admin/login")
+
     return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Admin — atendente.online</title><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>{GLOBAL_CSS}</style></head><body>
 <div class="auth-container"><div class="auth-card" style="border-top:3px solid var(--red)">
     <div style="text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"><span class="admin-badge" style="margin-left:8px;vertical-align:middle">ADMIN</span></div>
-    <h2>Painel Administrativo</h2>{alert}
-    <form method="POST">{csrf_field()}
-    <div class="form-group"><label class="form-label">Email admin</label><input type="email" name="email" class="form-input" required></div>
-    <div class="form-group"><label class="form-label">Senha</label><input type="password" name="password" class="form-input" required></div>
-    <button type="submit" class="btn btn-primary btn-block btn-lg" style="background:var(--red)">Entrar no Admin</button></form>
+    <h2>{'Verificação 2FA' if step_2fa else 'Painel Administrativo'}</h2>
+    {alert}
+    {warning_2fa}
+    {form_body}
 </div></div></body></html>"""
 
 @app.route("/admin/logout")
 def admin_logout():
+    log_admin_action("logout")
     session.pop("is_admin", None)
+    session.pop("admin_awaiting_2fa", None)
     return redirect("/admin/login")
 
 
@@ -6369,11 +7006,16 @@ def admin_create_user():
 @admin_required
 def admin_toggle_user(uid):
     db = get_db()
-    user = db.execute("SELECT is_active FROM users WHERE id=?", (uid,)).fetchone()
+    user = db.execute("SELECT is_active, email FROM users WHERE id=?", (uid,)).fetchone()
     if user:
         new_status = 0 if user["is_active"] else 1
         db.execute("UPDATE users SET is_active=? WHERE id=?", (new_status, uid))
         db.commit()
+        log_admin_action(
+            "user_activated" if new_status else "user_deactivated",
+            target_type="user", target_id=uid,
+            details=f"email={user['email']}"
+        )
     return redirect("/admin/users")
 
 
@@ -6389,12 +7031,292 @@ def admin_change_plan(uid):
     plan_info = PLANS[new_plan]
     msgs_limit = plan_info.get("msgs", 500)
 
+    old_user = db.execute("SELECT email, plan FROM users WHERE id=?", (uid,)).fetchone()
     db.execute(
         "UPDATE users SET plan=?, plan_status='active', msgs_limit=?, email_verified=1, is_active=1 WHERE id=?",
         (new_plan, msgs_limit, uid)
     )
     db.commit()
+
+    if old_user:
+        log_admin_action(
+            "user_plan_changed",
+            target_type="user", target_id=uid,
+            details=f"email={old_user['email']} de {old_user['plan']} para {new_plan}"
+        )
     return redirect("/admin/users")
+
+
+# ─── ADMIN: 2FA (SETUP, DISABLE, AUDIT) ──────────────────────
+@app.route("/admin/2fa", methods=["GET", "POST"])
+@admin_required
+def admin_2fa_setup():
+    """Setup/gerenciamento de 2FA do admin"""
+    msg = ""
+    is_enabled = is_admin_2fa_enabled()
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+
+        if action == "disable" and is_enabled:
+            # Exige senha de confirmação
+            confirm_pw = request.form.get("confirm_password", "")
+            if confirm_pw != ADMIN_PASSWORD:
+                msg = '<div class="alert alert-error">Senha incorreta. 2FA não foi desativado.</div>'
+            else:
+                set_setting("ADMIN_TOTP_SECRET", "")
+                set_setting("ADMIN_BACKUP_CODES", "")
+                log_admin_action("2fa_disabled")
+                is_enabled = False
+                msg = '<div class="alert alert-warning">⚠️ 2FA desativado. Reconfigure para manter segurança.</div>'
+
+        elif action == "verify_setup":
+            # Usuário acabou de escanear o QR, está validando
+            pending_secret = session.get("pending_totp_secret", "")
+            code = request.form.get("totp_code", "").strip()
+            if not pending_secret:
+                msg = '<div class="alert alert-error">Sessão expirada. Inicie o setup novamente.</div>'
+            elif verify_totp_code(pending_secret, code):
+                # Salva definitivamente
+                backup_codes = generate_backup_codes(8)
+                set_setting("ADMIN_TOTP_SECRET", pending_secret)
+                set_setting("ADMIN_BACKUP_CODES", ",".join(backup_codes))
+                session.pop("pending_totp_secret", None)
+                log_admin_action("2fa_enabled")
+                session["2fa_backup_codes_shown"] = backup_codes  # Mostra uma vez só
+                return redirect("/admin/2fa?setup=success")
+            else:
+                msg = '<div class="alert alert-error">Código inválido. Tente novamente.</div>'
+
+    # Página de sucesso mostra backup codes (única vez)
+    if request.args.get("setup") == "success":
+        codes = session.pop("2fa_backup_codes_shown", [])
+        codes_html = "".join([f'<li style="font-family:monospace;font-size:16px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05)">{c}</li>' for c in codes])
+        content = f"""<div class="container">
+            <div class="page-header"><h1>✅ 2FA Ativado!</h1><p>Guarde seus backup codes em local seguro</p></div>
+            <div class="alert alert-success">🎉 2FA está funcionando. A partir de agora, todo login exigirá código do seu app autenticador.</div>
+            <div class="card" style="margin-top:16px">
+                <div class="card-header"><span class="card-title">🔑 Seus Backup Codes</span></div>
+                <p style="color:var(--text2);margin-bottom:16px">Use um destes códigos <strong>se perder seu celular</strong>. Cada código funciona apenas <strong>uma vez</strong>.</p>
+                <div class="alert alert-warning">⚠️ <strong>IMPORTANTE:</strong> Anote ou salve em gerenciador de senhas. Esses códigos não serão mostrados novamente!</div>
+                <ul style="list-style:none;padding:20px;background:rgba(0,0,0,0.3);border-radius:8px;margin-top:16px">{codes_html}</ul>
+                <a href="/admin/2fa" class="btn btn-primary" style="margin-top:16px">Já anotei, continuar</a>
+            </div>
+        </div>"""
+        return admin_html("2FA Ativado", content)
+
+    # Iniciar novo setup (gera secret temporário)
+    if not is_enabled and request.args.get("start") == "1":
+        new_secret = generate_totp_secret()
+        if not new_secret:
+            content = '<div class="container"><div class="alert alert-error">❌ pyotp não instalado. Execute: pip install pyotp qrcode</div></div>'
+            return admin_html("Erro 2FA", content)
+
+        session["pending_totp_secret"] = new_secret
+        uri = generate_totp_uri(new_secret, "atendente.online", ADMIN_EMAIL)
+        qr_data = generate_totp_qr_base64(uri)
+
+        qr_html = f'<img src="{qr_data}" alt="QR Code 2FA" style="width:220px;height:220px;background:white;padding:12px;border-radius:8px;display:block;margin:0 auto">' if qr_data else '<p style="color:var(--red)">Erro ao gerar QR code</p>'
+
+        content = f"""<div class="container">
+            <div class="page-header"><h1>🔐 Configurar 2FA</h1><p>Passo 1: Escaneie o QR code no seu app</p></div>
+            <div class="grid-2">
+                <div class="card">
+                    <div class="card-header"><span class="card-title">📱 Escaneie com:</span></div>
+                    <ul style="list-style:none;padding:0;color:var(--text2);font-size:14px">
+                        <li style="padding:6px 0">• Google Authenticator</li>
+                        <li style="padding:6px 0">• Authy</li>
+                        <li style="padding:6px 0">• Microsoft Authenticator</li>
+                        <li style="padding:6px 0">• 1Password, Bitwarden, etc</li>
+                    </ul>
+                    <div style="margin-top:20px">
+                        {qr_html}
+                    </div>
+                    <p style="color:var(--text3);font-size:12px;text-align:center;margin-top:12px">Ou cole este código manualmente:</p>
+                    <code style="display:block;padding:10px;background:rgba(0,0,0,0.3);border-radius:6px;font-size:11px;word-break:break-all;text-align:center">{new_secret}</code>
+                </div>
+                <div class="card">
+                    <div class="card-header"><span class="card-title">✅ Passo 2: Confirme o código</span></div>
+                    <p style="color:var(--text2);margin-bottom:16px">Depois de escanear, digite o código de 6 dígitos que aparece no app:</p>
+                    <form method="POST">{csrf_field()}
+                        <input type="hidden" name="action" value="verify_setup">
+                        <div class="form-group">
+                            <input type="text" name="totp_code" class="form-input" required maxlength="6" autocomplete="off" autofocus
+                                   placeholder="000000" style="font-size:24px;letter-spacing:8px;text-align:center;font-family:monospace">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Ativar 2FA →</button>
+                    </form>
+                    {msg}
+                </div>
+            </div>
+            <a href="/admin/2fa" style="display:block;text-align:center;margin-top:20px;color:var(--text3)">← Cancelar</a>
+        </div>"""
+        return admin_html("Setup 2FA", content)
+
+    # Tela principal: status
+    status_card = ""
+    if is_enabled:
+        backup_count = len([c for c in (get_setting("ADMIN_BACKUP_CODES", "") or "").split(",") if c.strip()])
+        status_card = f"""
+        <div class="card" style="border-left:4px solid #10b981">
+            <div class="card-header"><span class="card-title">✅ 2FA Ativado</span></div>
+            <p style="color:var(--text2);margin-bottom:16px">Seu login requer código do app autenticador. Backup codes restantes: <strong>{backup_count}</strong></p>
+            <form method="POST" style="margin-top:16px">{csrf_field()}
+                <input type="hidden" name="action" value="disable">
+                <p style="color:var(--text3);font-size:13px;margin-bottom:8px">Para desativar, digite sua senha admin:</p>
+                <div class="form-group">
+                    <input type="password" name="confirm_password" class="form-input" placeholder="Senha admin" required>
+                </div>
+                <button type="submit" class="btn" style="background:rgba(239,68,68,0.2);color:#ef4444" onclick="return confirm('Desativar 2FA? Isso reduz a segurança da conta admin.')">🚫 Desativar 2FA</button>
+            </form>
+        </div>
+        """
+    else:
+        status_card = """
+        <div class="card" style="border-left:4px solid #f59e0b">
+            <div class="card-header"><span class="card-title">⚠️ 2FA Desativado</span></div>
+            <p style="color:var(--text2);margin-bottom:20px">Sem 2FA, qualquer pessoa com sua senha pode acessar o painel admin. <strong>Recomendamos fortemente ativar.</strong></p>
+            <ul style="color:var(--text3);font-size:13px;margin-bottom:20px;padding-left:20px;line-height:1.8">
+                <li>Leva menos de 2 minutos para configurar</li>
+                <li>Funciona com Google Authenticator, Authy, etc</li>
+                <li>Gera 8 backup codes para emergência</li>
+            </ul>
+            <a href="/admin/2fa?start=1" class="btn btn-primary">🔐 Configurar 2FA agora</a>
+        </div>
+        """
+
+    content = f"""<div class="container">
+        <div class="page-header"><h1>🔐 Autenticação de 2 Fatores</h1><p>Proteção extra para sua conta admin</p></div>
+        {msg}
+        {status_card}
+    </div>"""
+    return admin_html("2FA Admin", content)
+
+
+@app.route("/admin/audit-log")
+@admin_required
+def admin_audit_log_view():
+    """Histórico de ações admin (auditoria)"""
+    db = get_db()
+    logs = db.execute(
+        "SELECT * FROM admin_audit_log ORDER BY created_at DESC LIMIT 500"
+    ).fetchall()
+
+    total = db.execute("SELECT COUNT(*) as c FROM admin_audit_log").fetchone()["c"]
+
+    # Últimos 7 dias
+    recent = db.execute(
+        "SELECT COUNT(*) as c FROM admin_audit_log WHERE datetime(created_at) > datetime('now', '-7 days')"
+    ).fetchone()["c"]
+
+    rows = ""
+    for log in logs:
+        action_cls = "badge-green"
+        if "fail" in log["action"] or "error" in log["action"]:
+            action_cls = "badge-red"
+        elif "disabled" in log["action"] or "delete" in log["action"]:
+            action_cls = "badge-orange"
+        elif "enabled" in log["action"] or "created" in log["action"]:
+            action_cls = "badge-blue"
+
+        rows += f"""<tr>
+            <td style="font-size:12px;color:var(--text3);white-space:nowrap">{to_br_datetime(log['created_at'])}</td>
+            <td><span class="badge {action_cls}">{esc(log['action'])}</span></td>
+            <td style="font-size:12px">{esc(log['target_type'] or '—')} {(': ' + esc(log['target_id'])) if log['target_id'] else ''}</td>
+            <td style="font-size:12px;color:var(--text3);font-family:monospace">{esc(log['ip_address'] or '—')}</td>
+            <td style="font-size:11px;color:var(--text3);max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{esc(log['details'] or '')}</td>
+        </tr>"""
+
+    content = f"""<div class="container">
+        <div class="page-header"><h1>📋 Auditoria Admin</h1><p>Histórico de todas as ações realizadas no painel</p></div>
+        <div class="grid-3" style="margin-bottom:24px">
+            <div class="stat-card"><div class="stat-icon stat-icon-blue">📋</div><div class="stat-value">{total}</div><div class="stat-label">Total de ações</div></div>
+            <div class="stat-card"><div class="stat-icon stat-icon-green">📅</div><div class="stat-value">{recent}</div><div class="stat-label">Últimos 7 dias</div></div>
+            <div class="stat-card"><div class="stat-icon stat-icon-orange">🕐</div><div class="stat-value">500</div><div class="stat-label">Exibindo últimas</div></div>
+        </div>
+        <div class="card">
+            <div class="card-header"><span class="card-title">Histórico detalhado</span></div>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Quando</th><th>Ação</th><th>Alvo</th><th>IP</th><th>Detalhes</th></tr></thead>
+                    <tbody>{rows or '<tr><td colspan="5" style="text-align:center;padding:40px;color:var(--text3)">Nenhuma ação registrada ainda</td></tr>'}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>"""
+    return admin_html("Auditoria Admin", content)
+
+
+# ─── ADMIN: ERROS DE WEBHOOK ──────────────────────────────────
+@app.route("/admin/webhook-errors")
+@admin_required
+def admin_webhook_errors():
+    """Dashboard de erros de webhook para diagnosticar falhas"""
+    db = get_db()
+    errors = db.execute(
+        """SELECT we.*, u.email FROM webhook_errors we
+           LEFT JOIN users u ON we.user_id=u.id
+           ORDER BY we.created_at DESC LIMIT 200"""
+    ).fetchall()
+
+    unresolved = db.execute(
+        "SELECT COUNT(*) as c FROM webhook_errors WHERE resolved=0"
+    ).fetchone()["c"]
+    total = db.execute("SELECT COUNT(*) as c FROM webhook_errors").fetchone()["c"]
+
+    rows = ""
+    for e in errors:
+        source_cls = {
+            "whatsapp": "badge-green",
+            "instagram": "badge-purple",
+            "messenger": "badge-blue",
+            "mercadopago": "badge-orange"
+        }.get(e["source"], "badge-gray")
+        resolved_label = '<span class="badge badge-green">Resolvido</span>' if e["resolved"] else '<span class="badge badge-red">Aberto</span>'
+        rows += f"""<tr>
+            <td style="font-size:12px;color:var(--text3)">{to_br_datetime(e['created_at'])}</td>
+            <td><span class="badge {source_cls}">{esc(e['source'])}</span></td>
+            <td><strong>{esc(e['error_type'] or '—')}</strong></td>
+            <td style="font-size:12px;max-width:400px;color:var(--text2)">{esc((e['error_message'] or '')[:200])}</td>
+            <td style="font-size:11px;color:var(--text3)">{esc(e['email'] or (f'user_{e["user_id"]}' if e['user_id'] else '—'))}</td>
+            <td>{resolved_label}</td>
+            <td>
+                {'<form method="POST" action="/admin/webhook-errors/' + str(e['id']) + '/resolve" style="display:inline">' + csrf_field() + '<button class="btn btn-sm btn-success">Resolver</button></form>' if not e['resolved'] else ''}
+            </td>
+        </tr>"""
+
+    content = f"""<div class="container">
+        <div class="page-header">
+            <h1>🚨 Erros de Webhook</h1>
+            <p>Falhas detectadas nos webhooks para revisão</p>
+        </div>
+
+        <div class="grid-3" style="margin-bottom:24px">
+            <div class="stat-card"><div class="stat-icon stat-icon-red">🚨</div><div class="stat-value">{unresolved}</div><div class="stat-label">Erros abertos</div></div>
+            <div class="stat-card"><div class="stat-icon stat-icon-blue">📋</div><div class="stat-value">{total}</div><div class="stat-label">Total de erros</div></div>
+            <div class="stat-card"><div class="stat-icon stat-icon-green">✅</div><div class="stat-value">{total - unresolved}</div><div class="stat-label">Resolvidos</div></div>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><span class="card-title">Últimos 200 erros</span></div>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Quando</th><th>Fonte</th><th>Tipo</th><th>Mensagem</th><th>Usuário</th><th>Status</th><th>Ação</th></tr></thead>
+                    <tbody>{rows or '<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:40px">✅ Nenhum erro registrado. Tudo funcionando!</td></tr>'}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>"""
+    return admin_html("Erros Webhook", content)
+
+
+@app.route("/admin/webhook-errors/<int:eid>/resolve", methods=["POST"])
+@admin_required
+def admin_resolve_webhook_error(eid):
+    db = get_db()
+    db.execute("UPDATE webhook_errors SET resolved=1 WHERE id=?", (eid,))
+    db.commit()
+    return redirect("/admin/webhook-errors")
 
 
 # ─── ADMIN: PAGAMENTOS ────────────────────────────────────────
@@ -6505,7 +7427,7 @@ def admin_logs():
 def admin_api_settings():
     msg = ""
     if request.method == "POST":
-        keys = ["ANTHROPIC_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY", "MERCADOPAGO_ACCESS_TOKEN", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_APP_SECRET"]
+        keys = ["ANTHROPIC_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY", "MERCADOPAGO_ACCESS_TOKEN", "MP_WEBHOOK_SECRET", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_APP_SECRET"]
         for key in keys:
             value = request.form.get(key, "").strip()
             if value:
@@ -6533,6 +7455,7 @@ def admin_api_settings():
     groq_key = get_setting("GROQ_API_KEY")
     openai_key = get_setting("OPENAI_API_KEY")
     mp_token = get_setting("MERCADOPAGO_ACCESS_TOKEN")
+    mp_webhook_secret = get_setting("MP_WEBHOOK_SECRET", "")
     wa_verify = get_setting("WHATSAPP_VERIFY_TOKEN", "meu_token_verificacao")
     wa_app_secret = get_setting("WHATSAPP_APP_SECRET", "")
     base_url = get_setting("BASE_URL", "http://localhost:8080")
@@ -6589,6 +7512,12 @@ def admin_api_settings():
                     <input type="text" name="MERCADOPAGO_ACCESS_TOKEN" class="form-input" placeholder="APP_USR-..." value="" autocomplete="off"
                         style="background:#2a2a3a;border:2px solid {'var(--green)' if mp_token and mp_token != 'TEST-xxxx' else 'var(--orange)'}">
                     <small style="color:var(--text3)">{'✅ Configurado: ' + mask(mp_token) if mp_token and mp_token != 'TEST-xxxx' else '⚠️ Não configurado — checkout simulado'}</small>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">🔐 MP Webhook Secret (assinatura)</label>
+                    <input type="password" name="MP_WEBHOOK_SECRET" class="form-input" placeholder="{'••••••••' if mp_webhook_secret else 'Chave secreta para validar webhooks'}" value="" autocomplete="off"
+                        style="background:#2a2a3a;border:2px solid {'var(--green)' if mp_webhook_secret else 'var(--orange)'}">
+                    <small style="color:var(--text3)">{'✅ Configurado — webhooks de pagamento serão validados' if mp_webhook_secret else '⚠️ Configure em MP > Webhooks > Secret signature (previne fraude de pagamento)'}</small>
                 </div>
                 <div class="form-group">
                     <label class="form-label">WhatsApp Verify Token</label>
@@ -6765,6 +7694,7 @@ check_production_requirements()
 # Inicializa o banco sempre (necessário para gunicorn no Railway)
 init_db()
 migrate_encrypt_existing_secrets()
+migrate_encrypt_user_tokens()
 
 # Inicia scheduler de posts da agência (em background)
 try:

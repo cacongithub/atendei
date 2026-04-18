@@ -5022,26 +5022,11 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
         order_id = cur.lastrowid
         db_conn.commit()
 
-        # Gera PIX via Mercado Pago
+        # Gera APENAS o link de checkout do Mercado Pago
+        # Esse link já oferece PIX + Cartão Crédito + Cartão Débito + Boleto
+        # O cliente escolhe direto na página do Mercado Pago
         items_names = ", ".join([f"{i['quantity']}x {i['name']}" for i in items_detail])
-        pix = mp_create_pix_payment(
-            user["mp_access_token"],
-            total,
-            f"Pedido #{order_id}: {items_names[:100]}",
-            customer_phone,
-            f"order_{order_id}"
-        )
 
-        if pix:
-            db_conn.execute(
-                """UPDATE orders SET
-                    mp_payment_id=?, mp_qr_code=?, mp_copy_paste=?
-                   WHERE id=?""",
-                (pix["id"], pix["qr_code_base64"], pix["copy_paste"], order_id)
-            )
-            db_conn.commit()
-
-        # Gera link de checkout cartão
         checkout = mp_create_checkout_preference(
             user["mp_access_token"],
             items_json,
@@ -5052,8 +5037,8 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
 
         if checkout:
             db_conn.execute(
-                "UPDATE orders SET mp_checkout_url=? WHERE id=?",
-                (checkout["checkout_url"], order_id)
+                "UPDATE orders SET mp_payment_id=?, mp_checkout_url=? WHERE id=?",
+                (checkout["id"], checkout["checkout_url"], order_id)
             )
             db_conn.commit()
 
@@ -5063,7 +5048,6 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
             "order_id": order_id,
             "total": total,
             "items": items_detail,
-            "pix_copy_paste": pix["copy_paste"] if pix else None,
             "checkout_url": checkout["checkout_url"] if checkout else None
         }
     except Exception as e:
@@ -5072,7 +5056,9 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
 
 
 def format_order_message(order_data):
-    """Formata mensagem bonita com pedido + PIX + link cartão"""
+    """Formata mensagem do pedido com link único de pagamento.
+    O link do Mercado Pago oferece todas as opções: PIX, Cartão Crédito,
+    Cartão Débito e Boleto. O cliente escolhe na página segura do MP."""
     items_text = "\n".join([f"• {i['quantity']}x {i['name']} — R$ {i['subtotal']:.2f}"
                             for i in order_data["items"]])
 
@@ -5083,24 +5069,27 @@ def format_order_message(order_data):
 💰 *Total: R$ {order_data['total']:.2f}*
 
 ━━━━━━━━━━━━━━━━━━━━
-💳 *COMO PAGAR:*
+💳 *COMO PAGAR*
 
-*OPÇÃO 1 — PIX (mais rápido)*
-Copie e cole este código no seu app do banco:
-
-```
-{order_data.get('pix_copy_paste', 'PIX indisponível')}
-```
+Clique no link abaixo para finalizar o pagamento:
 """
     if order_data.get("checkout_url"):
         msg += f"""
-*OPÇÃO 2 — Cartão/Boleto*
-{order_data['checkout_url']}
+👉 {order_data['checkout_url']}
+
+Na página segura do Mercado Pago, você pode escolher:
+✅ PIX (aprovação imediata)
+✅ Cartão de Crédito (até 12x)
+✅ Cartão de Débito
+✅ Boleto Bancário
 """
+    else:
+        msg += "\n⚠️ Link de pagamento indisponível no momento. Por favor, entre em contato."
+
     msg += """
 ━━━━━━━━━━━━━━━━━━━━
-✅ Após o pagamento, confirmarei automaticamente seu pedido!
-⏰ Válido por 24 horas."""
+✅ Após o pagamento, confirmaremos automaticamente seu pedido!
+⏰ Link válido por 24 horas."""
     return msg
 
 

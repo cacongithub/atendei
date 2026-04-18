@@ -1791,6 +1791,7 @@ def admin_html(title, content):
             <a href="/admin/logs" class="nav-link">Logs</a>
             <a href="/admin/audit-log" class="nav-link">📋 Auditoria</a>
             <a href="/admin/webhook-errors" class="nav-link">🚨 Erros</a>
+            <a href="/admin/mp-debug" class="nav-link">🧪 MP Debug</a>
             <a href="/admin/2fa" class="nav-link">🔐 2FA</a>
             <a href="/admin/api-settings" class="nav-link nav-link-accent">APIs</a>
         </div>
@@ -4748,20 +4749,46 @@ def mp_create_pix_payment(access_token, amount, description, payer_phone, extern
 
 
 def mp_create_checkout_preference(access_token, items, payer_phone, external_reference, notification_url):
-    """Cria link de checkout Mercado Pago (cartão/boleto)"""
+    """Cria link de checkout Mercado Pago com TODAS as opções habilitadas:
+    PIX, Cartão de Crédito (até 12x), Cartão de Débito e Boleto.
+
+    Para PIX aparecer corretamente, a conta MP precisa:
+    1. Ter CPF/CNPJ verificado
+    2. Ter PIX habilitado em 'Ferramentas > Meios de pagamento'
+    3. Usar access token de produção (não test)
+    """
     if not access_token:
         return None
     try:
-        import requests as req
+        import requests as req, uuid as uuid_mod
+
         url = "https://api.mercadopago.com/checkout/preferences"
         headers = {
             "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": str(uuid_mod.uuid4())
         }
+
+        # Gera email de placeholder do comprador (MP exige para PIX aparecer)
+        phone_clean = ''.join(c for c in payer_phone if c.isdigit())
+        payer_email = f"customer_{phone_clean[-9:] if len(phone_clean) >= 9 else phone_clean}@atendente.online"
+
+        # Data de expiração: 24h
+        expires_at = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
+
         payload = {
             "items": items,
             "external_reference": external_reference,
             "notification_url": notification_url,
+            "payer": {
+                "email": payer_email,
+                "name": "Cliente",
+                "surname": "WhatsApp",
+                "phone": {
+                    "area_code": phone_clean[2:4] if len(phone_clean) >= 4 else "",
+                    "number": phone_clean[4:] if len(phone_clean) >= 4 else phone_clean
+                }
+            },
             "back_urls": {
                 "success": "https://atendente.online/payment/success",
                 "pending": "https://atendente.online/payment/pending",
@@ -4769,11 +4796,19 @@ def mp_create_checkout_preference(access_token, items, payer_phone, external_ref
             },
             "auto_return": "approved",
             "payment_methods": {
+                # NÃO excluir nenhum método — permite PIX, Cartão, Débito, Boleto
                 "excluded_payment_methods": [],
                 "excluded_payment_types": [],
-                "installments": 12
-            }
+                "installments": 12,
+                "default_installments": 1
+            },
+            "expires": True,
+            "expiration_date_from": datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
+            "expiration_date_to": expires_at,
+            "statement_descriptor": "ATENDENTEONLINE",
+            "binary_mode": False  # False = aceita pagamentos pendentes (PIX, Boleto); True = só cartão instantâneo
         }
+
         resp = req.post(url, headers=headers, json=payload, timeout=15)
         if resp.status_code in (200, 201):
             data = resp.json()
@@ -4782,7 +4817,7 @@ def mp_create_checkout_preference(access_token, items, payer_phone, external_ref
                 "checkout_url": data.get("init_point", ""),
                 "sandbox_url": data.get("sandbox_init_point", "")
             }
-        print(f"[MP CHECKOUT] Erro {resp.status_code}: {resp.text[:200]}")
+        print(f"[MP CHECKOUT] Erro {resp.status_code}: {resp.text[:500]}")
         return None
     except Exception as e:
         print(f"[MP CHECKOUT] Exceção: {e}")
@@ -7037,6 +7072,167 @@ def admin_change_plan(uid):
 
 
 # ─── ADMIN: 2FA (SETUP, DISABLE, AUDIT) ──────────────────────
+# ─── ADMIN: DEBUG MERCADO PAGO ──────────────────────────────────
+@app.route("/admin/mp-debug", methods=["GET", "POST"])
+@admin_required
+def admin_mp_debug():
+    """Testa a geração de link de pagamento do Mercado Pago.
+    Útil para diagnosticar por que PIX não aparece."""
+    result_html = ""
+
+    if request.method == "POST":
+        try:
+            import time as time_mod
+            import json as json_mod
+
+            # Pega dados do formulário
+            user_id = int(request.form.get("user_id", 0))
+            test_amount = float(request.form.get("amount", "10.00"))
+
+            db = get_db()
+            raw_user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            if not raw_user:
+                result_html = '<div class="alert alert-error">❌ Usuário não encontrado</div>'
+            else:
+                user = decrypt_user_row(raw_user)
+                mp_token = user.get("mp_access_token", "")
+
+                if not mp_token:
+                    result_html = '<div class="alert alert-error">❌ Usuário não tem MP token configurado em /dashboard/commerce/settings</div>'
+                else:
+                    # Detecta se é token de teste
+                    is_test = mp_token.startswith("TEST-")
+
+                    # Cria preference de teste
+                    items_test = [{
+                        "title": "Pedido de Teste",
+                        "quantity": 1,
+                        "unit_price": test_amount,
+                        "currency_id": "BRL"
+                    }]
+
+                    checkout = mp_create_checkout_preference(
+                        mp_token,
+                        items_test,
+                        "5585999999999",
+                        f"test_debug_{int(time_mod.time())}",
+                        f"https://atendente.online/webhook/mp-commerce/{user_id}"
+                    )
+
+                    if checkout:
+                        # Consulta os detalhes da preference criada
+                        import requests as req
+                        detail_resp = req.get(
+                            f"https://api.mercadopago.com/checkout/preferences/{checkout['id']}",
+                            headers={"Authorization": f"Bearer {mp_token}"},
+                            timeout=10
+                        )
+
+                        detail = detail_resp.json() if detail_resp.status_code == 200 else {}
+
+                        # Consulta os métodos de pagamento habilitados NA CONTA
+                        methods_resp = req.get(
+                            "https://api.mercadopago.com/v1/payment_methods",
+                            headers={"Authorization": f"Bearer {mp_token}"},
+                            timeout=10
+                        )
+                        methods = methods_resp.json() if methods_resp.status_code == 200 else []
+
+                        # Separa por tipo
+                        pix_methods = [m for m in methods if m.get("id") == "pix" or "pix" in m.get("name", "").lower()]
+                        credit_methods = [m for m in methods if m.get("payment_type_id") == "credit_card"]
+                        debit_methods = [m for m in methods if m.get("payment_type_id") == "debit_card"]
+                        ticket_methods = [m for m in methods if m.get("payment_type_id") == "ticket"]
+
+                        pix_status = "✅ HABILITADO" if pix_methods else "❌ NÃO HABILITADO"
+                        pix_color = "#10b981" if pix_methods else "#ef4444"
+
+                        result_html = f"""
+                        <div class="alert alert-{'warning' if is_test else 'success'}">
+                            {'⚠️ Token de TESTE (sandbox). Em produção use o token real.' if is_test else '✅ Token de PRODUÇÃO'}
+                        </div>
+
+                        <div class="card" style="margin-top:16px">
+                            <div class="card-header"><span class="card-title">🔗 Link gerado</span></div>
+                            <div style="padding:16px">
+                                <p><strong>Preference ID:</strong> <code>{esc(checkout['id'])}</code></p>
+                                <p style="margin-top:12px"><strong>URL:</strong></p>
+                                <a href="{esc(checkout['checkout_url'])}" target="_blank" style="color:#00c896;word-break:break-all">{esc(checkout['checkout_url'])}</a>
+                                <br><br>
+                                <a href="{esc(checkout['checkout_url'])}" target="_blank" class="btn btn-primary">🧪 Abrir link em nova aba</a>
+                            </div>
+                        </div>
+
+                        <div class="card" style="margin-top:16px;border-left:4px solid {pix_color}">
+                            <div class="card-header"><span class="card-title">💰 PIX nesta conta MP: {pix_status}</span></div>
+                            <div style="padding:16px">
+                                {'<p style="color:#10b981">PIX aparece nos métodos disponíveis da conta.</p>' if pix_methods else ''}
+                                {'''<div class="alert alert-error" style="margin:12px 0">
+                                    <strong>⚠️ Para habilitar PIX nesta conta:</strong><br>
+                                    1. Acesse <a href="https://www.mercadopago.com.br/settings/account/pix" target="_blank" style="color:#00c896">mercadopago.com.br/settings/account/pix</a><br>
+                                    2. Cadastre uma chave PIX (CPF, CNPJ, email ou aleatória)<br>
+                                    3. Verifique se sua conta está validada (CPF/CNPJ comprovado)<br>
+                                    4. Aguarde aprovação do MP (pode levar minutos)<br>
+                                    5. Gere um novo link de pagamento
+                                </div>''' if not pix_methods else ''}
+                            </div>
+                        </div>
+
+                        <div class="grid-4" style="margin-top:16px;gap:8px">
+                            <div class="stat-card"><div class="stat-value">{len(credit_methods)}</div><div class="stat-label">Cartões Crédito</div></div>
+                            <div class="stat-card"><div class="stat-value">{len(debit_methods)}</div><div class="stat-label">Cartões Débito</div></div>
+                            <div class="stat-card"><div class="stat-value">{len(ticket_methods)}</div><div class="stat-label">Boletos</div></div>
+                            <div class="stat-card"><div class="stat-value">{len(pix_methods)}</div><div class="stat-label">PIX</div></div>
+                        </div>
+
+                        <div class="card" style="margin-top:16px">
+                            <div class="card-header"><span class="card-title">🔍 Detalhes da Preference</span></div>
+                            <pre style="padding:12px;background:#0a0e14;color:#94a3b8;font-size:11px;overflow-x:auto;border-radius:6px;max-height:300px">{esc(json_mod.dumps(detail, indent=2, ensure_ascii=False)[:3000])}</pre>
+                        </div>
+                        """
+                    else:
+                        result_html = '<div class="alert alert-error">❌ Falha ao criar preference. Verifique o log no console.</div>'
+
+        except Exception as e:
+            result_html = f'<div class="alert alert-error">❌ Erro: {esc(str(e))}</div>'
+
+    # Listar usuários com MP configurado
+    db = get_db()
+    users_raw = db.execute("SELECT id, email FROM users WHERE mp_access_token != '' AND mp_access_token IS NOT NULL ORDER BY id DESC LIMIT 50").fetchall()
+    users_options = ""
+    for u in users_raw:
+        users_options += f'<option value="{u["id"]}">#{u["id"]} — {esc(u["email"])}</option>'
+
+    if not users_options:
+        users_options = '<option value="">Nenhum usuário com MP configurado</option>'
+
+    content = f"""<div class="container">
+        <div class="page-header">
+            <h1>🧪 Debug Mercado Pago</h1>
+            <p>Testa a geração de link e diagnostica por que PIX não aparece</p>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><span class="card-title">Testar geração de link</span></div>
+            <form method="POST" style="padding:16px">{csrf_field()}
+                <div class="form-group">
+                    <label class="form-label">Usuário (com MP configurado)</label>
+                    <select name="user_id" class="form-input" required>{users_options}</select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Valor do teste (R$)</label>
+                    <input type="number" name="amount" class="form-input" value="10.00" step="0.01" min="1" max="1000">
+                    <small style="color:var(--text3)">Recomendado: valor baixo (R$ 1-10) para não gerar cobrança real em teste</small>
+                </div>
+                <button type="submit" class="btn btn-primary">🧪 Gerar link de teste</button>
+            </form>
+        </div>
+
+        {result_html}
+    </div>"""
+    return admin_html("Debug Mercado Pago", content)
+
+
 @app.route("/admin/2fa", methods=["GET", "POST"])
 @admin_required
 def admin_2fa_setup():

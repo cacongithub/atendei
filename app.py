@@ -4668,9 +4668,7 @@ def commerce_dashboard():
 
     # Últimos pedidos
     orders = db.execute(
-        """SELECT o.*, c.last_message
-           FROM orders o
-           LEFT JOIN conversations c ON o.conversation_id=c.id
+        """SELECT o.* FROM orders o
            WHERE o.user_id=?
            ORDER BY o.created_at DESC LIMIT 20""",
         (user["id"],)

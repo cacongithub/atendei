@@ -5498,6 +5498,33 @@ def generate_ai_response(user, conversation_id, message, db_conn):
     if matched_product:
         gallery_note = f"\n\n⚠️ IMPORTANTE: O sistema JÁ VAI ENVIAR automaticamente a foto de '{matched_product['name']}' para o cliente junto com sua resposta. NÃO diga que não pode enviar foto. NÃO mencione que vai enviar a foto (ela já está sendo enviada). Apenas responda normalmente descrevendo o produto ou confirmando o pedido."
 
+    # Info sobre comércio se estiver ativo
+    commerce_note = ""
+    if user["commerce_enabled"] and user["mp_access_token"]:
+        products_with_price = db_conn.execute(
+            "SELECT name, price FROM product_gallery WHERE user_id=? AND active=1 AND price > 0",
+            (user["id"],)
+        ).fetchall()
+        if products_with_price:
+            prices_text = "\n".join([f"- {p['name']}: R$ {p['price']:.2f}" for p in products_with_price])
+            commerce_note = f"""
+
+🛒 SISTEMA DE PAGAMENTO ATIVO:
+Este sistema ACEITA pagamentos automaticamente! Quando o cliente pedir para comprar, o sistema gera:
+- PIX instantâneo (copia e cola)
+- Link de cartão de crédito/débito (Mercado Pago)
+- Link de boleto
+
+PRODUTOS COM PREÇO (aceitam compra direto no WhatsApp):
+{prices_text}
+
+REGRAS DE VENDA:
+- NUNCA diga "não aceitamos pagamento pelo WhatsApp" — aceita sim!
+- Quando o cliente disser "quero comprar X" ou pedir o produto, o sistema gera PIX e link automaticamente.
+- Você apenas confirma o pedido naturalmente e explica que vai gerar os dados de pagamento.
+- Exemplo: "Ótimo! Vou gerar seu PIX agora mesmo, só um instante..."
+- Se o cliente perguntar se aceita cartão/PIX: SIM, aceitamos ambos."""
+
     system_prompt = f"""{user['ai_system_prompt']}
 
 Tom: {tone_map.get(user['ai_tone'],'Profissional.')}
@@ -5509,7 +5536,7 @@ RESPOSTAS RÁPIDAS DISPONÍVEIS:
 {qr_context or 'Nenhuma.'}
 
 FOTOS DE PRODUTOS DISPONÍVEIS (enviadas automaticamente quando o cliente pedir):
-{gallery_context or 'Nenhuma foto cadastrada.'}
+{gallery_context or 'Nenhuma foto cadastrada.'}{commerce_note}
 
 REGRAS:
 - Responda de forma breve (máx 3 parágrafos curtos)

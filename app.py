@@ -2805,7 +2805,11 @@ def mp_callback():
     if status == "success" and simulated == "1":
         if not is_dev:
             # Em produção, simulação está DESABILITADA — registra tentativa suspeita
-            print(f"[SECURITY] Tentativa de bypass com simulated=1 por user {user['id']} ({user.get('email','')})")
+            try:
+                user_email = user["email"]
+            except:
+                user_email = ""
+            print(f"[SECURITY] Tentativa de bypass com simulated=1 por user {user['id']} ({user_email})")
             return redirect("/dashboard/billing?error=Operação não permitida")
         # Em dev, permite simular
         pid = f"sim_{int(time.time())}"
@@ -4355,11 +4359,28 @@ def detect_purchase_intent(message, products):
         if not api_key or not products:
             return None
 
-        products_text = "\n".join([
-            f"- ID:{p['id']} | {p['name']} | R$ {p['price']:.2f}"
-            + (f" (estoque: {p['stock']})" if p['stock'] >= 0 else "")
-            for p in products if p.get('active', 1) and p.get('price', 0) > 0
-        ])
+        def _get(p, key, default=None):
+            try:
+                if hasattr(p, 'get') and not hasattr(p, 'keys'):
+                    return p.get(key, default)
+                val = p[key]
+                return val if val is not None else default
+            except (KeyError, IndexError, TypeError):
+                return default
+
+        products_text_lines = []
+        for p in products:
+            active = _get(p, 'active', 1)
+            price = _get(p, 'price', 0) or 0
+            if not active or price <= 0:
+                continue
+            stock = _get(p, 'stock', -1)
+            line = f"- ID:{p['id']} | {p['name']} | R$ {price:.2f}"
+            if stock is not None and stock >= 0:
+                line += f" (estoque: {stock})"
+            products_text_lines.append(line)
+
+        products_text = "\n".join(products_text_lines)
 
         if not products_text:
             return None
@@ -5855,10 +5876,22 @@ def gallery():
     if products:
         for p in products:
             img_url = f"/media/gallery/{p['id']}"
-            price_html = f'<div style="background:rgba(16,185,129,0.15);color:#10b981;padding:4px 10px;border-radius:6px;display:inline-block;font-weight:600;font-size:13px;margin-bottom:8px">💰 R$ {(p["price"] or 0):.2f}</div>' if (p.get("price") or 0) > 0 else '<div style="background:rgba(239,68,68,0.15);color:#ef4444;padding:4px 10px;border-radius:6px;display:inline-block;font-size:12px;margin-bottom:8px">⚠️ Sem preço</div>'
+            # Helper para pegar coluna com fallback (sqlite3.Row não tem .get)
+            def _col(row, key, default=None):
+                try:
+                    val = row[key]
+                    return val if val is not None else default
+                except (KeyError, IndexError):
+                    return default
+
+            p_price = _col(p, 'price', 0) or 0
+            p_stock = _col(p, 'stock', -1)
+            p_active = _col(p, 'active', 1)
+
+            price_html = f'<div style="background:rgba(16,185,129,0.15);color:#10b981;padding:4px 10px;border-radius:6px;display:inline-block;font-weight:600;font-size:13px;margin-bottom:8px">💰 R$ {p_price:.2f}</div>' if p_price > 0 else '<div style="background:rgba(239,68,68,0.15);color:#ef4444;padding:4px 10px;border-radius:6px;display:inline-block;font-size:12px;margin-bottom:8px">⚠️ Sem preço</div>'
             stock_html = ''
-            if p.get("stock", -1) >= 0:
-                stock_html = f'<div style="color:var(--text3);font-size:11px;margin-bottom:8px">Estoque: <strong>{p["stock"]}</strong></div>'
+            if p_stock is not None and p_stock >= 0:
+                stock_html = f'<div style="color:var(--text3);font-size:11px;margin-bottom:8px">Estoque: <strong>{p_stock}</strong></div>'
             products_html += f"""
             <div class="card" style="padding:16px">
                 <img src="{img_url}" style="width:100%;height:180px;object-fit:cover;border-radius:8px;margin-bottom:12px" alt="{esc(p['name'])}">
@@ -5870,7 +5903,7 @@ def gallery():
                 <div style="display:flex;gap:6px">
                     <form method="POST" action="/dashboard/gallery/{p['id']}/update-price" style="flex:1;margin:0">{csrf_field()}
                         <div style="display:flex;gap:4px">
-                            <input type="number" step="0.01" name="price" value="{p.get('price', 0) or 0}"
+                            <input type="number" step="0.01" name="price" value="{p_price}"
                                    style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.1);padding:6px 8px;border-radius:6px;color:var(--text);width:70%;font-size:12px"
                                    placeholder="Preço">
                             <button type="submit" class="btn btn-sm" style="background:var(--accent2);color:white;width:30%;font-size:11px;padding:6px">💾</button>

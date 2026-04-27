@@ -1772,7 +1772,7 @@ def base_html(title, content, user=None):
                 <span class="user-name">{user['name']}</span>
                 <a href="/logout" class="btn-logout">Sair</a>
             </div></div></nav>"""
-    return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+    return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><link rel="icon" type="image/png" href="/favicon.ico"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#6366f1">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>{title} — atendente.online</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1799,7 +1799,7 @@ def admin_html(title, content):
             <span class="user-plan" style="background:rgba(239,68,68,0.15);color:var(--red)">ADMIN</span>
             <a href="/admin/logout" class="btn-logout">Sair</a>
         </div></div></nav>"""
-    return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+    return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><link rel="icon" type="image/png" href="/favicon.ico"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#6366f1">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>{title} — Admin Atende.AI</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -3155,7 +3155,7 @@ def mp_create_preference():
         is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
         if not is_dev:
             return redirect("/dashboard/billing?error=Sistema de pagamento indisponível")
-        return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Checkout Simulado (DEV)</title>
+        return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><link rel="icon" type="image/png" href="/favicon.ico"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#6366f1"><title>Checkout Simulado (DEV)</title>
         <style>body{{font-family:'DM Sans',sans-serif;background:#0a0e14;color:#f0f4f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
         .box{{background:#111827;padding:40px;border-radius:16px;max-width:400px;text-align:center;border:1px solid rgba(255,255,255,0.1)}}
         .price{{font-size:36px;font-weight:700;color:#34d399;margin:16px 0}}.btn{{display:inline-block;padding:14px 32px;background:#00c896;color:white;border-radius:8px;text-decoration:none;font-weight:600}}
@@ -3335,7 +3335,7 @@ def print_conversation(conv_id):
         content = esc(m["content"])
         msgs_html += f'<div style="background:{bg};padding:12px;margin-bottom:8px;border-radius:8px"><div style="font-size:12px;color:#666;margin-bottom:4px"><strong>{sender}</strong> — {date}</div><div>{content}</div></div>'
 
-    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><link rel="icon" type="image/png" href="/favicon.ico"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#6366f1">
 <title>Conversa — {esc(conv['customer_name'] or conv['customer_phone'])}</title>
 <style>
 body{{font-family:Arial,sans-serif;max-width:800px;margin:0 auto;padding:24px;background:#fff;color:#000}}
@@ -4817,11 +4817,23 @@ def mp_create_checkout_preference(access_token, items, payer_phone, external_ref
                 "checkout_url": data.get("init_point", ""),
                 "sandbox_url": data.get("sandbox_init_point", "")
             }
-        print(f"[MP CHECKOUT] Erro {resp.status_code}: {resp.text[:500]}")
-        return None
+
+        # Erro — log detalhado
+        error_detail = resp.text[:500]
+        print(f"[MP CHECKOUT] Erro {resp.status_code}: {error_detail}")
+
+        # Retorna informação do erro para o admin poder ver
+        return {
+            "error": True,
+            "status_code": resp.status_code,
+            "detail": error_detail
+        }
     except Exception as e:
         print(f"[MP CHECKOUT] Exceção: {e}")
-        return None
+        return {
+            "error": True,
+            "detail": str(e)
+        }
 
 
 def detect_purchase_intent(message, products):
@@ -5070,7 +5082,10 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
             f"https://atendente.online/webhook/mp-commerce/{user['id']}"
         )
 
-        if checkout:
+        # Verifica se é resposta de erro
+        is_valid = checkout and not checkout.get("error") and checkout.get("checkout_url")
+
+        if is_valid:
             db_conn.execute(
                 "UPDATE orders SET mp_payment_id=?, mp_checkout_url=? WHERE id=?",
                 (checkout["id"], checkout["checkout_url"], order_id)
@@ -5083,7 +5098,7 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
             "order_id": order_id,
             "total": total,
             "items": items_detail,
-            "checkout_url": checkout["checkout_url"] if checkout else None
+            "checkout_url": checkout["checkout_url"] if is_valid else None
         }
     except Exception as e:
         print(f"[ORDER] Erro: {e}")
@@ -6813,7 +6828,7 @@ def admin_login():
         session.pop("admin_awaiting_2fa", None)
         return redirect("/admin/login")
 
-    return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+    return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><link rel="icon" type="image/png" href="/favicon.ico"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#6366f1"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Admin — atendente.online</title><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>{GLOBAL_CSS}</style></head><body>
 <div class="auth-container"><div class="auth-card" style="border-top:3px solid var(--red)">
@@ -7119,7 +7134,51 @@ def admin_mp_debug():
                         f"https://atendente.online/webhook/mp-commerce/{user_id}"
                     )
 
-                    if checkout:
+                    # Trata erro 403 e outros do MP
+                    if checkout and checkout.get("error"):
+                        status_code = checkout.get("status_code", "?")
+                        detail = checkout.get("detail", "")
+
+                        # Erro 403 = permissão / PolicyAgent
+                        if status_code == 403 or "PolicyAgent" in detail or "UNAUTHORIZED" in detail:
+                            result_html = f'''
+                            <div class="alert alert-error">
+                                ❌ <strong>Erro 403 — Token sem permissão</strong>
+                            </div>
+                            <div class="card" style="margin-top:16px;border-left:4px solid #ef4444">
+                                <div class="card-header"><span class="card-title">🚨 Diagnóstico</span></div>
+                                <div style="padding:16px">
+                                    <p style="margin-bottom:12px">O Mercado Pago bloqueou a criação do link. Isso acontece quando:</p>
+                                    <ul style="list-style:none;padding-left:0;line-height:2">
+                                        <li><strong>1.</strong> Token foi gerado em aplicação que NÃO tem "Checkout Pro" habilitado</li>
+                                        <li><strong>2.</strong> Conta MP não está verificada (CPF/CNPJ pendente)</li>
+                                        <li><strong>3.</strong> Credenciais de produção ainda não foram liberadas</li>
+                                        <li><strong>4.</strong> Token foi revogado/expirou</li>
+                                    </ul>
+
+                                    <div class="alert alert-info" style="margin-top:16px">
+                                        <strong>💡 Solução rápida:</strong><br><br>
+                                        1. Acesse <a href="https://www.mercadopago.com.br/developers/panel/app" target="_blank" style="color:#00c896">mercadopago.com.br/developers/panel/app</a><br>
+                                        2. Crie uma NOVA aplicação marcando <strong>"Checkout Pro"</strong> nos produtos<br>
+                                        3. Pegue o token em <strong>"Credenciais de teste"</strong> (começa com <code>TEST-</code>)<br>
+                                        4. Cole no sistema em <a href="/dashboard/commerce/settings" style="color:#00c896">/dashboard/commerce/settings</a><br>
+                                        5. Teste aqui novamente<br><br>
+                                        Depois de homologar, use as <strong>"Credenciais de produção"</strong> (APP_USR-).
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card" style="margin-top:16px">
+                                <div class="card-header"><span class="card-title">📋 Resposta bruta do MP</span></div>
+                                <pre style="padding:12px;background:#0a0e14;color:#94a3b8;font-size:11px;overflow-x:auto;border-radius:6px">Status: {status_code}\\n{esc(detail)}</pre>
+                            </div>
+                            '''
+                        else:
+                            result_html = f'''
+                            <div class="alert alert-error">
+                                ❌ Erro {status_code}: {esc(detail[:200])}
+                            </div>
+                            '''
+                    elif checkout and checkout.get("checkout_url"):
                         # Consulta os detalhes da preference criada
                         import requests as req
                         detail_resp = req.get(
@@ -7886,6 +7945,53 @@ try:
     start_social_scheduler()
 except Exception as e:
     print(f"[SCHEDULER] Não foi possível iniciar: {e}")
+
+
+# ─── FAVICON (logo na aba do navegador) ───────────────────
+@app.route("/favicon.ico")
+def favicon():
+    """Serve o logo como favicon para aparecer na aba do navegador"""
+    import base64 as b64
+    from flask import Response
+    try:
+        png_bytes = b64.b64decode(LOGO_NAV_B64)
+        return Response(png_bytes, mimetype="image/png", headers={
+            "Cache-Control": "public, max-age=86400"
+        })
+    except Exception as e:
+        print(f"[FAVICON] Erro: {e}")
+        return Response(status=404)
+
+
+@app.route("/apple-touch-icon.png")
+@app.route("/apple-touch-icon-precomposed.png")
+def apple_touch_icon():
+    """Ícone para iOS quando salvar como atalho na tela inicial"""
+    import base64 as b64
+    from flask import Response
+    try:
+        png_bytes = b64.b64decode(LOGO_NAV_B64)
+        return Response(png_bytes, mimetype="image/png", headers={
+            "Cache-Control": "public, max-age=86400"
+        })
+    except Exception as e:
+        print(f"[APPLE ICON] Erro: {e}")
+        return Response(status=404)
+
+
+@app.route("/icon-192.png")
+def icon_192():
+    """Ícone PWA"""
+    import base64 as b64
+    from flask import Response
+    try:
+        png_bytes = b64.b64decode(LOGO_NAV_B64)
+        return Response(png_bytes, mimetype="image/png", headers={
+            "Cache-Control": "public, max-age=86400"
+        })
+    except:
+        return Response(status=404)
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))

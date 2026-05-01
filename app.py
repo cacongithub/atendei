@@ -2435,7 +2435,7 @@ def conversations():
                 <div class="chat-messages" id="chat-messages">{msgs_html}</div>
                 <div style="padding:16px 24px;border-top:1px solid rgba(255,255,255,0.06);display:flex;gap:8px">
                     <input type="text" class="form-input" id="msg-input" placeholder="Digite..." style="flex:1" onkeydown="if(event.key==='Enter')sendMsg()">
-                    <button class="btn btn-primary" onclick="sendMsg()">Enviar</button></div></div></div></div>
+                    <button class="btn btn-primary" id="send-btn" onclick="sendMsg()">Enviar</button></div></div></div></div>
     <script nonce="{g.csp_nonce}">
     let activeConvId = {first_id or 0};
     let lastMsgCount = 0;
@@ -2470,11 +2470,15 @@ def conversations():
         box.innerHTML='';
         messages.forEach(m=>{{
             const div=document.createElement('div');
-            div.className='msg '+(m.sender==='bot'?'msg-bot':'msg-customer');
+            // bot e human aparecem do lado direito (saída); customer do lado esquerdo (entrada)
+            const isFromUs = m.sender==='bot' || m.sender==='human';
+            div.className='msg '+(isFromUs?'msg-bot':'msg-customer');
             div.textContent=m.content;
             const t=document.createElement('div');
             t.className='msg-time';
-            t.textContent=formatBrTime(m.created_at);
+            // Indica visualmente quando foi humano vs bot
+            const senderLabel = m.sender==='human' ? '👤 ' : (m.sender==='bot' ? '🤖 ' : '');
+            t.textContent=senderLabel+formatBrTime(m.created_at);
             div.appendChild(t);
             box.appendChild(div);
         }});
@@ -2530,11 +2534,59 @@ def conversations():
     setInterval(refreshMessages, 3000);
     setInterval(refreshSidebar, 10000);
 
-    function sendMsg(){{const i=document.getElementById('msg-input');if(!i.value.trim())return;
-        const b=document.getElementById('chat-messages');
-        const div=document.createElement('div');div.className='msg msg-bot';div.textContent=i.value;
-        const t=document.createElement('div');t.className='msg-time';t.textContent='agora';
-        div.appendChild(t);b.appendChild(div);b.scrollTop=b.scrollHeight;i.value=''}}
+    function sendMsg(){{
+        if(!activeConvId){{ alert('Selecione uma conversa primeiro'); return; }}
+        const i = document.getElementById('msg-input');
+        const msg = i.value.trim();
+        if(!msg) return;
+
+        // Desabilita botão durante envio
+        const sendBtn = document.getElementById('send-btn');
+        if(sendBtn) sendBtn.disabled = true;
+
+        // Adiciona mensagem na tela com indicador "enviando..."
+        const b = document.getElementById('chat-messages');
+        const div = document.createElement('div');
+        div.className = 'msg msg-bot';
+        div.style.opacity = '0.6';
+        div.textContent = msg;
+        const t = document.createElement('div');
+        t.className = 'msg-time';
+        t.textContent = 'enviando...';
+        div.appendChild(t);
+        b.appendChild(div);
+        b.scrollTop = b.scrollHeight;
+        i.value = '';
+
+        // Envia para o backend que envia via WhatsApp API
+        fetch('/api/conversations/' + activeConvId + '/send', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{message: msg}})
+        }})
+        .then(r => r.json().then(d => ({{ok: r.ok, data: d}})))
+        .then(({{ok, data}}) => {{
+            if(sendBtn) sendBtn.disabled = false;
+            if(ok && data.success){{
+                div.style.opacity = '1';
+                t.textContent = 'enviado ✓';
+                // Recarrega mensagens para sincronizar
+                setTimeout(refreshMessages, 500);
+            }} else {{
+                div.style.background = 'rgba(239,68,68,0.2)';
+                div.style.borderLeft = '3px solid #ef4444';
+                t.textContent = '❌ ' + (data.error || 'falha ao enviar');
+                t.style.color = '#ef4444';
+            }}
+        }})
+        .catch(err => {{
+            if(sendBtn) sendBtn.disabled = false;
+            div.style.background = 'rgba(239,68,68,0.2)';
+            t.textContent = '❌ erro de conexão';
+            t.style.color = '#ef4444';
+            console.error('Erro ao enviar:', err);
+        }});
+    }}
     function filterChats(q){{document.querySelectorAll('.chat-item').forEach(i=>{{i.style.display=i.textContent.toLowerCase().includes(q.toLowerCase())?'':'none'}})}}
     function toggleHuman(){{alert('Você assumiu o atendimento desta conversa!')}}
 
@@ -3242,6 +3294,74 @@ def api_conv_messages(conv_id):
     if not conv: return jsonify({"error":"Não encontrada"}), 404
     messages = db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (conv_id,)).fetchall()
     return jsonify({"customer_phone":conv["customer_phone"],"customer_name":conv["customer_name"],"messages":[dict(m) for m in messages]})
+
+
+@app.route("/api/conversations/<int:conv_id>/send", methods=["POST"])
+@login_required
+def api_conv_send_message(conv_id):
+    """Envia mensagem manual do atendente para o cliente.
+    O atendente digita no painel e o sistema envia via WhatsApp Business API."""
+    try:
+        data = request.get_json(silent=True) or {}
+        message = (data.get("message") or "").strip()
+
+        if not message:
+            return jsonify({"error": "Mensagem vazia"}), 400
+
+        if len(message) > 4096:
+            return jsonify({"error": "Mensagem muito longa (máx 4096 caracteres)"}), 400
+
+        db = get_db()
+
+        # Valida que a conversa pertence ao usuário
+        conv = db.execute(
+            "SELECT * FROM conversations WHERE id=? AND user_id=?",
+            (conv_id, g.user["id"])
+        ).fetchone()
+        if not conv:
+            return jsonify({"error": "Conversa não encontrada"}), 404
+
+        # Pega tokens do usuário (já descriptografados pelo login_required)
+        user = g.user
+        phone_id = user.get("whatsapp_phone_id", "")
+        token = user.get("whatsapp_token", "")
+
+        if not phone_id or not token:
+            return jsonify({
+                "error": "WhatsApp não configurado. Vá em Configurações."
+            }), 400
+
+        # Envia via WhatsApp API
+        result = send_whatsapp_message(phone_id, token, conv["customer_phone"], message)
+
+        if not result or not result.get("success"):
+            error_msg = result.get("error", "Falha desconhecida") if result else "Sem resposta da API"
+            return jsonify({
+                "error": f"Falha ao enviar: {error_msg}"
+            }), 500
+
+        # Registra no banco como mensagem do atendente humano
+        db.execute(
+            """INSERT INTO messages (conversation_id, sender, content, msg_type)
+               VALUES (?, ?, ?, ?)""",
+            (conv_id, "human", message, "text")
+        )
+
+        # Atualiza timestamp da conversa
+        db.execute(
+            "UPDATE conversations SET last_message_at=datetime('now') WHERE id=?",
+            (conv_id,)
+        )
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Mensagem enviada"
+        })
+
+    except Exception as e:
+        print(f"[SEND MANUAL] Erro: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/conversations")
@@ -6232,7 +6352,7 @@ def send_whatsapp_message(phone_id, token, to, message):
     print(f"[WA SEND] Tentando enviar para {to}...")
     if not phone_id or not token:
         print(f"[WA SEND] ERRO: Phone ID ou Token vazio!")
-        return
+        return {"success": False, "error": "Phone ID ou Token não configurado"}
     try:
         import requests as req
         url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
@@ -6242,10 +6362,19 @@ def send_whatsapp_message(phone_id, token, to, message):
         if resp.status_code != 200:
             print(f"[WA SEND] ERRO! Status {resp.status_code}")
             print(f"[WA SEND] Resposta: {resp.text[:300]}")
+            # Tenta extrair erro humanizado da resposta
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get("error", {}).get("message", resp.text[:200])
+            except:
+                err_msg = resp.text[:200]
+            return {"success": False, "error": err_msg, "status_code": resp.status_code}
         else:
             print(f"[WA SEND] ✓ Mensagem enviada para {to}")
+            return {"success": True}
     except Exception as e:
         print(f"[WA SEND] EXCEÇÃO: {e}")
+        return {"success": False, "error": str(e)}
 
 
 def prepare_tts_text(text):

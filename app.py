@@ -1753,7 +1753,7 @@ def base_html(title, content, user=None):
         plan_name = PLANS.get(user['plan'],{}).get('name','')
         nav = f"""<nav class="nav-main"><div class="nav-inner">
             <a href="/dashboard"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" class="nav-logo-img"></a>
-            <button class="nav-toggle" onclick="document.querySelector('.nav-links').classList.toggle('open')" aria-label="Menu">☰</button>
+            <button class="nav-toggle" id="nav-toggle-btn" aria-label="Menu">☰</button>
             <div class="nav-links">
                 <a href="/dashboard" class="nav-link">Dashboard</a>
                 <a href="/dashboard/conversations" class="nav-link">Conversas</a>
@@ -1776,13 +1776,26 @@ def base_html(title, content, user=None):
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>{title} — atendente.online</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>{GLOBAL_CSS}</style></head><body>{nav}{content}</body></html>"""
+<style>{GLOBAL_CSS}</style></head><body>{nav}{content}
+<script nonce="{g.csp_nonce}">
+// Hamburger menu toggle (CSP-compliant)
+(function(){{
+    var btn = document.getElementById('nav-toggle-btn');
+    if(btn){{
+        btn.addEventListener('click', function(){{
+            var links = document.querySelector('.nav-links');
+            if(links) links.classList.toggle('open');
+        }});
+    }}
+}})();
+</script>
+</body></html>"""
 
 
 def admin_html(title, content):
     nav = f"""<nav class="nav-main admin-nav"><div class="nav-inner">
         <a href="/admin" style="display:flex;align-items:center;gap:10px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" class="nav-logo-img"><span class="admin-badge">ADMIN</span></a>
-        <button class="nav-toggle" onclick="document.querySelector('.admin-nav .nav-links').classList.toggle('open')" aria-label="Menu">☰</button>
+        <button class="nav-toggle" id="admin-nav-toggle-btn" aria-label="Menu">☰</button>
         <div class="nav-links">
             <a href="/admin" class="nav-link">Dashboard</a>
             <a href="/admin/users" class="nav-link">Clientes</a>
@@ -1803,7 +1816,20 @@ def admin_html(title, content):
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>{title} — Admin Atende.AI</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>{GLOBAL_CSS}</style></head><body>{nav}{content}</body></html>"""
+<style>{GLOBAL_CSS}</style></head><body>{nav}{content}
+<script nonce="{g.csp_nonce}">
+// Admin hamburger toggle (CSP-compliant)
+(function(){{
+    var btn = document.getElementById('admin-nav-toggle-btn');
+    if(btn){{
+        btn.addEventListener('click', function(){{
+            var links = document.querySelector('.admin-nav .nav-links');
+            if(links) links.classList.toggle('open');
+        }});
+    }}
+}})();
+</script>
+</body></html>"""
 
 
 # ─── HELPER FUNCTIONS ──────────────────────────────────────────
@@ -2406,7 +2432,7 @@ def conversations():
         except (KeyError, IndexError):
             channel = "whatsapp"
         icon = channel_icons.get(channel, "🟢")
-        sidebar_items += f'<div class="chat-item {active}" onclick="loadConversation({int(c["id"])},this)"><span class="chat-item-time">{icon} {date}</span><div class="chat-item-name">{name}</div><div class="chat-item-preview">{preview}</div></div>'
+        sidebar_items += f'<div class="chat-item {active}" data-conv-id="{int(c["id"])}"><span class="chat-item-time">{icon} {date}</span><div class="chat-item-name">{name}</div><div class="chat-item-preview">{preview}</div></div>'
 
     if first_id:
         messages = db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (first_id,)).fetchall()
@@ -2426,16 +2452,16 @@ def conversations():
     content = f"""<div class="container"><div class="page-header"><h1>Conversas <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--green2);font-weight:500;background:rgba(0,200,150,0.1);padding:4px 12px;border-radius:20px;vertical-align:middle"><span style="width:8px;height:8px;border-radius:50%;background:var(--green2);display:inline-block;animation:pulse 2s infinite"></span> ao vivo</span></h1><p>{len(convos)} conversas <a href="/dashboard/conversations/export" class="btn btn-sm btn-secondary" style="margin-left:12px">📥 Exportar CSV</a></p></div>
     <style>@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:0.3}}}}</style>
         <div class="chat-container"><div class="chat-sidebar"><div class="chat-sidebar-header">
-            <input type="text" class="form-input" placeholder="Buscar..." style="font-size:13px;padding:8px 12px" oninput="filterChats(this.value)">
+            <input type="text" class="form-input" id="search-chats" placeholder="Buscar..." style="font-size:13px;padding:8px 12px">
             </div><div id="chat-list">{sidebar_items}</div></div>
             <div class="chat-main"><div class="chat-header"><div><strong id="chat-name">{first_name}</strong>
                 <span style="color:var(--text3);font-size:12px" id="chat-phone">{first_phone}</span></div>
                 <div><a href="/dashboard/conversations/{first_id}/export" class="btn btn-sm btn-secondary" style="margin-right:8px">📥 Exportar</a>
-                <button class="btn btn-secondary btn-sm" onclick="toggleHuman()">🙋 Assumir</button></div></div>
+                <button class="btn btn-secondary btn-sm" id="assume-btn">🙋 Assumir</button></div></div>
                 <div class="chat-messages" id="chat-messages">{msgs_html}</div>
                 <div style="padding:16px 24px;border-top:1px solid rgba(255,255,255,0.06);display:flex;gap:8px">
-                    <input type="text" class="form-input" id="msg-input" placeholder="Digite..." style="flex:1" onkeydown="if(event.key==='Enter')sendMsg()">
-                    <button class="btn btn-primary" id="send-btn" onclick="sendMsg()">Enviar</button></div></div></div></div>
+                    <input type="text" class="form-input" id="msg-input" placeholder="Digite..." style="flex:1">
+                    <button class="btn btn-primary" id="send-btn">Enviar</button></div></div></div></div>
     <script nonce="{g.csp_nonce}">
     let activeConvId = {first_id or 0};
     let lastMsgCount = 0;
@@ -2516,7 +2542,7 @@ def conversations():
             data.conversations.forEach(c=>{{
                 const div=document.createElement('div');
                 div.className='chat-item '+(c.id===activeConvId?'active':'');
-                div.onclick=function(){{loadConversation(c.id,div)}};
+                div.dataset.convId = c.id;
                 const time=document.createElement('span');
                 time.className='chat-item-time';
                 time.textContent=formatBrDate(c.last_message_at);
@@ -2596,6 +2622,47 @@ def conversations():
 
     const box=document.getElementById('chat-messages');
     if(box) box.scrollTop=box.scrollHeight;
+
+    // ─── EVENT LISTENERS (CSP-compliant) ─────────────────────
+    // Substitui onclick="..." inline por addEventListener,
+    // que é permitido pelo CSP nonce.
+    const sendBtn = document.getElementById('send-btn');
+    if(sendBtn){{
+        sendBtn.addEventListener('click', sendMsg);
+    }}
+
+    const msgInput = document.getElementById('msg-input');
+    if(msgInput){{
+        msgInput.addEventListener('keydown', function(e){{
+            if(e.key === 'Enter'){{
+                e.preventDefault();
+                sendMsg();
+            }}
+        }});
+    }}
+
+    const assumeBtn = document.getElementById('assume-btn');
+    if(assumeBtn){{
+        assumeBtn.addEventListener('click', toggleHuman);
+    }}
+
+    const searchInput = document.getElementById('search-chats');
+    if(searchInput){{
+        searchInput.addEventListener('input', function(e){{
+            filterChats(e.target.value);
+        }});
+    }}
+
+    // Delegação de evento para chat-items (que podem ser recriados dinamicamente)
+    const chatList = document.getElementById('chat-list');
+    if(chatList){{
+        chatList.addEventListener('click', function(e){{
+            const item = e.target.closest('.chat-item');
+            if(item && item.dataset.convId){{
+                loadConversation(parseInt(item.dataset.convId), item);
+            }}
+        }});
+    }}
     </script>"""
     return base_html("Conversas", content, dict(user))
 

@@ -2439,6 +2439,7 @@ def conversations():
     <script nonce="{g.csp_nonce}">
     let activeConvId = {first_id or 0};
     let lastMsgCount = 0;
+    const CSRF_TOKEN = '{generate_csrf_token()}';
 
     function formatBrTime(utcStr){{
         // Converte 'YYYY-MM-DD HH:MM:SS' (UTC) para HH:MM de Brasília
@@ -2561,7 +2562,10 @@ def conversations():
         // Envia para o backend que envia via WhatsApp API
         fetch('/api/conversations/' + activeConvId + '/send', {{
             method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
+            headers: {{
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': CSRF_TOKEN
+            }},
             body: JSON.stringify({{message: msg}})
         }})
         .then(r => r.json().then(d => ({{ok: r.ok, data: d}})))

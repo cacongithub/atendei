@@ -91,6 +91,7 @@ app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
 app.config['SESSION_COOKIE_SECURE'] = os.getenv("FLASK_ENV") != "development"
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=12)
 
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "TEST-xxxx")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", secrets.token_hex(16))
@@ -169,13 +170,12 @@ def add_security_headers(response):
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
     # Content Security Policy
-    # Nota: 'unsafe-inline' em script-src + nonce permite handlers inline (onclick/onkeydown)
-    # usados nos templates atuais. Ainda bloqueia eval() e scripts dinâmicos.
-    # Para uma CSP ainda mais forte, seria preciso refatorar handlers inline para addEventListener.
+    # Handlers inline foram migrados para addEventListener, então script-src
+    # pode depender apenas de nonce sem 'unsafe-inline'.
     nonce = getattr(g, 'csp_nonce', '')
     csp = (
         "default-src 'self'; "
-        f"script-src 'self' 'unsafe-inline' 'nonce-{nonce}'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com data:; "
         "img-src 'self' data: https:; "
@@ -411,6 +411,7 @@ def init_db():
         content TEXT NOT NULL,
         msg_type TEXT DEFAULT 'text',
         media_url TEXT DEFAULT '',
+        external_message_id TEXT DEFAULT '',
         created_at TEXT DEFAULT (datetime('now')),
         FOREIGN KEY (conversation_id) REFERENCES conversations(id)
     );
@@ -602,6 +603,15 @@ def init_db():
         resolved INTEGER DEFAULT 0,
         created_at TEXT DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS processed_webhook_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        event_key TEXT NOT NULL,
+        user_id INTEGER,
+        payload_preview TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(source, event_key)
+    );
     CREATE TABLE IF NOT EXISTS admin_audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         action TEXT NOT NULL,
@@ -675,12 +685,25 @@ def init_db():
         ("conversations", "notes", "TEXT DEFAULT ''"),
         ("conversations", "channel", "TEXT DEFAULT 'whatsapp'"),
         ("messages", "media_url", "TEXT DEFAULT ''"),
+        ("messages", "external_message_id", "TEXT DEFAULT ''"),
     ]
     for table, column, col_type in migrations:
         try:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
         except sqlite3.OperationalError:
             pass
+    try:
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_webhook_events_unique ON processed_webhook_events(source, event_key)")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        db.execute("CREATE INDEX IF NOT EXISTS idx_users_whatsapp_phone_id ON users(whatsapp_phone_id)")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_external_message_id ON messages(external_message_id)")
+    except sqlite3.OperationalError:
+        pass
     db.commit()
     db.close()
 
@@ -861,6 +884,149 @@ def log_admin_action(action, target_type="", target_id="", details=""):
         db_conn.close()
     except Exception as e:
         print(f"[AUDIT] Falha ao registrar: {e}")
+
+
+def _safe_payload_preview(payload, limit=500):
+    """Gera preview reduzido e menos sensível para armazenar em logs/tabelas."""
+    try:
+        if not payload:
+            return ""
+        if isinstance(payload, dict):
+            preview = {}
+            for key in ("id", "type", "from", "timestamp", "status", "object"):
+                if key in payload:
+                    preview[key] = payload.get(key)
+            if "metadata" in payload and isinstance(payload["metadata"], dict):
+                preview["metadata"] = {
+                    "phone_number_id": payload["metadata"].get("phone_number_id", "")
+                }
+            return json.dumps(preview, ensure_ascii=False)[:limit]
+        return str(payload)[:limit]
+    except Exception:
+        return ""
+
+
+def register_processed_webhook_event(source, event_key, user_id=None, payload=None):
+    """Registra evento processado. Retorna False se já tiver sido processado."""
+    if not source or not event_key:
+        return False
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.execute(
+            """INSERT INTO processed_webhook_events (source, event_key, user_id, payload_preview)
+               VALUES (?,?,?,?)""",
+            (source[:50], str(event_key)[:255], user_id, _safe_payload_preview(payload))
+        )
+        db_conn.commit()
+        db_conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        print(f"[WEBHOOK EVENT] Falha ao registrar {source}:{event_key} -> {e}")
+        return False
+
+
+def resolve_user_by_whatsapp_phone_id(db_conn, phone_number_id):
+    if not phone_number_id:
+        return None
+    db_conn.row_factory = sqlite3.Row
+    return db_conn.execute(
+        "SELECT * FROM users WHERE whatsapp_phone_id=? AND is_active=1 LIMIT 1",
+        (phone_number_id,)
+    ).fetchone()
+
+
+def parse_db_datetime(value):
+    if not value:
+        return None
+    try:
+        if "T" in value:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        else:
+            dt = datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def validate_user_messaging_access(user):
+    """Valida se o tenant pode consumir IA e enviar mensagens automáticas."""
+    if not user:
+        return False, "user_not_found", "Conta não encontrada."
+    if not user.get("is_active", 1):
+        return False, "user_inactive", "Conta desativada."
+
+    plan_status = (user.get("plan_status") or "").strip().lower()
+    if plan_status in {"inactive", "cancelled", "blocked", "suspended"}:
+        return False, "plan_inactive", "Seu plano está inativo. Entre em contato para reativar."
+
+    if plan_status == "trial":
+        trial_ends_at = parse_db_datetime(user.get("trial_ends_at", ""))
+        if trial_ends_at and datetime.now(timezone.utc) > trial_ends_at:
+            return False, "trial_expired", "Seu período de teste expirou."
+
+    msgs_limit = int(user.get("msgs_limit") or 0)
+    msgs_used = int(user.get("msgs_used") or 0)
+    if msgs_limit > 0 and msgs_used >= msgs_limit:
+        return False, "message_limit_reached", "Seu limite mensal de mensagens foi atingido."
+
+    return True, "ok", ""
+
+
+def get_last_customer_message_at(db_conn, user_id, phone, channel="whatsapp"):
+    row = db_conn.execute(
+        """
+        SELECT MAX(m.created_at) as last_customer_message_at
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE c.user_id=? AND c.customer_phone=? AND c.channel=? AND m.sender='customer'
+        """,
+        (user_id, phone, channel)
+    ).fetchone()
+    return parse_db_datetime(row["last_customer_message_at"]) if row and row["last_customer_message_at"] else None
+
+
+def is_within_customer_care_window(db_conn, user_id, phone, channel="whatsapp", now_utc=None):
+    now_utc = now_utc or datetime.now(timezone.utc)
+    last_customer_message_at = get_last_customer_message_at(db_conn, user_id, phone, channel)
+    if not last_customer_message_at:
+        return False
+    return (now_utc - last_customer_message_at).total_seconds() <= 24 * 3600
+
+
+def get_approved_template_for_campaign(db_conn, campaign):
+    template_id = campaign["template_id"] if campaign else None
+    if template_id:
+        tpl = db_conn.execute(
+            "SELECT * FROM whatsapp_templates WHERE id=? AND user_id=? LIMIT 1",
+            (template_id, campaign["user_id"])
+        ).fetchone()
+        if tpl and (tpl["status"] or "").lower() == "approved":
+            return tpl
+    return None
+
+
+def validate_campaign_contact_window(db_conn, campaign, contact):
+    template = get_approved_template_for_campaign(db_conn, campaign)
+    within_window = is_within_customer_care_window(db_conn, campaign["user_id"], contact["phone"], "whatsapp")
+    if within_window:
+        return True, ""
+    if template:
+        return False, "Contato fora da janela de 24h. Este projeto ainda nao envia template aprovado automaticamente."
+    return False, "Contato fora da janela de 24h e sem template aprovado."
+
+
+def parse_mp_subscription_reference(external_reference):
+    parts = (external_reference or "").split("_")
+    if len(parts) < 4 or parts[0] != "user" or parts[2] != "plan":
+        return None
+    try:
+        return {"user_id": int(parts[1]), "plan_key": parts[3]}
+    except (TypeError, ValueError):
+        return None
 
 
 def validate_mp_signature(request_obj, webhook_secret=None):
@@ -1159,13 +1325,7 @@ def log_webhook_error(source, user_id, error_type, error_message, payload=None):
     """Registra erro de webhook para revisão posterior no admin.
     Não falha se o DB estiver down — só imprime no log."""
     try:
-        preview = ""
-        if payload:
-            try:
-                import json as json_mod
-                preview = json_mod.dumps(payload, ensure_ascii=False)[:500]
-            except:
-                preview = str(payload)[:500]
+        preview = _safe_payload_preview(payload)
         db_conn = sqlite3.connect(DATABASE)
         db_conn.execute(
             """INSERT INTO webhook_errors
@@ -2348,6 +2508,8 @@ def login():
                     return redirect("/verify-email")
                 else:
                     reset_login_attempts(client_ip)
+                    session.clear()
+                    session.permanent = True
                     session["user_id"] = user["id"]
                     db.execute("UPDATE users SET last_login=datetime('now') WHERE id=?", (user["id"],))
                     db.commit()
@@ -2387,16 +2549,16 @@ def dashboard():
         FROM conversations c WHERE c.user_id=? ORDER BY c.last_message_at DESC LIMIT 5""", (user["id"],)).fetchall()
     convos_html = ""
     if recent:
-        rows = "".join(f"""<tr><td><strong>{c['customer_phone']}</strong><br><span style="color:var(--text3);font-size:12px">{c['customer_name'] or 'Sem nome'}</span></td>
-            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{(c['last_msg'] or '—')[:60]}</td>
+        rows = "".join(f"""<tr><td><strong>{esc(c['customer_phone'])}</strong><br><span style="color:var(--text3);font-size:12px">{esc(c['customer_name'] or 'Sem nome')}</span></td>
+            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{esc((c['last_msg'] or '—')[:60])}</td>
             <td>{'<span class="badge badge-green">Ativa</span>' if c['status']=='active' else '<span class="badge badge-orange">Finalizada</span>'}{' <span class="badge badge-purple">Humano</span>' if c['is_human_takeover'] else ''}</td>
-            <td style="color:var(--text3);font-size:12px">{(c['last_message_at'] or '')[:16]}</td></tr>""" for c in recent)
+            <td style="color:var(--text3);font-size:12px">{esc((c['last_message_at'] or '')[:16])}</td></tr>""" for c in recent)
         convos_html = f'<div class="card"><div class="card-header"><span class="card-title">Conversas recentes</span><a href="/dashboard/conversations" class="btn btn-secondary btn-sm">Ver todas →</a></div><div class="table-wrap"><table><thead><tr><th>Cliente</th><th>Última msg</th><th>Status</th><th>Hora</th></tr></thead><tbody>{rows}</tbody></table></div></div>'
     else:
         convos_html = '<div class="card"><div class="empty-state"><div class="icon">💬</div><h3>Nenhuma conversa ainda</h3><p>Configure seu WhatsApp para começar.</p><a href="/dashboard/settings" class="btn btn-primary" style="margin-top:16px">Configurar →</a></div></div>'
 
     content = f"""<div class="container">
-        <div class="page-header fade-in"><h1>Olá, {user['name'].split()[0]}! 👋</h1><p>Plano {plan['name']} {plan_badge}</p></div>
+        <div class="page-header fade-in"><h1>Olá, {esc(user['name'].split()[0])}! 👋</h1><p>Plano {plan['name']} {plan_badge}</p></div>
         <div class="grid-4">
             <div class="stat-card fade-in fade-in-1"><div class="stat-icon stat-icon-green">💬</div><div class="stat-value">{stats['conversations']}</div><div class="stat-label">Conversas totais</div></div>
             <div class="stat-card fade-in fade-in-2"><div class="stat-icon stat-icon-blue">📨</div><div class="stat-value">{stats['today_messages']}</div><div class="stat-label">Mensagens hoje</div></div>
@@ -2744,7 +2906,7 @@ def training():
                         msg = f'<div class="alert alert-error">Erro ao processar arquivo: {esc(str(e))}</div>'
 
     kb = db.execute("SELECT * FROM knowledge_base WHERE user_id=? ORDER BY created_at DESC", (user["id"],)).fetchall()
-    kb_rows = "".join(f'<tr><td><strong>{i["title"]}</strong></td><td><span class="badge badge-purple">{i["category"]}</span></td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)">{i["content"][:100]}</td><td><form method="POST">{csrf_field()}<span style="display:inline"><input type="hidden" name="action" value="delete_kb"><input type="hidden" name="kb_id" value="{i["id"]}"><button type="submit" class="btn btn-danger btn-sm">✕</button></form></td></tr>' for i in kb)
+    kb_rows = "".join(f'<tr><td><strong>{esc(i["title"])}</strong></td><td><span class="badge badge-purple">{esc(i["category"])}</span></td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)">{esc(i["content"][:100])}</td><td><form method="POST">{csrf_field()}<span style="display:inline"><input type="hidden" name="action" value="delete_kb"><input type="hidden" name="kb_id" value="{i["id"]}"><button type="submit" class="btn btn-danger btn-sm">✕</button></form></td></tr>' for i in kb)
 
     content = f"""<div class="container"><div class="page-header fade-in"><h1>Treinamento da IA 🧠</h1><p>Configure personalidade e base de conhecimento.</p></div>{msg}
         <div class="grid-2"><div class="card fade-in fade-in-1"><div class="card-header"><span class="card-title">Personalidade da IA</span></div>
@@ -2822,7 +2984,7 @@ def quick_replies():
             db.commit(); msg = '<div class="alert alert-success">Removida!</div>'
 
     qrs = db.execute("SELECT * FROM quick_replies WHERE user_id=? ORDER BY times_used DESC", (user["id"],)).fetchall()
-    rows = "".join(f'<tr><td><code style="color:var(--accent2)">/{q["shortcut"]}</code></td><td>{q["content"][:80]}</td><td>{q["times_used"]}</td><td><form method="POST">{csrf_field()}<span style="display:inline"><input type="hidden" name="action" value="delete"><input type="hidden" name="qr_id" value="{q["id"]}"><button type="submit" class="btn btn-danger btn-sm">✕</button></form></td></tr>' for q in qrs)
+    rows = "".join(f'<tr><td><code style="color:var(--accent2)">/{esc(q["shortcut"])}</code></td><td>{esc(q["content"][:80])}</td><td>{q["times_used"]}</td><td><form method="POST">{csrf_field()}<span style="display:inline"><input type="hidden" name="action" value="delete"><input type="hidden" name="qr_id" value="{q["id"]}"><button type="submit" class="btn btn-danger btn-sm">✕</button></form></td></tr>' for q in qrs)
 
     content = f"""<div class="container"><div class="page-header"><h1>Respostas Rápidas ⚡</h1><p>Atalhos para mensagens que você usa com frequência.</p></div>{msg}
         <div class="grid-2"><div class="card"><div class="card-header"><span class="card-title">Nova resposta rápida</span></div>
@@ -3023,7 +3185,7 @@ def settings():
 
     base = get_setting("BASE_URL", BASE_URL)
     wa_verify = get_setting("WHATSAPP_VERIFY_TOKEN", WHATSAPP_VERIFY_TOKEN)
-    webhook_url = f"{base}/webhook/whatsapp/{user['id']}"
+    webhook_url = f"{base}/webhook/whatsapp"
     # Escape de todos os valores do usuário para prevenir XSS
     u_name = esc(user['name'])
     u_company = esc(user['company'])
@@ -3336,23 +3498,48 @@ def mp_webhook():
         pid = data.get("data",{}).get("id")
         if pid:
             try:
+                event_key = f"payment:{pid}"
+                if not register_processed_webhook_event("mercadopago_subscription", event_key, None, {"id": pid, "type": "payment"}):
+                    return jsonify({"status": "duplicate"}), 200
+
                 import mercadopago
                 mp_token = get_setting("MERCADOPAGO_ACCESS_TOKEN", MERCADOPAGO_ACCESS_TOKEN)
                 sdk = mercadopago.SDK(mp_token)
                 payment = sdk.payment().get(pid)["response"]
-                ext = payment.get("external_reference",""); parts = ext.split("_")
-                if len(parts) >= 4:
-                    uid = int(parts[1]); pk = parts[3]; plan = PLANS.get(pk)
-                    db_c = sqlite3.connect(DATABASE); db_c.row_factory = sqlite3.Row
-                    if payment.get("status") == "approved" and plan:
-                        db_c.execute("UPDATE users SET plan=?,plan_status='active',msgs_limit=?,msgs_used=0 WHERE id=?", (pk,plan["msgs"],uid))
-                        db_c.execute("UPDATE payments SET status='approved' WHERE mp_payment_id=?", (str(pid),))
-                        db_c.execute("INSERT OR IGNORE INTO payments (user_id,mp_payment_id,amount,status,plan) VALUES (?,?,?,?,?)", (uid,str(pid),payment.get("transaction_amount",0),"approved",pk))
-                    elif payment.get("status") == "rejected":
-                        db_c.execute("UPDATE payments SET status='rejected' WHERE mp_payment_id=?", (str(pid),))
-                    db_c.commit(); db_c.close()
-                    print(f"[MP] Webhook: payment {pid} status={payment.get('status')} user={uid} plan={pk}")
-            except Exception as e: print(f"[MP] Webhook error: {e}")
+                ext = payment.get("external_reference", "")
+                ref = parse_mp_subscription_reference(ext)
+                if not ref:
+                    return jsonify({"status":"invalid_reference"}), 200
+
+                uid = ref["user_id"]
+                pk = ref["plan_key"]
+                plan = PLANS.get(pk)
+                amount = float(payment.get("transaction_amount") or 0)
+                currency = payment.get("currency_id", "")
+                if not plan or currency != "BRL" or abs(amount - float(plan["price"])) > 0.01:
+                    log_webhook_error("mercadopago", uid, "InvalidPaymentData", f"amount={amount} currency={currency} ref={ext}", {"payment_id": pid})
+                    return jsonify({"status":"invalid_payment_data"}), 200
+
+                db_c = sqlite3.connect(DATABASE)
+                db_c.row_factory = sqlite3.Row
+                user_row = db_c.execute("SELECT id FROM users WHERE id=?", (uid,)).fetchone()
+                if not user_row:
+                    db_c.close()
+                    return jsonify({"status":"user_not_found"}), 200
+
+                if payment.get("status") == "approved":
+                    db_c.execute("UPDATE users SET plan=?,plan_status='active',msgs_limit=?,msgs_used=0 WHERE id=?", (pk, plan["msgs"], uid))
+                    db_c.execute("UPDATE payments SET status='approved' WHERE mp_payment_id=? AND user_id=?", (str(pid), uid))
+                    db_c.execute("INSERT OR IGNORE INTO payments (user_id,mp_payment_id,amount,status,plan) VALUES (?,?,?,?,?)", (uid, str(pid), amount, "approved", pk))
+                elif payment.get("status") == "rejected":
+                    db_c.execute("UPDATE payments SET status='rejected' WHERE mp_payment_id=? AND user_id=?", (str(pid), uid))
+                else:
+                    db_c.execute("INSERT OR IGNORE INTO payments (user_id,mp_payment_id,amount,status,plan) VALUES (?,?,?,?,?)", (uid, str(pid), amount, payment.get("status", "pending"), pk))
+                db_c.commit()
+                db_c.close()
+                print(f"[MP] Webhook: payment {pid} status={payment.get('status')} user={uid} plan={pk}")
+            except Exception as e:
+                print(f"[MP] Webhook error: {e}")
     return jsonify({"status":"ok"}), 200
 
 
@@ -3542,7 +3729,7 @@ h1{{border-bottom:2px solid #00c896;padding-bottom:8px}}
 <strong>Empresa:</strong> {esc(user['company'] or user['name'])}
 </div>
 <div class="no-print" style="margin-bottom:20px">
-<button onclick="window.print()" style="padding:10px 20px;background:#00c896;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px">🖨️ Imprimir</button>
+<button id="print-conversation-btn" style="padding:10px 20px;background:#00c896;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px">🖨️ Imprimir</button>
 <a href="/dashboard/conversations/{conv_id}/export" style="margin-left:8px;padding:10px 20px;background:#0ea5e9;color:white;text-decoration:none;border-radius:6px;font-size:14px">📥 Baixar CSV</a>
 <a href="/dashboard/conversations" style="margin-left:8px;padding:10px 20px;background:#666;color:white;text-decoration:none;border-radius:6px;font-size:14px">← Voltar</a>
 </div>
@@ -3550,6 +3737,9 @@ h1{{border-bottom:2px solid #00c896;padding-bottom:8px}}
 <div style="margin-top:40px;font-size:12px;color:#999;text-align:center">
 Exportado em {datetime.now().strftime("%d/%m/%Y %H:%M")} — atendente.online
 </div>
+<script nonce="{getattr(g, 'csp_nonce', '')}">
+document.getElementById('print-conversation-btn')?.addEventListener('click', function(){{ window.print(); }});
+</script>
 </body></html>"""
 
 
@@ -3566,8 +3756,9 @@ def verify_whatsapp_signature(request_data, signature_header, app_secret):
     return hmac.compare_digest(expected, received)
 
 
+@app.route("/webhook/whatsapp", methods=["GET","POST"])
 @app.route("/webhook/whatsapp/<int:user_id>", methods=["GET","POST"])
-def whatsapp_webhook(user_id):
+def whatsapp_webhook(user_id=None):
     if request.method == "GET":
         wa_verify = get_setting("WHATSAPP_VERIFY_TOKEN", WHATSAPP_VERIFY_TOKEN)
         if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == wa_verify:
@@ -3591,54 +3782,84 @@ def whatsapp_webhook(user_id):
 
     data = request.json or {}
     try:
-        db_conn = sqlite3.connect(DATABASE); db_conn.row_factory = sqlite3.Row
-        raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        if not raw_user: db_conn.close(); return jsonify({"status":"user not found"}), 404
-        user = decrypt_user_row(raw_user)
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
 
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
                 value = change.get("value", {})
+                metadata = value.get("metadata", {}) or {}
+                phone_number_id = metadata.get("phone_number_id", "")
+                raw_user = resolve_user_by_whatsapp_phone_id(db_conn, phone_number_id)
+                if not raw_user:
+                    log_webhook_error("whatsapp", None, "UserNotMapped", f"phone_number_id={phone_number_id}", {"metadata": metadata})
+                    continue
+
+                user = decrypt_user_row(raw_user)
+                resolved_user_id = user["id"]
+
                 for msg in value.get("messages", []):
+                    wamid = msg.get("id", "")
+                    if wamid and not register_processed_webhook_event("whatsapp", wamid, resolved_user_id, msg):
+                        continue
+
                     sender_phone = msg.get("from", "")
-                    
-                    # Check blocked
-                    blocked = db_conn.execute("SELECT id FROM blocked_contacts WHERE user_id=? AND phone=?", (user_id, sender_phone)).fetchone()
-                    if blocked: continue
 
-                    # Process media (TEXT, AUDIO, IMAGE, PDF, LOCATION, etc.)
+                    blocked = db_conn.execute("SELECT id FROM blocked_contacts WHERE user_id=? AND phone=?", (resolved_user_id, sender_phone)).fetchone()
+                    if blocked:
+                        continue
+
                     media_result = process_whatsapp_media(msg, user["whatsapp_token"])
+                    if not media_result["content"]:
+                        continue
 
-                    if not media_result["content"]: continue
-
-                    # Find or create conversation
-                    conv = db_conn.execute("SELECT * FROM conversations WHERE user_id=? AND customer_phone=? AND status='active'", (user_id, sender_phone)).fetchone()
+                    conv = db_conn.execute(
+                        "SELECT * FROM conversations WHERE user_id=? AND customer_phone=? AND status='active' AND channel='whatsapp'",
+                        (resolved_user_id, sender_phone)
+                    ).fetchone()
                     if not conv:
                         contact_name = ""
                         contacts = value.get("contacts", [])
-                        if contacts: contact_name = contacts[0].get("profile",{}).get("name","")
-                        db_conn.execute("INSERT INTO conversations (user_id,customer_phone,customer_name) VALUES (?,?,?)", (user_id, sender_phone, contact_name))
+                        if contacts:
+                            contact_name = contacts[0].get("profile", {}).get("name", "")
+                        db_conn.execute(
+                            "INSERT INTO conversations (user_id,customer_phone,customer_name,channel) VALUES (?,?,?,?)",
+                            (resolved_user_id, sender_phone, contact_name, "whatsapp")
+                        )
                         db_conn.commit()
-                        conv = db_conn.execute("SELECT * FROM conversations WHERE user_id=? AND customer_phone=? AND status='active'", (user_id, sender_phone)).fetchone()
+                        conv = db_conn.execute(
+                            "SELECT * FROM conversations WHERE user_id=? AND customer_phone=? AND status='active' AND channel='whatsapp'",
+                            (resolved_user_id, sender_phone)
+                        ).fetchone()
 
-                    # Save message
-                    db_conn.execute("INSERT INTO messages (conversation_id,sender,content,msg_type,media_url) VALUES (?,?,?,?,?)",
-                        (conv["id"], "customer", media_result["content"], media_result["type"], media_result.get("media_path","")))
+                    db_conn.execute(
+                        "INSERT INTO messages (conversation_id,sender,content,msg_type,media_url,external_message_id) VALUES (?,?,?,?,?,?)",
+                        (conv["id"], "customer", media_result["content"], media_result["type"], media_result.get("media_path", ""), wamid)
+                    )
                     db_conn.execute("UPDATE conversations SET last_message_at=datetime('now') WHERE id=?", (conv["id"],))
 
-                    if conv["is_human_takeover"]: db_conn.commit(); continue
+                    if conv["is_human_takeover"]:
+                        db_conn.commit()
+                        continue
 
-                    # Generate AI response using the description (clean text for the AI)
+                    can_process, access_code, access_message = validate_user_messaging_access(user)
+                    if not can_process:
+                        db_conn.execute(
+                            "INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
+                            (conv["id"], "system", f"[BLOQUEIO AUTOMATICO: {access_code}] {access_message}", "system")
+                        )
+                        db_conn.commit()
+                        continue
+
                     ai_input = media_result.get("description", media_result["content"])
                     if media_result["type"] == "audio":
-                        ai_input = f"[MENSAGEM DE ÁUDIO DO CLIENTE]: {ai_input}"
+                        ai_input = f"[MENSAGEM DE AUDIO DO CLIENTE]: {ai_input}"
 
-                    # ═══ DETECÇÃO DE INTENÇÃO DE COMPRA ═══
                     commerce_triggered = False
                     if user["commerce_enabled"] and user["mp_access_token"] and media_result["type"] == "text":
                         products = db_conn.execute(
                             "SELECT * FROM product_gallery WHERE user_id=? AND active=1 AND price > 0",
-                            (user_id,)
+                            (resolved_user_id,)
                         ).fetchall()
                         products_list = [dict(p) for p in products]
 
@@ -3655,32 +3876,29 @@ def whatsapp_webhook(user_id):
                                         sender_phone,
                                         commerce_msg
                                     )
-                                    # Reabre conexão
                                     db_conn = sqlite3.connect(DATABASE)
                                     db_conn.row_factory = sqlite3.Row
                                     db_conn.execute(
                                         "INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
                                         (conv["id"], "bot", commerce_msg, "text")
                                     )
-                                    db_conn.execute("UPDATE users SET msgs_used=msgs_used+1 WHERE id=?", (user_id,))
+                                    db_conn.execute("UPDATE users SET msgs_used=msgs_used+1 WHERE id=?", (resolved_user_id,))
                                     db_conn.commit()
                                     commerce_triggered = True
                                 else:
-                                    # Reabre conexão mesmo se falhou
                                     db_conn = sqlite3.connect(DATABASE)
                                     db_conn.row_factory = sqlite3.Row
 
                     if commerce_triggered:
-                        continue  # Pula IA normal se gerou cobrança
+                        continue
 
                     ai_response = generate_ai_response(user, conv["id"], ai_input, db_conn)
 
-                    db_conn.execute("INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)", (conv["id"],"bot",ai_response,"text"))
-                    db_conn.execute("UPDATE users SET msgs_used=msgs_used+1 WHERE id=?", (user_id,))
+                    db_conn.execute("INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)", (conv["id"], "bot", ai_response, "text"))
+                    db_conn.execute("UPDATE users SET msgs_used=msgs_used+1 WHERE id=?", (resolved_user_id,))
                     db_conn.commit()
 
-                    # Verifica se deve enviar foto de produto da galeria
-                    product = find_matching_product(user_id, ai_input)
+                    product = find_matching_product(resolved_user_id, ai_input)
                     if product and os.path.exists(product["file_path"]):
                         print(f"[GALLERY] Enviando foto: {product['name']}")
                         caption = product["description"] or product["name"]
@@ -3691,24 +3909,23 @@ def whatsapp_webhook(user_id):
                             product["file_path"],
                             caption=caption
                         )
-                        # Registra no histórico
                         db_conn.execute(
                             "INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
                             (conv["id"], "bot", f"[Foto: {product['name']}]", "image")
                         )
                         db_conn.commit()
 
-                    # Se cliente mandou áudio, responde com áudio
                     audio_sent = False
                     if media_result["type"] == "audio":
-                        print(f"[VOICE] Cliente enviou áudio, gerando resposta por voz...")
+                        print(f"[VOICE] Cliente enviou audio, gerando resposta por voz...")
                         audio_path = text_to_audio(ai_response)
                         if audio_path:
                             audio_sent = send_whatsapp_audio(user["whatsapp_phone_id"], user["whatsapp_token"], sender_phone, audio_path)
-                            try: os.remove(audio_path)
-                            except: pass
+                            try:
+                                os.remove(audio_path)
+                            except Exception:
+                                pass
 
-                    # Se não enviou áudio (ou falhou), envia texto
                     if not audio_sent:
                         send_whatsapp_message(user["whatsapp_phone_id"], user["whatsapp_token"], sender_phone, ai_response)
         db_conn.close()
@@ -3804,6 +4021,9 @@ def webhook_instagram(user_id):
                 msg = event.get("message", {})
                 if not msg or msg.get("is_echo"):
                     continue
+                event_id = msg.get("mid") or event.get("timestamp") or f"{sender_id}:{msg.get('text','')[:40]}"
+                if not register_processed_webhook_event("instagram", event_id, user_id, {"sender": sender_id, "mid": msg.get("mid", "")}):
+                    continue
 
                 message_text = msg.get("text", "")
                 if not message_text:
@@ -3839,6 +4059,15 @@ def webhook_instagram(user_id):
                 db_conn.commit()
 
                 if conv["is_human_takeover"]:
+                    continue
+
+                can_process, access_code, access_message = validate_user_messaging_access(user)
+                if not can_process:
+                    db_conn.execute(
+                        "INSERT INTO messages (conversation_id, sender, content, msg_type) VALUES (?,?,?,?)",
+                        (conv["id"], "system", f"[BLOQUEIO AUTOMATICO: {access_code}] {access_message}", "system")
+                    )
+                    db_conn.commit()
                     continue
 
                 # Gera resposta com IA
@@ -3948,6 +4177,9 @@ def webhook_messenger(user_id):
                 msg = event.get("message", {})
                 if not msg or msg.get("is_echo"):
                     continue
+                event_id = msg.get("mid") or event.get("timestamp") or f"{sender_id}:{msg.get('text','')[:40]}"
+                if not register_processed_webhook_event("messenger", event_id, user_id, {"sender": sender_id, "mid": msg.get("mid", "")}):
+                    continue
 
                 message_text = msg.get("text", "")
                 if not message_text:
@@ -3981,6 +4213,15 @@ def webhook_messenger(user_id):
                 db_conn.commit()
 
                 if conv["is_human_takeover"]:
+                    continue
+
+                can_process, access_code, access_message = validate_user_messaging_access(user)
+                if not can_process:
+                    db_conn.execute(
+                        "INSERT INTO messages (conversation_id, sender, content, msg_type) VALUES (?,?,?,?)",
+                        (conv["id"], "system", f"[BLOQUEIO AUTOMATICO: {access_code}] {access_message}", "system")
+                    )
+                    db_conn.commit()
                     continue
 
                 ai_response = generate_ai_response(user, conv["id"], message_text, db_conn)
@@ -5352,6 +5593,10 @@ def mp_commerce_webhook(user_id):
         if not payment_id:
             return jsonify({"status": "no_id"}), 200
 
+        event_key = f"payment:{payment_id}"
+        if not register_processed_webhook_event("mercadopago_commerce", event_key, user_id, {"id": payment_id}):
+            return jsonify({"status": "duplicate"}), 200
+
         db_conn = sqlite3.connect(DATABASE)
         db_conn.row_factory = sqlite3.Row
 
@@ -5375,6 +5620,8 @@ def mp_commerce_webhook(user_id):
         payment = resp.json()
         status = payment.get("status", "")
         external_ref = payment.get("external_reference", "")
+        amount = float(payment.get("transaction_amount") or 0)
+        currency = payment.get("currency_id", "")
 
         if not external_ref.startswith("order_"):
             db_conn.close()
@@ -5390,10 +5637,24 @@ def mp_commerce_webhook(user_id):
             db_conn.close()
             return jsonify({"status": "order_not_found"}), 200
 
+        if currency != "BRL":
+            db_conn.close()
+            log_webhook_error("mercadopago", user_id, "InvalidCurrency", f"currency={currency}", {"payment_id": payment_id})
+            return jsonify({"status": "invalid_currency"}), 200
+
+        if abs(amount - float(order["total"] or 0)) > 0.01:
+            db_conn.close()
+            log_webhook_error("mercadopago", user_id, "InvalidAmount", f"amount={amount} expected={order['total']}", {"payment_id": payment_id})
+            return jsonify({"status": "invalid_amount"}), 200
+
+        if order["user_id"] != user_id:
+            db_conn.close()
+            return jsonify({"status": "user_mismatch"}), 200
+
         if status == "approved" and order["payment_status"] != "paid":
             db_conn.execute(
-                "UPDATE orders SET payment_status='paid', paid_at=datetime('now') WHERE id=?",
-                (order_id,)
+                "UPDATE orders SET payment_status='paid', paid_at=datetime('now'), mp_payment_id=? WHERE id=?",
+                (str(payment_id), order_id)
             )
             db_conn.commit()
 
@@ -5757,6 +6018,15 @@ def run_campaign(campaign_id):
         failed = 0
 
         for contact in contacts:
+            allowed_window, window_error = validate_campaign_contact_window(db_conn, campaign, contact)
+            if not allowed_window:
+                db_conn.execute(
+                    "UPDATE campaign_contacts SET status='failed', error=? WHERE id=?",
+                    (window_error[:200], contact["id"])
+                )
+                failed += 1
+                continue
+
             # Personaliza a mensagem com variáveis
             msg = campaign["message"]
             try:
@@ -5777,7 +6047,7 @@ def run_campaign(campaign_id):
                     contact["phone"],
                     msg
                 )
-                if result:
+                if result and result.get("success") is True:
                     db_conn.execute(
                         "UPDATE campaign_contacts SET status='sent', sent_at=datetime('now') WHERE id=?",
                         (contact["id"],)
@@ -5785,8 +6055,8 @@ def run_campaign(campaign_id):
                     sent += 1
                 else:
                     db_conn.execute(
-                        "UPDATE campaign_contacts SET status='failed', error='send_error' WHERE id=?",
-                        (contact["id"],)
+                        "UPDATE campaign_contacts SET status='failed', error=? WHERE id=?",
+                        ((result or {}).get("error", "send_error")[:200], contact["id"])
                     )
                     failed += 1
             except Exception as e:
@@ -5992,6 +6262,19 @@ def campaign_start(cid):
         (cid, user["id"])
     ).fetchone()
     if campaign and campaign["status"] == "draft":
+        pending_contacts = db.execute(
+            "SELECT * FROM campaign_contacts WHERE campaign_id=? AND status='pending' LIMIT 2000",
+            (cid,)
+        ).fetchall()
+        for contact in pending_contacts:
+            allowed_window, window_error = validate_campaign_contact_window(db, campaign, contact)
+            if not allowed_window:
+                db.execute(
+                    "UPDATE campaigns SET status='blocked', completed_at=datetime('now') WHERE id=?",
+                    (cid,)
+                )
+                db.commit()
+                return redirect(f"/dashboard/campaigns?error={window_error}")
         import threading
         threading.Thread(target=run_campaign, args=(cid,), daemon=True).start()
     return redirect("/dashboard/campaigns")
@@ -6975,28 +7258,36 @@ def admin_login():
             if code_ok:
                 reset_login_attempts(client_ip)
                 session.pop("admin_awaiting_2fa", None)
+                session.clear()
+                session.permanent = True
                 session["is_admin"] = True
                 log_admin_action("login_success", details="2FA ok")
                 return redirect("/admin")
             else:
                 record_login_attempt(client_ip)
                 error = "Código inválido. Tente novamente."
-        elif request.form.get("email") == ADMIN_EMAIL and request.form.get("password") == ADMIN_PASSWORD:
-            # Etapa 1: senha OK. Precisa de 2FA?
-            if is_admin_2fa_enabled():
-                session["admin_awaiting_2fa"] = True
-                step_2fa = True
-                log_admin_action("password_ok_awaiting_2fa")
-            else:
-                # 2FA não configurado — entra direto (compatibilidade inicial)
-                reset_login_attempts(client_ip)
-                session["is_admin"] = True
-                log_admin_action("login_success", details="sem 2FA")
-                return redirect("/admin")
         else:
-            record_login_attempt(client_ip)
-            error = "Credenciais inválidas."
-            log_admin_action("login_failed", details=f"email={request.form.get('email','')[:50]}")
+            import hmac as hmac_mod
+            email_ok = hmac_mod.compare_digest(request.form.get("email", ""), ADMIN_EMAIL)
+            password_ok = hmac_mod.compare_digest(request.form.get("password", ""), ADMIN_PASSWORD)
+            if email_ok and password_ok:
+                # Etapa 1: senha OK. Precisa de 2FA?
+                if is_admin_2fa_enabled():
+                    session["admin_awaiting_2fa"] = True
+                    step_2fa = True
+                    log_admin_action("password_ok_awaiting_2fa")
+                else:
+                    # 2FA não configurado — entra direto (compatibilidade inicial)
+                    reset_login_attempts(client_ip)
+                    session.clear()
+                    session.permanent = True
+                    session["is_admin"] = True
+                    log_admin_action("login_success", details="sem 2FA")
+                    return redirect("/admin")
+            else:
+                record_login_attempt(client_ip)
+                error = "Credenciais inválidas."
+                log_admin_action("login_failed", details=f"email={request.form.get('email','')[:50]}")
 
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
 
@@ -7133,8 +7424,8 @@ def admin_users():
         stats = get_user_stats(u["id"])
         plan_name = PLANS.get(u['plan'], {}).get('name', u['plan'])
         rows += f"""<tr>
-            <td><strong>{u['name']}</strong><br><span style="color:var(--text3);font-size:12px">{u['email']}</span></td>
-            <td>{u['company'] or '—'}</td>
+            <td><strong>{esc(u['name'])}</strong><br><span style="color:var(--text3);font-size:12px">{esc(u['email'])}</span></td>
+            <td>{esc(u['company'] or '—')}</td>
             <td><span class="badge badge-purple">{plan_name}</span></td>
             <td><span class="badge {status_cls}">{status_txt}</span></td>
             <td>{u['msgs_used']}/{u['msgs_limit']}</td>
@@ -7144,7 +7435,7 @@ def admin_users():
             <td>
                 <form method="POST" action="/admin/users/{u['id']}/change-plan" style="display:inline;margin-right:4px">
                     {csrf_field()}
-                    <select name="plan" onchange="this.form.submit()" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.1);color:var(--text);padding:4px 8px;border-radius:6px;font-size:12px">
+                    <select name="plan" class="admin-plan-select" style="background:#2a2a3a;border:1px solid rgba(255,255,255,0.1);color:var(--text);padding:4px 8px;border-radius:6px;font-size:12px">
                         <option value="starter" {'selected' if u['plan']=='starter' else ''}>Starter</option>
                         <option value="pro" {'selected' if u['plan']=='pro' else ''}>Pro</option>
                         <option value="business" {'selected' if u['plan']=='business' else ''}>Business</option>
@@ -7201,7 +7492,15 @@ def admin_users():
         </div>
 
         <div class="card"><div class="table-wrap"><table><thead><tr><th>Cliente</th><th>Empresa</th><th>Plano</th><th>Status</th><th>Msgs</th><th>Conversas</th><th>Cadastro</th><th>Último login</th><th>Ação</th></tr></thead>
-        <tbody>{rows}</tbody></table></div></div></div>"""
+        <tbody>{rows}</tbody></table></div></div>
+        <script nonce="{getattr(g, 'csp_nonce', '')}">
+        document.querySelectorAll('.admin-plan-select').forEach(function(el) {{
+            el.addEventListener('change', function() {{
+                this.form.submit();
+            }});
+        }});
+        </script>
+        </div>"""
     return admin_html("Clientes", content)
 
 
@@ -7505,7 +7804,8 @@ def admin_2fa_setup():
         if action == "disable" and is_enabled:
             # Exige senha de confirmação
             confirm_pw = request.form.get("confirm_password", "")
-            if confirm_pw != ADMIN_PASSWORD:
+            import hmac as hmac_mod
+            if not hmac_mod.compare_digest(confirm_pw, ADMIN_PASSWORD):
                 msg = '<div class="alert alert-error">Senha incorreta. 2FA não foi desativado.</div>'
             else:
                 set_setting("ADMIN_TOTP_SECRET", "")
@@ -7611,7 +7911,7 @@ def admin_2fa_setup():
                 <div class="form-group">
                     <input type="password" name="confirm_password" class="form-input" placeholder="Senha admin" required>
                 </div>
-                <button type="submit" class="btn" style="background:rgba(239,68,68,0.2);color:#ef4444" onclick="return confirm('Desativar 2FA? Isso reduz a segurança da conta admin.')">🚫 Desativar 2FA</button>
+                <button type="submit" id="disable-2fa-btn" class="btn" style="background:rgba(239,68,68,0.2);color:#ef4444">🚫 Desativar 2FA</button>
             </form>
         </div>
         """
@@ -7633,7 +7933,14 @@ def admin_2fa_setup():
         <div class="page-header"><h1>🔐 Autenticação de 2 Fatores</h1><p>Proteção extra para sua conta admin</p></div>
         {msg}
         {status_card}
-    </div>"""
+    </div>
+    <script nonce="{getattr(g, 'csp_nonce', '')}">
+    document.getElementById('disable-2fa-btn')?.addEventListener('click', function(event) {{
+        if (!window.confirm('Desativar 2FA? Isso reduz a segurança da conta admin.')) {{
+            event.preventDefault();
+        }}
+    }});
+    </script>"""
     return admin_html("2FA Admin", content)
 
 
@@ -7781,10 +8088,10 @@ def admin_payments():
         p_plan = PLANS.get(p['plan'], {}).get('name', p['plan'])
         p_cls = 'badge-green' if p['status']=='approved' else 'badge-orange' if p['status']=='pending' else 'badge-red'
         p_label = {"approved":"Aprovado","pending":"Pendente","rejected":"Rejeitado"}.get(p['status'], p['status'])
-        rows += f"""<tr><td>{p_date}</td><td><strong>{p['name']}</strong><br><span style="color:var(--text3);font-size:12px">{p['email']}</span></td>
+        rows += f"""<tr><td>{p_date}</td><td><strong>{esc(p['name'])}</strong><br><span style="color:var(--text3);font-size:12px">{esc(p['email'])}</span></td>
         <td><span class="badge badge-purple">{p_plan}</span></td><td>R$ {p['amount']:.2f}</td>
         <td><span class="badge {p_cls}">{p_label}</span></td>
-        <td style="font-size:12px;color:var(--text3)">{p['mp_payment_id'] or '—'}</td></tr>"""
+        <td style="font-size:12px;color:var(--text3)">{esc(p['mp_payment_id'] or '—')}</td></tr>"""
 
     content = f"""<div class="container"><div class="page-header"><h1>Pagamentos 💰</h1><p>Histórico de todas as transações</p></div>
         <div class="grid-4" style="margin-bottom:32px">
@@ -7818,7 +8125,7 @@ def admin_usage():
         is_healthy = plan_price > u['total_cost'] * 5.5
         health_color = 'var(--green2)' if is_healthy else 'var(--red)'
         health_label = 'Saudável' if is_healthy else 'Atenção'
-        rows += f"""<tr><td><strong>{u['name']}</strong><br><span style="color:var(--text3);font-size:12px">{u['email']}</span></td>
+        rows += f"""<tr><td><strong>{esc(u['name'])}</strong><br><span style="color:var(--text3);font-size:12px">{esc(u['email'])}</span></td>
         <td><span class="badge badge-purple">{plan_name}</span></td>
         <td>{u['msgs_used']}/{u['msgs_limit']}</td><td>{u['api_calls']}</td>
         <td>{u['total_tokens_in']:,}</td><td>{u['total_tokens_out']:,}</td>
@@ -7852,8 +8159,8 @@ def admin_logs():
     user_rows = ""
     for u in recent_users:
         pn = PLANS.get(u["plan"], {}).get("name", u["plan"])
-        user_rows += f'<tr><td style="color:var(--text3);font-size:12px">{(u["created_at"] or "")[:16]}</td><td>👤 Novo cadastro</td><td><strong>{u["name"]}</strong> ({u["email"]}) — Plano {pn}</td></tr>'
-    pay_rows = "".join(f'<tr><td style="color:var(--text3);font-size:12px">{(p["created_at"] or "")[:16]}</td><td>💳 Pagamento</td><td><strong>{p["name"]}</strong> — R$ {p["amount"]:.2f} ({p["status"]})</td></tr>' for p in recent_payments)
+        user_rows += f'<tr><td style="color:var(--text3);font-size:12px">{(u["created_at"] or "")[:16]}</td><td>👤 Novo cadastro</td><td><strong>{esc(u["name"])}</strong> ({esc(u["email"])}) — Plano {esc(pn)}</td></tr>'
+    pay_rows = "".join(f'<tr><td style="color:var(--text3);font-size:12px">{(p["created_at"] or "")[:16]}</td><td>💳 Pagamento</td><td><strong>{esc(p["name"])}</strong> — R$ {p["amount"]:.2f} ({p["status"]})</td></tr>' for p in recent_payments)
 
     content = f"""<div class="container"><div class="page-header"><h1>Logs do Sistema 📋</h1><p>Atividade recente</p></div>
         <div class="grid-2">
@@ -8105,6 +8412,12 @@ def check_production_requirements():
     # 3. ADMIN_PASSWORD deve estar configurado
     if not os.getenv("ADMIN_PASSWORD"):
         errors.append("ADMIN_PASSWORD não configurado — painel admin inacessível")
+
+    # 4. requests é obrigatório para webhooks, mídia, IA e pagamentos
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        errors.append("requests não instalado — integrações externas não funcionam")
 
     if errors and not is_dev:
         print("="*70)

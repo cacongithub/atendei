@@ -2683,6 +2683,7 @@ def conversations():
             lastMsgCount = data.messages.length;
             document.getElementById('chat-name').textContent=data.customer_name||data.customer_phone;
             document.getElementById('chat-phone').textContent=data.customer_phone;
+            updateAssumeBtn(data.is_human_takeover === 1);
         }});
     }}
 
@@ -2780,7 +2781,50 @@ def conversations():
         }});
     }}
     function filterChats(q){{document.querySelectorAll('.chat-item').forEach(i=>{{i.style.display=i.textContent.toLowerCase().includes(q.toLowerCase())?'':'none'}})}}
-    function toggleHuman(){{alert('Você assumiu o atendimento desta conversa!')}}
+    function updateAssumeBtn(isHuman){{
+        const btn = document.getElementById('assume-btn');
+        if(!btn) return;
+        if(isHuman){{
+            btn.textContent = '🤖 Devolver para IA';
+            btn.className = 'btn btn-primary btn-sm';
+            btn.dataset.takeover = '1';
+        }} else {{
+            btn.textContent = '🙋 Assumir';
+            btn.className = 'btn btn-secondary btn-sm';
+            btn.dataset.takeover = '0';
+        }}
+    }}
+
+    function toggleHuman(){{
+        if(!activeConvId){{ alert('Selecione uma conversa primeiro'); return; }}
+        const btn = document.getElementById('assume-btn');
+        if(btn) btn.disabled = true;
+        fetch('/api/conversations/' + activeConvId + '/toggle-human', {{
+            method: 'POST',
+            headers: {{
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': CSRF_TOKEN
+            }}
+        }})
+        .then(r => r.json())
+        .then(data => {{
+            if(btn) btn.disabled = false;
+            if(data.success){{
+                updateAssumeBtn(data.is_human_takeover === 1);
+                if(data.is_human_takeover === 1){{
+                    alert('✅ Você assumiu. A IA não responderá mais nesta conversa.');
+                }} else {{
+                    alert('🤖 IA retomou. Próximas mensagens serão respondidas automaticamente.');
+                }}
+            }} else {{
+                alert('❌ Erro: ' + (data.error || 'falha ao alterar'));
+            }}
+        }})
+        .catch(err => {{
+            if(btn) btn.disabled = false;
+            alert('❌ Erro de conexão: ' + err.message);
+        }});
+    }}
 
     const box=document.getElementById('chat-messages');
     if(box) box.scrollTop=box.scrollHeight;
@@ -3551,7 +3595,42 @@ def api_conv_messages(conv_id):
     conv = db.execute("SELECT * FROM conversations WHERE id=? AND user_id=?", (conv_id, g.user["id"])).fetchone()
     if not conv: return jsonify({"error":"Não encontrada"}), 404
     messages = db.execute("SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (conv_id,)).fetchall()
-    return jsonify({"customer_phone":conv["customer_phone"],"customer_name":conv["customer_name"],"messages":[dict(m) for m in messages]})
+    return jsonify({"customer_phone":conv["customer_phone"],"customer_name":conv["customer_name"],"is_human_takeover":conv["is_human_takeover"],"messages":[dict(m) for m in messages]})
+
+
+@app.route("/api/conversations/<int:conv_id>/toggle-human", methods=["POST"])
+@login_required
+def api_conv_toggle_human(conv_id):
+    """Alterna entre IA respondendo automaticamente vs atendente humano.
+    is_human_takeover=1 -> IA NAO responde mensagens dessa conversa.
+    is_human_takeover=0 -> IA volta a responder automaticamente."""
+    if not csrf_protect():
+        return jsonify({"error": "CSRF invalido"}), 403
+    try:
+        db = get_db()
+        conv = db.execute(
+            "SELECT * FROM conversations WHERE id=? AND user_id=?",
+            (conv_id, g.user["id"])
+        ).fetchone()
+        if not conv:
+            return jsonify({"error": "Conversa nao encontrada"}), 404
+
+        new_status = 0 if conv["is_human_takeover"] else 1
+        db.execute(
+            "UPDATE conversations SET is_human_takeover=? WHERE id=?",
+            (new_status, conv_id)
+        )
+        db.commit()
+
+        print(f"[CONV {conv_id}] Takeover alterado: {'humano' if new_status else 'IA'} (user {g.user['id']})")
+        return jsonify({
+            "success": True,
+            "is_human_takeover": new_status,
+            "message": "Atendimento humano ativo" if new_status else "IA retomada"
+        })
+    except Exception as e:
+        print(f"[TOGGLE HUMAN] Erro: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/conversations/<int:conv_id>/send", methods=["POST"])

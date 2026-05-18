@@ -652,6 +652,19 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users(id),
         FOREIGN KEY (media_id) REFERENCES social_media_library(id)
     );
+    CREATE TABLE IF NOT EXISTS consent_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        email TEXT DEFAULT '',
+        consent_type TEXT NOT NULL,
+        consent_version TEXT NOT NULL,
+        accepted INTEGER DEFAULT 1,
+        ip_address TEXT DEFAULT '',
+        user_agent TEXT DEFAULT '',
+        details TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    );
     """)
     # ── MIGRAÇÃO AUTOMÁTICA ──
     migrations = [
@@ -686,6 +699,8 @@ def init_db():
         ("conversations", "channel", "TEXT DEFAULT 'whatsapp'"),
         ("messages", "media_url", "TEXT DEFAULT ''"),
         ("messages", "external_message_id", "TEXT DEFAULT ''"),
+        ("verification_codes", "code_type", "TEXT DEFAULT 'signup'"),
+        ("users", "deleted_at", "TEXT DEFAULT ''"),
     ]
     for table, column, col_type in migrations:
         try:
@@ -702,6 +717,10 @@ def init_db():
         pass
     try:
         db.execute("CREATE INDEX IF NOT EXISTS idx_messages_external_message_id ON messages(external_message_id)")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        db.execute("CREATE INDEX IF NOT EXISTS idx_consent_log_user ON consent_log(user_id, consent_type, created_at)")
     except sqlite3.OperationalError:
         pass
     db.commit()
@@ -904,6 +923,384 @@ def _safe_payload_preview(payload, limit=500):
         return str(payload)[:limit]
     except Exception:
         return ""
+
+
+# ============================================================
+# LGPD — Versionamento de documentos legais
+# ============================================================
+# IMPORTANTE: Quando atualizar Política de Privacidade, Termos ou DPA,
+# INCREMENTE a versão correspondente. Usuários ativos serão solicitados
+# a re-aceitar os documentos atualizados no próximo login.
+PRIVACY_POLICY_VERSION = "2026.05.18"
+TERMS_OF_SERVICE_VERSION = "2026.05.18"
+DPA_VERSION = "2026.05.18"
+
+# Tipos de consentimento registrados na tabela consent_log
+CONSENT_TYPES = {
+    "privacy_policy": "Política de Privacidade",
+    "terms_of_service": "Termos de Serviço",
+    "dpa": "Contrato de Operador (DPA)",
+    "marketing_email": "Recebimento de comunicações de marketing",
+    "data_processing": "Tratamento de dados pessoais",
+}
+
+
+def register_consent(user_id, email, consent_type, version, accepted=True, details=""):
+    """Registra consentimento do usuário para fins de comprovação LGPD (Art. 8º).
+
+    Args:
+        user_id: ID do usuário (pode ser None se for em momento de signup pré-criação)
+        email: email do usuário (sempre registrado, mesmo se user_id for None)
+        consent_type: tipo de consentimento (ver CONSENT_TYPES)
+        version: versão do documento aceito (ex: PRIVACY_POLICY_VERSION)
+        accepted: True se aceitou, False se revogou
+        details: informações adicionais (texto livre)
+
+    Returns:
+        True se registrou com sucesso, False em caso de erro.
+    """
+    if consent_type not in CONSENT_TYPES:
+        print(f"[CONSENT] Tipo inválido: {consent_type}")
+        return False
+    try:
+        ip = request.remote_addr if request else ""
+        ua = request.headers.get("User-Agent", "")[:300] if request else ""
+        db = get_db()
+        db.execute(
+            """INSERT INTO consent_log
+               (user_id, email, consent_type, consent_version, accepted, ip_address, user_agent, details)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, (email or "")[:200], consent_type, version, 1 if accepted else 0, ip, ua, details[:500])
+        )
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[CONSENT] Erro ao registrar consentimento: {e}")
+        return False
+
+
+def get_user_consents(user_id):
+    """Retorna todos os consentimentos registrados de um usuário, mais recente primeiro."""
+    try:
+        db = get_db()
+        rows = db.execute(
+            """SELECT consent_type, consent_version, accepted, created_at, details
+               FROM consent_log
+               WHERE user_id = ?
+               ORDER BY created_at DESC""",
+            (user_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[CONSENT] Erro ao buscar consentimentos: {e}")
+        return []
+
+
+def user_has_accepted_latest(user_id, consent_type, current_version):
+    """Verifica se o usuário já aceitou a versão atual de um documento.
+    Útil para forçar re-aceitação quando termos são atualizados."""
+    try:
+        db = get_db()
+        row = db.execute(
+            """SELECT 1 FROM consent_log
+               WHERE user_id = ? AND consent_type = ? AND consent_version = ? AND accepted = 1
+               LIMIT 1""",
+            (user_id, consent_type, current_version)
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return True  # Em caso de erro, não bloqueia o usuário
+
+
+def user_needs_to_reaccept_terms(user_id):
+    """Retorna True se o usuário precisa re-aceitar termos (novo signup ou versão antiga).
+    Verifica os 3 documentos legais principais."""
+    if not user_id:
+        return False
+    return not (
+        user_has_accepted_latest(user_id, "privacy_policy", PRIVACY_POLICY_VERSION) and
+        user_has_accepted_latest(user_id, "terms_of_service", TERMS_OF_SERVICE_VERSION) and
+        user_has_accepted_latest(user_id, "dpa", DPA_VERSION)
+    )
+
+
+def mask_email(email):
+    """Mascarar email para exibição: cleriston@gmail.com → cle***@gmail.com"""
+    if not email or "@" not in email:
+        return email or ""
+    local, domain = email.split("@", 1)
+    if len(local) <= 3:
+        return f"{local[0]}***@{domain}"
+    return f"{local[:3]}***@{domain}"
+
+
+def mask_phone(phone):
+    """Mascarar telefone: +5588999998888 → +5588****8888"""
+    if not phone:
+        return ""
+    s = str(phone)
+    if len(s) <= 6:
+        return s
+    return s[:6] + "*" * (len(s) - 10) + s[-4:] if len(s) >= 10 else s[:3] + "*" * (len(s) - 3)
+
+
+def export_user_data_as_json(user_id):
+    """Exporta TODOS os dados pessoais do usuário em formato estruturado JSON.
+    Cumpre LGPD Art. 18, V (portabilidade) e Art. 18, II (acesso).
+
+    Retorna dict pronto pra serialização ou None em caso de erro.
+    """
+    try:
+        db = get_db()
+        # Dados básicos do usuário (sem hash de senha!)
+        user_row = db.execute(
+            """SELECT id, email, name, company, phone, plan, plan_status,
+                      msgs_limit, msgs_used, trial_ends_at, last_login,
+                      created_at, is_active, email_verified
+               FROM users WHERE id=?""", (user_id,)
+        ).fetchone()
+        if not user_row:
+            return None
+
+        export = {
+            "_meta": {
+                "export_date": datetime.now().isoformat(),
+                "lgpd_basis": "Art. 18, II e V da Lei 13.709/2018",
+                "data_subject_id": user_id,
+                "controller": "atendente.online — Clériston Almeida Capistrano",
+                "format_version": "1.0",
+            },
+            "cadastro": dict(user_row),
+            "consentimentos": [],
+            "configuracoes_whatsapp": [],
+            "contatos": [],
+            "conversas": [],
+            "mensagens": [],
+            "pedidos": [],
+            "pagamentos": [],
+            "pipeline_cards": [],
+            "knowledge_base": [],
+            "quick_replies": [],
+            "templates_whatsapp": [],
+            "campanhas": [],
+            "contatos_bloqueados": [],
+            "produtos": [],
+            "biblioteca_social": [],
+            "posts_agendados": [],
+            "uso_api": [],
+            "log_admin": [],
+        }
+
+        # Helper interno para tabelas simples (1 SELECT)
+        def _fetch_table(table, where="user_id=?", params=(user_id,), order=""):
+            try:
+                sql = f"SELECT * FROM {table} WHERE {where}"
+                if order:
+                    sql += f" ORDER BY {order}"
+                rows = db.execute(sql, params).fetchall()
+                return [dict(r) for r in rows]
+            except Exception as e:
+                print(f"[EXPORT] Erro lendo {table}: {e}")
+                return []
+
+        export["consentimentos"]       = _fetch_table("consent_log", order="created_at DESC")
+        export["contatos"]             = _fetch_table("contacts")
+        export["conversas"]            = _fetch_table("conversations")
+        export["pedidos"]              = _fetch_table("orders")
+        export["pagamentos"]           = _fetch_table("payments")
+        export["pipeline_cards"]       = _fetch_table("pipeline_cards")
+        export["knowledge_base"]       = _fetch_table("knowledge_base")
+        export["quick_replies"]        = _fetch_table("quick_replies")
+        export["templates_whatsapp"]   = _fetch_table("whatsapp_templates")
+        export["campanhas"]            = _fetch_table("campaigns")
+        export["contatos_bloqueados"]  = _fetch_table("blocked_contacts")
+        export["produtos"]             = _fetch_table("product_gallery")
+        export["biblioteca_social"]    = _fetch_table("social_media_library")
+        export["posts_agendados"]      = _fetch_table("scheduled_posts")
+        export["uso_api"]              = _fetch_table("api_usage_log", order="created_at DESC")
+
+        # Mensagens: pelo conv.user_id (não tem user_id direto)
+        try:
+            rows = db.execute(
+                """SELECT m.* FROM messages m
+                   JOIN conversations c ON c.id = m.conversation_id
+                   WHERE c.user_id = ?
+                   ORDER BY m.created_at""", (user_id,)
+            ).fetchall()
+            export["mensagens"] = [dict(r) for r in rows]
+        except Exception as e:
+            print(f"[EXPORT] Erro lendo messages: {e}")
+
+        # Resumo numérico
+        export["_resumo"] = {
+            "total_contatos": len(export["contatos"]),
+            "total_conversas": len(export["conversas"]),
+            "total_mensagens": len(export["mensagens"]),
+            "total_pedidos": len(export["pedidos"]),
+            "total_pagamentos": len(export["pagamentos"]),
+            "total_consentimentos": len(export["consentimentos"]),
+        }
+
+        return export
+    except Exception as e:
+        print(f"[EXPORT] Erro fatal: {e}")
+        return None
+
+
+def anonymize_user_account(user_id, reason="user_request"):
+    """Anonimiza a conta do usuário (LGPD Art. 18, VI - exclusão).
+
+    Estratégia HÍBRIDA:
+    - Anonimiza PII em `users` (mas mantém registro pra integridade referencial e obrigação fiscal)
+    - DELETA: conversas, mensagens, contatos, knowledge_base, quick_replies,
+              campaigns, pipeline_cards, scheduled_posts, social_media_library,
+              product_gallery, blocked_contacts
+    - MANTÉM (anonimizado): users (linha vazia com flag), payments, orders, audit logs,
+              api_usage_log (necessário pra obrigação fiscal/contábil 5 anos)
+    - PRESERVA: consent_log (prova legal perpétua de aceites/revogações)
+
+    Retorna True se executou sem erros críticos.
+    """
+    if not user_id:
+        return False
+    try:
+        db = get_db()
+        anon_email = f"deleted_user_{user_id}@deleted.local"
+        deleted_at = datetime.now().isoformat()
+
+        # 1. Registrar a revogação ANTES de anonimizar (precisamos do email original)
+        original = db.execute("SELECT email FROM users WHERE id=?", (user_id,)).fetchone()
+        original_email = original["email"] if original else ""
+
+        # Tabelas a DELETAR (conteúdo operacional, sem obrigação legal de manter)
+        tables_to_delete = [
+            ("messages", "conversation_id IN (SELECT id FROM conversations WHERE user_id=?)"),
+            ("conversations", "user_id=?"),
+            ("contacts", "user_id=?"),
+            ("knowledge_base", "user_id=?"),
+            ("quick_replies", "user_id=?"),
+            ("blocked_contacts", "user_id=?"),
+            ("campaign_contacts", "campaign_id IN (SELECT id FROM campaigns WHERE user_id=?)"),
+            ("campaigns", "user_id=?"),
+            ("pipeline_cards", "user_id=?"),
+            ("pipeline_stages", "user_id=?"),
+            ("whatsapp_templates", "user_id=?"),
+            ("product_gallery", "user_id=?"),
+            ("social_media_library", "user_id=?"),
+            ("scheduled_posts", "user_id=?"),
+        ]
+        for table, where in tables_to_delete:
+            try:
+                db.execute(f"DELETE FROM {table} WHERE {where}", (user_id,))
+            except Exception as e:
+                print(f"[ANONYMIZE] Erro deletando {table}: {e}")
+
+        # Tabelas a ANONIMIZAR (mantém pra obrigação fiscal/legal)
+        # orders e payments: anonimizar referência ao cliente, manter dados financeiros
+        try:
+            db.execute(
+                "UPDATE orders SET customer_name='Usuário Excluído', customer_phone='', customer_email='' WHERE user_id=?",
+                (user_id,)
+            )
+        except Exception as e:
+            print(f"[ANONYMIZE] Erro anonimizando orders: {e}")
+
+        # Anonimiza o registro principal de users — mas mantém a linha
+        # pra preservar integridade referencial de payments (5 anos obrigatórios)
+        try:
+            db.execute(
+                """UPDATE users SET
+                    email = ?,
+                    password_hash = '',
+                    name = 'Usuário Excluído',
+                    company = '',
+                    phone = '',
+                    whatsapp_token = '',
+                    whatsapp_phone_id = '',
+                    whatsapp_business_account_id = '',
+                    instagram_token = '',
+                    messenger_token = '',
+                    telegram_chat_id = '',
+                    mercadopago_token = '',
+                    is_active = 0,
+                    plan_status = 'deleted',
+                    email_verified = 0,
+                    twofa_secret = '',
+                    twofa_enabled = 0,
+                    twofa_backup_codes = ''
+                   WHERE id = ?""",
+                (anon_email, user_id)
+            )
+        except Exception as e:
+            # Algumas colunas podem não existir — tenta versão mínima
+            print(f"[ANONYMIZE] Erro UPDATE users completo: {e} — tentando versão mínima")
+            db.execute(
+                """UPDATE users SET email=?, password_hash='', name='Usuário Excluído',
+                   company='', is_active=0, plan_status='deleted' WHERE id=?""",
+                (anon_email, user_id)
+            )
+
+        # Registra a anonimização no consent_log (prova legal)
+        db.execute(
+            """INSERT INTO consent_log
+               (user_id, email, consent_type, consent_version, accepted, ip_address, user_agent, details)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, original_email, "data_processing", PRIVACY_POLICY_VERSION, 0,
+             request.remote_addr if request else "",
+             (request.headers.get("User-Agent", "")[:300] if request else ""),
+             f"Conta anonimizada/excluída a pedido do titular em {deleted_at}. Motivo: {reason}")
+        )
+        db.commit()
+        print(f"[ANONYMIZE] Usuário {user_id} ({original_email}) anonimizado com sucesso")
+        return True
+    except Exception as e:
+        print(f"[ANONYMIZE] Erro fatal: {e}")
+        return False
+
+
+def generate_deletion_code(user_id, email):
+    """Gera código de 6 dígitos pra confirmar exclusão de conta via email.
+    Reutiliza tabela verification_codes com tipo 'deletion'.
+    Código válido por 15 minutos."""
+    if not email:
+        return None
+    try:
+        code = f"{secrets.randbelow(900000) + 100000}"  # 6 dígitos
+        db = get_db()
+        # Limpar códigos antigos do mesmo email
+        db.execute("DELETE FROM verification_codes WHERE email=? AND code_type='deletion'", (email,))
+        db.execute(
+            """INSERT INTO verification_codes (email, code, code_type, expires_at)
+               VALUES (?, ?, 'deletion', datetime('now', '+15 minutes'))""",
+            (email, code)
+        )
+        db.commit()
+        return code
+    except Exception as e:
+        print(f"[DELETION_CODE] Erro: {e}")
+        return None
+
+
+def verify_deletion_code(email, code):
+    """Verifica se o código de exclusão é válido."""
+    if not email or not code:
+        return False
+    try:
+        db = get_db()
+        row = db.execute(
+            """SELECT id FROM verification_codes
+               WHERE email=? AND code=? AND code_type='deletion'
+                 AND expires_at > datetime('now')
+               LIMIT 1""", (email, code)
+        ).fetchone()
+        if row:
+            db.execute("DELETE FROM verification_codes WHERE id=?", (row["id"],))
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        print(f"[DELETION_CODE] Erro verificação: {e}")
+        return False
 
 
 def register_processed_webhook_event(source, event_key, user_id=None, payload=None):
@@ -1412,6 +1809,25 @@ def login_required(f):
             return redirect("/login?error=Conta+desativada.+Entre+em+contato+com+o+suporte.")
         # Descriptografa tokens sensíveis transparentemente
         g.user = decrypt_user_row(user)
+
+        # LGPD: forçar re-aceite de termos atualizados (Sprint 2)
+        # Whitelist: rotas que devem funcionar mesmo sem aceite atualizado
+        # (a própria página de aceite, logout, exclusão de conta, exportação, documentos legais)
+        path = request.path or ""
+        lgpd_whitelist = (
+            "/conta/aceitar-termos",
+            "/conta/excluir",
+            "/conta/exportar",
+            "/logout",
+            "/privacy",
+            "/terms",
+            "/dpa",
+            "/dpo",
+        )
+        if not any(path.startswith(p) for p in lgpd_whitelist):
+            if user_needs_to_reaccept_terms(session["user_id"]):
+                return redirect("/conta/aceitar-termos")
+
         return f(*args, **kwargs)
     return decorated
 
@@ -1930,6 +2346,7 @@ def base_html(title, content, user=None):
             <div class="nav-user">
                 <span class="user-plan">{plan_name}</span>
                 <span class="user-name">{user['name']}</span>
+                <a href="/conta/meus-dados" class="btn-logout" title="Meus dados (LGPD)" style="margin-right:6px">🛡️</a>
                 <a href="/logout" class="btn-logout">Sair</a>
             </div></div></nav>"""
     return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><link rel="icon" type="image/png" href="/favicon.ico"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#6366f1">
@@ -2050,60 +2467,173 @@ def get_admin_stats():
 
 @app.route("/privacy")
 def privacy_policy():
-    content = """
-    <div class="container" style="max-width:800px">
+    content = f"""
+    <div class="container" style="max-width:860px">
         <div class="card" style="margin-top:40px;padding:40px">
-            <h1 style="font-size:28px;font-weight:700;margin-bottom:24px">Política de Privacidade</h1>
-            <p style="color:var(--text2);margin-bottom:16px">Última atualização: abril de 2026</p>
-            
-            <div style="color:var(--text2);font-size:15px;line-height:1.8">
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">1. Informações que coletamos</h2>
-                <p>O Atende.AI coleta as seguintes informações para fornecer nossos serviços:</p>
-                <p>• <strong style="color:var(--text)">Dados de cadastro:</strong> nome, email, empresa e telefone fornecidos durante o registro.</p>
-                <p>• <strong style="color:var(--text)">Dados do WhatsApp Business:</strong> Phone Number ID e tokens de acesso necessários para a integração com a API do WhatsApp Cloud.</p>
-                <p>• <strong style="color:var(--text)">Mensagens:</strong> conteúdo das conversas entre sua empresa e seus clientes via WhatsApp, incluindo texto, áudio, imagens e documentos, para processamento pela inteligência artificial.</p>
-                <p>• <strong style="color:var(--text)">Dados de uso:</strong> métricas de utilização do serviço, como quantidade de mensagens processadas.</p>
+            <h1 style="font-size:28px;font-weight:700;margin-bottom:8px">Política de Privacidade</h1>
+            <p style="color:var(--text2);margin-bottom:24px;font-size:14px">
+                <strong>Versão:</strong> {PRIVACY_POLICY_VERSION} &nbsp;|&nbsp;
+                <strong>Última atualização:</strong> 18 de maio de 2026
+            </p>
 
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">2. Como usamos suas informações</h2>
-                <p>Utilizamos os dados coletados para:</p>
-                <p>• Fornecer e manter o serviço de atendimento automatizado via WhatsApp.</p>
-                <p>• Processar mensagens recebidas e gerar respostas inteligentes através de IA.</p>
-                <p>• Transcrever mensagens de áudio para texto.</p>
-                <p>• Analisar imagens e documentos enviados pelos clientes.</p>
-                <p>• Exibir conversas e métricas no painel administrativo.</p>
-                <p>• Processar pagamentos de assinatura.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">3. Compartilhamento de dados</h2>
-                <p>Seus dados podem ser compartilhados com os seguintes serviços terceiros, exclusivamente para o funcionamento do sistema:</p>
-                <p>• <strong style="color:var(--text)">Meta (WhatsApp Cloud API):</strong> para envio e recebimento de mensagens.</p>
-                <p>• <strong style="color:var(--text)">Anthropic (Claude):</strong> para processamento de linguagem natural e geração de respostas.</p>
-                <p>• <strong style="color:var(--text)">Groq:</strong> para transcrição de mensagens de áudio.</p>
-                <p>• <strong style="color:var(--text)">Mercado Pago:</strong> para processamento de pagamentos.</p>
-                <p>Não vendemos, alugamos ou compartilhamos seus dados pessoais com terceiros para fins de marketing.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">4. Armazenamento e segurança</h2>
-                <p>Os dados são armazenados em servidores seguros. Senhas são criptografadas usando PBKDF2 com salt. Tokens de API são armazenados de forma segura no banco de dados. Utilizamos HTTPS para toda comunicação.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">5. Retenção de dados</h2>
-                <p>Mantemos seus dados enquanto sua conta estiver ativa. Ao cancelar sua conta, seus dados serão excluídos em até 30 dias, exceto quando houver obrigação legal de retenção.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">6. Direitos do usuário</h2>
-                <p>Conforme a LGPD (Lei Geral de Proteção de Dados), você tem direito a:</p>
-                <p>• Acessar seus dados pessoais.</p>
-                <p>• Corrigir dados incompletos ou incorretos.</p>
-                <p>• Solicitar a exclusão dos seus dados.</p>
-                <p>• Revogar o consentimento a qualquer momento.</p>
-                <p>• Solicitar a portabilidade dos seus dados.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">7. Contato</h2>
-                <p>Para dúvidas sobre esta política ou para exercer seus direitos, entre em contato pelo email do administrador do sistema.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">8. Alterações</h2>
-                <p>Esta política pode ser atualizada periodicamente. Notificaremos sobre mudanças significativas por email ou pelo painel do sistema.</p>
+            <div style="background:var(--bg2);padding:16px;border-radius:8px;margin-bottom:24px;font-size:14px;line-height:1.7">
+                <strong>📌 Resumo executivo:</strong> O atendente.online é uma plataforma SaaS de atendimento WhatsApp com IA.
+                Coletamos dados estritamente necessários para operar o serviço, criptografamos informações sensíveis,
+                não vendemos dados a terceiros, e respeitamos integralmente a LGPD (Lei nº 13.709/2018).
             </div>
-            
-            <div style="margin-top:32px;text-align:center">
+
+            <div style="color:var(--text2);font-size:15px;line-height:1.8">
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">1. Identificação do Controlador</h2>
+                <p>O serviço atendente.online é operado por:</p>
+                <p style="background:var(--bg2);padding:12px;border-radius:6px;margin:12px 0">
+                    <strong>Clériston Almeida Capistrano</strong><br>
+                    Pessoa física (CNPJ em processo de abertura)<br>
+                    Endereço: Quixadá-CE, Brasil<br>
+                    E-mail de contato: <a href="mailto:contato@atendente.online">contato@atendente.online</a>
+                </p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">2. Encarregado pelo Tratamento de Dados (DPO)</h2>
+                <p>Conforme exigido pelo Art. 41 da LGPD, indicamos como Encarregado pelo Tratamento de Dados Pessoais:</p>
+                <p style="background:var(--bg2);padding:12px;border-radius:6px;margin:12px 0">
+                    <strong>Nome:</strong> Clériston Almeida Capistrano<br>
+                    <strong>E-mail:</strong> <a href="mailto:contato@atendente.online">contato@atendente.online</a><br>
+                    <strong>Atribuições:</strong> Receber comunicações de titulares e da ANPD,
+                    orientar sobre práticas de proteção de dados e executar demais atividades determinadas pelo controlador.
+                </p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">3. Dados Pessoais Tratados</h2>
+
+                <h3 style="color:var(--text);font-size:16px;margin:16px 0 8px">3.1. Dados dos Usuários (clientes do SaaS)</h3>
+                <p>• <strong style="color:var(--text)">Cadastro:</strong> nome, email, empresa, telefone, senha (armazenada com hash PBKDF2-SHA256).</p>
+                <p>• <strong style="color:var(--text)">Pagamento:</strong> processado integralmente pelo Mercado Pago; não armazenamos dados de cartão.</p>
+                <p>• <strong style="color:var(--text)">Credenciais de integração:</strong> tokens da Meta, Mercado Pago, Telegram — armazenados criptografados (AES-128 + HMAC-SHA256, Fernet).</p>
+                <p>• <strong style="color:var(--text)">Uso:</strong> data/hora de login, quantidade de mensagens processadas, IP, navegador.</p>
+
+                <h3 style="color:var(--text);font-size:16px;margin:16px 0 8px">3.2. Dados de Clientes Finais (interlocutores do WhatsApp)</h3>
+                <p>Quando seus clientes (terceiros) interagem com sua conta WhatsApp Business, processamos:</p>
+                <p>• Número de telefone, nome de perfil (fornecido pelo WhatsApp).</p>
+                <p>• Conteúdo das mensagens trocadas (texto, áudio, imagem, documentos).</p>
+                <p>• Mensagens são armazenadas criptografadas no banco de dados.</p>
+                <p style="background:#fff8e1;padding:12px;border-radius:6px;color:#5d4037;margin:8px 0">
+                    ⚠️ <strong>Importante:</strong> Para esses dados, atuamos como <strong>Operador</strong> (LGPD Art. 5º, VII),
+                    e você (usuário do atendente.online) é o <strong>Controlador</strong>. Você é responsável por obter
+                    consentimento dos seus próprios clientes e cumprir as obrigações de controlador previstas na LGPD.
+                </p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">4. Bases Legais para o Tratamento (LGPD Art. 7º e 11)</h2>
+                <p>Tratamos seus dados com base nas seguintes hipóteses legais:</p>
+                <p>• <strong style="color:var(--text)">Execução de contrato</strong> (Art. 7º, V): para prestar o serviço contratado.</p>
+                <p>• <strong style="color:var(--text)">Cumprimento de obrigação legal</strong> (Art. 7º, II): para emissão de notas, registros contábeis.</p>
+                <p>• <strong style="color:var(--text)">Consentimento</strong> (Art. 7º, I): para envio de comunicações de marketing (sempre opt-in).</p>
+                <p>• <strong style="color:var(--text)">Legítimo interesse</strong> (Art. 7º, IX): para segurança da plataforma (logs, auditoria, prevenção de fraude).</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">5. Compartilhamento com Terceiros (Operadores)</h2>
+                <p>Compartilhamos dados estritamente necessários com os seguintes operadores:</p>
+                <table style="width:100%;border-collapse:collapse;margin:12px 0;font-size:14px">
+                    <tr style="background:var(--bg2)">
+                        <th style="padding:10px;border:1px solid var(--border);text-align:left">Operador</th>
+                        <th style="padding:10px;border:1px solid var(--border);text-align:left">Finalidade</th>
+                        <th style="padding:10px;border:1px solid var(--border);text-align:left">País</th>
+                    </tr>
+                    <tr>
+                        <td style="padding:10px;border:1px solid var(--border)"><strong>Meta Platforms</strong></td>
+                        <td style="padding:10px;border:1px solid var(--border)">Envio/recebimento de mensagens WhatsApp, Instagram, Messenger</td>
+                        <td style="padding:10px;border:1px solid var(--border)">EUA/Irlanda</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:10px;border:1px solid var(--border)"><strong>Anthropic (Claude)</strong></td>
+                        <td style="padding:10px;border:1px solid var(--border)">Geração de respostas com IA</td>
+                        <td style="padding:10px;border:1px solid var(--border)">EUA</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:10px;border:1px solid var(--border)"><strong>Groq</strong></td>
+                        <td style="padding:10px;border:1px solid var(--border)">Transcrição de áudio (Speech-to-Text)</td>
+                        <td style="padding:10px;border:1px solid var(--border)">EUA</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:10px;border:1px solid var(--border)"><strong>Mercado Pago</strong></td>
+                        <td style="padding:10px;border:1px solid var(--border)">Processamento de pagamentos</td>
+                        <td style="padding:10px;border:1px solid var(--border)">Brasil/Argentina</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:10px;border:1px solid var(--border)"><strong>Railway</strong></td>
+                        <td style="padding:10px;border:1px solid var(--border)">Hospedagem da aplicação e banco de dados</td>
+                        <td style="padding:10px;border:1px solid var(--border)">EUA</td>
+                    </tr>
+                </table>
+                <p>Transferência internacional ocorre conforme Art. 33 da LGPD, com adoção de cláusulas contratuais
+                e medidas de segurança equivalentes às brasileiras.</p>
+                <p><strong style="color:var(--text)">Não vendemos, alugamos ou cedemos dados pessoais a terceiros</strong> para fins de marketing,
+                profiling de terceiros ou qualquer outra finalidade não declarada nesta política.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">6. Segurança da Informação</h2>
+                <p>Adotamos medidas técnicas e administrativas alinhadas com padrões internacionais (ISO 27001 como referência):</p>
+                <p>• <strong style="color:var(--text)">Em trânsito:</strong> HTTPS/TLS 1.2+ obrigatório em todas as comunicações.</p>
+                <p>• <strong style="color:var(--text)">Em repouso:</strong> mensagens, contatos e tokens criptografados (Fernet AES-128 + HMAC-SHA256).</p>
+                <p>• <strong style="color:var(--text)">Senhas:</strong> hash PBKDF2-SHA256 com 100.000 iterações + salt aleatório.</p>
+                <p>• <strong style="color:var(--text)">Acesso administrativo:</strong> 2FA (TOTP) obrigatório + códigos de backup.</p>
+                <p>• <strong style="color:var(--text)">Auditoria:</strong> registro de ações sensíveis (audit log).</p>
+                <p>• <strong style="color:var(--text)">Proteção:</strong> rate limiting, CSRF tokens, CSP, HSTS, X-Frame-Options.</p>
+                <p>• <strong style="color:var(--text)">Backups:</strong> diários, criptografados.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">7. Retenção de Dados</h2>
+                <p>Aplicamos o princípio da necessidade (LGPD Art. 6º, III): dados são mantidos pelo tempo estritamente necessário.</p>
+                <p>• <strong style="color:var(--text)">Mensagens de WhatsApp/Instagram/Messenger:</strong> conforme o plano contratado:</p>
+                <p style="margin-left:20px">– Plano Starter: <strong>3 meses</strong></p>
+                <p style="margin-left:20px">– Plano Profissional: <strong>6 meses</strong></p>
+                <p style="margin-left:20px">– Plano Business: <strong>12 meses</strong></p>
+                <p style="margin-left:20px">– Plano Agência: <strong>24 meses</strong></p>
+                <p>• <strong style="color:var(--text)">Dados de cadastro:</strong> enquanto a conta estiver ativa + 30 dias após cancelamento.</p>
+                <p>• <strong style="color:var(--text)">Pedidos e transações:</strong> 5 anos (obrigação legal — Código Tributário).</p>
+                <p>• <strong style="color:var(--text)">Logs de auditoria:</strong> 6 meses para análise de segurança.</p>
+                <p>• <strong style="color:var(--text)">Registros de consentimento:</strong> 5 anos para comprovação perante ANPD.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">8. Direitos do Titular (LGPD Art. 18)</h2>
+                <p>Você tem direito a, mediante requisição:</p>
+                <p>• <strong style="color:var(--text)">I.</strong> Confirmação da existência de tratamento;</p>
+                <p>• <strong style="color:var(--text)">II.</strong> Acesso aos dados;</p>
+                <p>• <strong style="color:var(--text)">III.</strong> Correção de dados incompletos, inexatos ou desatualizados;</p>
+                <p>• <strong style="color:var(--text)">IV.</strong> Anonimização, bloqueio ou eliminação de dados desnecessários, excessivos ou tratados em desconformidade;</p>
+                <p>• <strong style="color:var(--text)">V.</strong> Portabilidade dos dados (exportação em formato estruturado);</p>
+                <p>• <strong style="color:var(--text)">VI.</strong> Eliminação dos dados pessoais tratados com consentimento;</p>
+                <p>• <strong style="color:var(--text)">VII.</strong> Informação sobre entidades públicas e privadas com as quais compartilhamos dados;</p>
+                <p>• <strong style="color:var(--text)">VIII.</strong> Informação sobre a possibilidade de não fornecer consentimento e suas consequências;</p>
+                <p>• <strong style="color:var(--text)">IX.</strong> Revogação do consentimento.</p>
+                <p style="background:var(--bg2);padding:12px;border-radius:6px;margin:12px 0">
+                    💡 <strong>Como exercer:</strong> usuários logados podem acessar diretamente a página
+                    <a href="/conta/meus-dados"><strong>Meus Dados</strong></a> para exportar, corrigir ou excluir.
+                    Alternativamente, envie solicitação para <a href="mailto:contato@atendente.online">contato@atendente.online</a>
+                    com prazo de resposta de até 15 dias úteis.
+                </p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">9. Uso de Cookies e Tecnologias Similares</h2>
+                <p>Utilizamos cookies estritamente necessários (sessão de login, CSRF token). Não utilizamos cookies de rastreamento
+                comportamental de terceiros nem fornecemos dados para redes de publicidade.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">10. Incidentes de Segurança</h2>
+                <p>Em caso de incidente que possa acarretar risco ou dano relevante aos titulares, comunicaremos
+                à ANPD e aos titulares afetados em prazo razoável, conforme Art. 48 da LGPD.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">11. Alterações desta Política</h2>
+                <p>Esta política pode ser atualizada para refletir mudanças legais, técnicas ou de negócio. A versão atual
+                é <strong>{PRIVACY_POLICY_VERSION}</strong>. Versões futuras serão notificadas por email e
+                pelo painel do sistema, com solicitação de novo aceite quando aplicável.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">12. Foro</h2>
+                <p>Fica eleito o foro da Comarca de Quixadá, Estado do Ceará, para dirimir quaisquer controvérsias
+                oriundas desta Política, com renúncia expressa a qualquer outro, por mais privilegiado que seja.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">13. Autoridade Nacional</h2>
+                <p>Você também pode apresentar reclamação à Autoridade Nacional de Proteção de Dados (ANPD)
+                em <a href="https://www.gov.br/anpd" target="_blank" rel="noopener">gov.br/anpd</a>.</p>
+
+            </div>
+
+            <div style="margin-top:32px;text-align:center;display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
                 <a href="/" class="btn btn-secondary">← Voltar ao início</a>
+                <a href="/terms" class="btn btn-secondary">Ver Termos de Serviço</a>
+                <a href="/dpa" class="btn btn-secondary">Ver DPA (Contrato de Operador)</a>
             </div>
         </div>
     </div>"""
@@ -2112,44 +2642,872 @@ def privacy_policy():
 
 @app.route("/terms")
 def terms_of_service():
-    content = """
-    <div class="container" style="max-width:800px">
+    content = f"""
+    <div class="container" style="max-width:860px">
         <div class="card" style="margin-top:40px;padding:40px">
-            <h1 style="font-size:28px;font-weight:700;margin-bottom:24px">Termos de Serviço</h1>
-            <p style="color:var(--text2);margin-bottom:16px">Última atualização: abril de 2026</p>
-            
-            <div style="color:var(--text2);font-size:15px;line-height:1.8">
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">1. Aceitação dos termos</h2>
-                <p>Ao utilizar o Atende.AI, você concorda com estes Termos de Serviço. Se não concordar, não utilize o serviço.</p>
+            <h1 style="font-size:28px;font-weight:700;margin-bottom:8px">Termos de Serviço</h1>
+            <p style="color:var(--text2);margin-bottom:24px;font-size:14px">
+                <strong>Versão:</strong> {TERMS_OF_SERVICE_VERSION} &nbsp;|&nbsp;
+                <strong>Última atualização:</strong> 18 de maio de 2026
+            </p>
 
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">2. Descrição do serviço</h2>
-                <p>O Atende.AI é uma plataforma SaaS de atendimento automatizado via WhatsApp com inteligência artificial. O serviço inclui: recebimento e resposta automática de mensagens, transcrição de áudios, análise de imagens, painel administrativo e integração com a API do WhatsApp Business.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">3. Planos e pagamento</h2>
-                <p>Oferecemos planos de assinatura mensal com período de teste gratuito de 7 dias. Os pagamentos são processados via Mercado Pago. Os preços podem ser atualizados com aviso prévio de 30 dias.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">4. Responsabilidades do usuário</h2>
-                <p>O usuário é responsável por: manter a confidencialidade de suas credenciais, cumprir as políticas do WhatsApp Business, garantir que possui consentimento dos seus clientes para comunicação via WhatsApp, e não utilizar o serviço para envio de spam ou conteúdo ilegal.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">5. Limitação de responsabilidade</h2>
-                <p>O Atende.AI não se responsabiliza por: indisponibilidade temporária dos serviços de terceiros (WhatsApp, Anthropic, Groq), conteúdo gerado pela IA que possa conter imprecisões, ou perdas decorrentes do uso inadequado do serviço.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">6. Cancelamento</h2>
-                <p>Você pode cancelar sua assinatura a qualquer momento pelo painel. O acesso continuará até o final do período pago. Não há reembolso proporcional.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">7. Propriedade intelectual</h2>
-                <p>O Atende.AI e todo seu conteúdo, funcionalidades e tecnologia são de propriedade exclusiva da empresa. Os dados e conversas dos clientes pertencem ao usuário.</p>
-
-                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">8. Contato</h2>
-                <p>Para dúvidas sobre estes termos, entre em contato pelo email do administrador do sistema.</p>
+            <div style="background:var(--bg2);padding:16px;border-radius:8px;margin-bottom:24px;font-size:14px;line-height:1.7">
+                <strong>📌 Resumo:</strong> Estes termos regem o uso do serviço atendente.online (SaaS de atendimento WhatsApp com IA).
+                Ao se cadastrar, você concorda integralmente com estas condições. Leia atentamente — em especial as seções
+                de responsabilidades do usuário, conformidade com a Meta e limitações de responsabilidade.
             </div>
-            
-            <div style="margin-top:32px;text-align:center">
+
+            <div style="color:var(--text2);font-size:15px;line-height:1.8">
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">1. Definições</h2>
+                <p>• <strong style="color:var(--text)">"Serviço":</strong> a plataforma atendente.online, acessível em https://atendente.online.</p>
+                <p>• <strong style="color:var(--text)">"Contratante" ou "Usuário":</strong> pessoa física ou jurídica que se cadastra e contrata o Serviço.</p>
+                <p>• <strong style="color:var(--text)">"Contratada":</strong> Clériston Almeida Capistrano, operador do Serviço.</p>
+                <p>• <strong style="color:var(--text)">"Cliente Final":</strong> pessoa que interage com o Contratante via WhatsApp/Instagram/Messenger.</p>
+                <p>• <strong style="color:var(--text)">"Dados Pessoais":</strong> conforme Art. 5º, I da LGPD.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">2. Aceitação dos Termos</h2>
+                <p>Ao criar conta no Serviço, o Contratante declara que: (i) leu, entendeu e aceita integralmente estes Termos,
+                a <a href="/privacy">Política de Privacidade</a> e o <a href="/dpa">Contrato de Operador (DPA)</a>;
+                (ii) tem capacidade legal para contratar (maior de 18 anos ou representante legal de pessoa jurídica);
+                (iii) as informações fornecidas no cadastro são verdadeiras e atualizadas.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">3. Descrição do Serviço</h2>
+                <p>O atendente.online é uma plataforma SaaS multi-tenant que oferece:</p>
+                <p>• Atendimento automatizado via WhatsApp, Instagram e Messenger com inteligência artificial (Claude/Anthropic);</p>
+                <p>• Transcrição de áudios, análise de imagens e processamento de documentos PDF;</p>
+                <p>• CRM com funil de vendas, campanhas/broadcast e quick replies;</p>
+                <p>• E-commerce básico com integração ao Mercado Pago;</p>
+                <p>• Agência Digital com IA para geração e aprovação de conteúdo;</p>
+                <p>• Painel administrativo com 2FA, audit log e relatórios.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">4. Cadastro e Conta</h2>
+                <p>4.1. O Contratante é responsável por manter senha e códigos de 2FA em sigilo.</p>
+                <p>4.2. Não é permitido compartilhar conta com terceiros. Cada conta corresponde a uma única empresa/CNPJ
+                ou CPF do contratante.</p>
+                <p>4.3. A Contratada pode suspender ou encerrar contas que violem estes Termos, sem reembolso.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">5. Planos, Preços e Pagamento</h2>
+                <p>5.1. Oferecemos quatro planos (Starter R$97, Profissional R$197, Business R$397, Agência R$997)
+                com cobrança mensal recorrente via Mercado Pago.</p>
+                <p>5.2. Período de teste gratuito de 7 dias está disponível para novos cadastros.
+                Ao final do período, é necessário contratar plano pago para manter o acesso.</p>
+                <p>5.3. <strong style="color:var(--text)">Direito de arrependimento (CDC Art. 49):</strong> o Contratante pessoa física pode rescindir o contrato
+                em até 7 dias após a primeira contratação paga, com restituição integral.</p>
+                <p>5.4. <strong style="color:var(--text)">Reajuste de preços:</strong> mediante aviso prévio de 30 dias por email. Se o Contratante não concordar,
+                pode cancelar a assinatura antes da próxima cobrança.</p>
+                <p>5.5. <strong style="color:var(--text)">Inadimplência:</strong> falha no pagamento suspende o serviço após 5 dias de tolerância.
+                Após 30 dias, a conta é marcada como inativa e os dados ficam sujeitos à política de retenção.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">6. Limites por Plano</h2>
+                <p>Cada plano possui limite mensal de mensagens processadas pela IA. Excedido o limite, mensagens
+                adicionais não serão respondidas automaticamente até o início do próximo ciclo, ou o Contratante
+                pode fazer upgrade para plano superior.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">7. Responsabilidades do Contratante</h2>
+                <p>O Contratante se compromete a:</p>
+                <p>7.1. <strong style="color:var(--text)">Cumprir as políticas da Meta:</strong> incluindo a
+                <a href="https://www.whatsapp.com/legal/business-policy/" target="_blank" rel="noopener">WhatsApp Business Policy</a>,
+                <a href="https://developers.facebook.com/policy" target="_blank" rel="noopener">Meta Platform Terms</a> e
+                <a href="https://www.whatsapp.com/legal/messaging-commerce-policy" target="_blank" rel="noopener">Commerce Policy</a>.</p>
+                <p>7.2. <strong style="color:var(--text)">Obter consentimento prévio:</strong> garantir que possui base legal
+                (Art. 7º LGPD) para se comunicar com cada Cliente Final via WhatsApp.</p>
+                <p>7.3. <strong style="color:var(--text)">Não enviar spam:</strong> não realizar campanhas em massa para listas adquiridas,
+                contatos sem opt-in ou conteúdo enganoso.</p>
+                <p>7.4. <strong style="color:var(--text)">Conteúdo lícito:</strong> não utilizar o Serviço para envio ou facilitação de
+                conteúdo ilegal, discriminatório, fraudulento, de ódio, ou que viole direitos de terceiros.</p>
+                <p>7.5. <strong style="color:var(--text)">Não burlar a IA:</strong> não tentar extrair prompts internos, contornar limites
+                de uso, fazer engenharia reversa do sistema ou explorar vulnerabilidades sem autorização.</p>
+                <p>7.6. <strong style="color:var(--text)">Atender solicitações de Clientes Finais:</strong> na qualidade de
+                Controlador dos dados dos próprios clientes, responder solicitações LGPD (acesso, correção,
+                exclusão) que receber.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">8. Conteúdo Gerado por IA</h2>
+                <p>8.1. As respostas geradas pela IA podem conter imprecisões ou erros. O Contratante é responsável
+                por revisar e corrigir respostas quando necessário (incluindo via funcionalidade "Assumir conversa").</p>
+                <p>8.2. A Contratada não garante exatidão factual, completude ou adequação das respostas para
+                propósitos específicos (médicos, jurídicos, financeiros).</p>
+                <p>8.3. A Contratada se reserva o direito de bloquear prompts que violem políticas de uso da Anthropic.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">9. Propriedade Intelectual</h2>
+                <p>9.1. O código-fonte, marca, design, fluxos e funcionalidades do Serviço são de propriedade
+                exclusiva da Contratada e protegidos pela Lei nº 9.610/98 (Direitos Autorais) e Lei nº 9.279/96 (Propriedade Industrial).</p>
+                <p>9.2. O Contratante mantém integralmente a propriedade dos dados e conteúdos que insere no Serviço
+                (mensagens, base de conhecimento, produtos, etc.).</p>
+                <p>9.3. O Contratante concede licença não-exclusiva para a Contratada processar esses dados estritamente
+                para a prestação do Serviço.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">10. Disponibilidade e Suporte</h2>
+                <p>10.1. O Serviço é fornecido "como está" (as-is), sem SLA contratual de uptime para os planos atuais.</p>
+                <p>10.2. Manutenções programadas serão comunicadas com antecedência. Manutenções emergenciais
+                podem ocorrer sem aviso prévio.</p>
+                <p>10.3. Suporte é prestado por email (<a href="mailto:contato@atendente.online">contato@atendente.online</a>)
+                em horário comercial (segunda a sexta, 9h às 18h, BRT).</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">11. Limitação de Responsabilidade</h2>
+                <p>11.1. A Contratada não se responsabiliza por:</p>
+                <p>• Indisponibilidade ou alterações em serviços de terceiros (Meta/WhatsApp, Anthropic, Groq, Mercado Pago, Railway);</p>
+                <p>• Bloqueios, suspensões ou penalidades aplicadas pela Meta às contas do Contratante;</p>
+                <p>• Perdas comerciais, lucros cessantes ou danos indiretos decorrentes de uso ou indisponibilidade do Serviço;</p>
+                <p>• Conteúdo enviado ou recebido pelo Contratante ou seus Clientes Finais.</p>
+                <p>11.2. A responsabilidade total da Contratada, em qualquer hipótese, fica limitada ao valor pago
+                pelo Contratante nos 3 (três) meses anteriores ao evento que originou a reclamação.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">12. Cancelamento e Encerramento</h2>
+                <p>12.1. O Contratante pode cancelar a qualquer momento pelo painel. O acesso continua até o final
+                do período já pago.</p>
+                <p>12.2. Não há reembolso proporcional de períodos não utilizados, exceto no direito de arrependimento (cl. 5.3).</p>
+                <p>12.3. Após cancelamento, os dados ficam disponíveis para exportação por 30 dias e são anonimizados em seguida,
+                conforme política de retenção (ver Política de Privacidade).</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">13. Alterações dos Termos</h2>
+                <p>13.1. Estes Termos podem ser atualizados. A versão atual é <strong>{TERMS_OF_SERVICE_VERSION}</strong>.</p>
+                <p>13.2. Alterações materiais serão notificadas por email com 30 dias de antecedência. O uso continuado
+                após esse prazo constitui aceite das novas condições.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">14. Disposições Gerais</h2>
+                <p>14.1. Estes Termos são regidos pelas leis da República Federativa do Brasil.</p>
+                <p>14.2. Fica eleito o foro da Comarca de Quixadá-CE, com renúncia a qualquer outro.</p>
+                <p>14.3. Se qualquer cláusula for considerada inválida, as demais permanecem em vigor.</p>
+
+            </div>
+
+            <div style="margin-top:32px;text-align:center;display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
                 <a href="/" class="btn btn-secondary">← Voltar ao início</a>
+                <a href="/privacy" class="btn btn-secondary">Ver Política de Privacidade</a>
+                <a href="/dpa" class="btn btn-secondary">Ver DPA</a>
             </div>
         </div>
     </div>"""
     return base_html("Termos de Serviço", content)
+
+
+@app.route("/dpa")
+def dpa_contract():
+    """Data Processing Agreement / Contrato de Operador (LGPD Art. 39)."""
+    content = f"""
+    <div class="container" style="max-width:860px">
+        <div class="card" style="margin-top:40px;padding:40px">
+            <h1 style="font-size:28px;font-weight:700;margin-bottom:8px">Contrato de Operador de Dados (DPA)</h1>
+            <p style="color:var(--text2);margin-bottom:24px;font-size:14px">
+                <strong>Versão:</strong> {DPA_VERSION} &nbsp;|&nbsp;
+                <strong>Última atualização:</strong> 18 de maio de 2026
+            </p>
+
+            <div style="background:var(--bg2);padding:16px;border-radius:8px;margin-bottom:24px;font-size:14px;line-height:1.7">
+                <strong>📌 O que é este documento?</strong> Este é o Contrato de Operador de Dados (DPA — Data Processing Agreement),
+                conforme exigido pela LGPD (Art. 39). Ele formaliza a relação entre você (Controlador) e o atendente.online
+                (Operador) sobre o tratamento de dados pessoais dos seus clientes finais. Anexo aos Termos de Serviço.
+            </div>
+
+            <div style="color:var(--text2);font-size:15px;line-height:1.8">
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 1ª — Definições e Partes</h2>
+                <p>São partes deste contrato:</p>
+                <p>• <strong style="color:var(--text)">CONTROLADOR:</strong> o Contratante do serviço atendente.online,
+                identificado nos dados de cadastro.</p>
+                <p>• <strong style="color:var(--text)">OPERADOR:</strong> Clériston Almeida Capistrano, operador da plataforma atendente.online.</p>
+                <p>Os termos "Dados Pessoais", "Titular", "Tratamento", "Controlador" e "Operador" seguem as definições
+                do Art. 5º da Lei nº 13.709/2018 (LGPD).</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 2ª — Objeto</h2>
+                <p>O OPERADOR realiza tratamento de Dados Pessoais dos clientes finais do CONTROLADOR
+                (pessoas que interagem via WhatsApp, Instagram e Messenger) exclusivamente em nome e por conta deste,
+                conforme as instruções aqui estabelecidas e seguindo os Termos de Serviço.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 3ª — Dados Tratados</h2>
+                <p>O tratamento envolve as seguintes categorias de dados:</p>
+                <p>• Identificadores: nome de perfil, número de telefone;</p>
+                <p>• Conteúdo: mensagens em texto, áudio, imagem e documentos;</p>
+                <p>• Metadados: data/hora, status de leitura, canal de origem.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 4ª — Finalidades</h2>
+                <p>Os Dados serão tratados exclusivamente para:</p>
+                <p>• Atendimento automatizado via IA;</p>
+                <p>• Armazenamento de histórico de conversas;</p>
+                <p>• Geração de métricas agregadas para o CONTROLADOR;</p>
+                <p>• Processamento de pedidos (e-commerce, se habilitado);</p>
+                <p>• Quaisquer finalidades acessórias necessárias à execução do contrato.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 5ª — Obrigações do OPERADOR</h2>
+                <p>O OPERADOR se compromete a:</p>
+                <p>5.1. Tratar os Dados apenas conforme instruções do CONTROLADOR e desta avença;</p>
+                <p>5.2. Adotar medidas técnicas e organizacionais para proteção dos Dados (criptografia, controle de acesso,
+                logs de auditoria, backups, conforme detalhado na Política de Privacidade);</p>
+                <p>5.3. Comunicar ao CONTROLADOR, sem demora injustificada (em até 48 horas após ciência), qualquer incidente
+                de segurança que possa afetar Dados sob seu tratamento (LGPD Art. 48);</p>
+                <p>5.4. Não compartilhar Dados com terceiros, exceto sub-operadores listados na Política de Privacidade
+                (Meta, Anthropic, Groq, Mercado Pago, Railway) e mediante garantias equivalentes;</p>
+                <p>5.5. Manter sigilo profissional sobre os Dados, inclusive após o término deste contrato;</p>
+                <p>5.6. Auxiliar o CONTROLADOR no atendimento de solicitações de Titulares e da ANPD;</p>
+                <p>5.7. Eliminar ou devolver Dados ao final do contrato, exceto se obrigação legal exigir retenção (Art. 16 LGPD);</p>
+                <p>5.8. Demonstrar conformidade quando solicitado pelo CONTROLADOR, mediante prazo razoável.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 6ª — Obrigações do CONTROLADOR</h2>
+                <p>O CONTROLADOR se compromete a:</p>
+                <p>6.1. Possuir base legal válida (LGPD Art. 7º) para o tratamento dos Dados que insere ou processa via o Serviço;</p>
+                <p>6.2. Informar adequadamente seus próprios titulares sobre o tratamento de dados, conforme Art. 9º LGPD;</p>
+                <p>6.3. Atender, em primeira instância, solicitações de seus próprios titulares (acesso, correção, exclusão);</p>
+                <p>6.4. Não inserir no Serviço dados de menores de 18 anos sem consentimento específico dos responsáveis,
+                nem dados sensíveis (saúde, religião, orientação sexual, biometria) sem base legal adequada (Art. 11 LGPD);</p>
+                <p>6.5. Comunicar imediatamente ao OPERADOR qualquer incidente, dúvida ou risco identificado.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 7ª — Sub-operadores Autorizados</h2>
+                <p>O CONTROLADOR autoriza expressamente o uso dos seguintes sub-operadores (lista completa na Política de Privacidade):</p>
+                <p>• Meta Platforms (WhatsApp/Instagram/Messenger API);</p>
+                <p>• Anthropic (Claude — geração de respostas com IA);</p>
+                <p>• Groq (transcrição de áudio);</p>
+                <p>• Mercado Pago (pagamentos);</p>
+                <p>• Railway (hospedagem).</p>
+                <p>Mudanças nesta lista serão comunicadas com 30 dias de antecedência, e o CONTROLADOR pode se opor
+                à inclusão de novos sub-operadores; havendo objeção, o contrato pode ser rescindido sem multa.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 8ª — Transferência Internacional</h2>
+                <p>Parte dos sub-operadores opera nos Estados Unidos. Tais transferências observam o Art. 33 da LGPD,
+                em especial cláusulas contratuais padrão e padrões de proteção compatíveis com o ordenamento jurídico brasileiro.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 9ª — Responsabilidade e Indenização</h2>
+                <p>9.1. Cada parte é responsável por suas obrigações nos termos da LGPD.</p>
+                <p>9.2. O CONTROLADOR isenta o OPERADOR de responsabilidade por dados inseridos em violação às suas obrigações
+                (cláusula 6ª) e por reclamações de seus próprios titulares baseadas em ausência de base legal do CONTROLADOR.</p>
+                <p>9.3. A limitação de responsabilidade estabelecida nos Termos de Serviço aplica-se também a este DPA.</p>
+
+                <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">Cláusula 10ª — Vigência e Disposições Finais</h2>
+                <p>10.1. Este DPA tem vigência a partir do aceite dos Termos de Serviço e perdura enquanto houver
+                tratamento de Dados pelo OPERADOR em nome do CONTROLADOR.</p>
+                <p>10.2. O DPA é parte integrante dos Termos de Serviço. Em caso de conflito específico sobre
+                proteção de dados, prevalece este DPA.</p>
+                <p>10.3. Aplicam-se as leis brasileiras. Foro: Comarca de Quixadá-CE.</p>
+
+                <p style="margin-top:24px;padding:12px;background:var(--bg2);border-radius:6px;font-size:13px">
+                    <strong>Encarregado pelo Tratamento de Dados (DPO):</strong> Clériston Almeida Capistrano —
+                    <a href="mailto:contato@atendente.online">contato@atendente.online</a>
+                </p>
+
+            </div>
+
+            <div style="margin-top:32px;text-align:center;display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+                <a href="/" class="btn btn-secondary">← Voltar ao início</a>
+                <a href="/privacy" class="btn btn-secondary">Política de Privacidade</a>
+                <a href="/terms" class="btn btn-secondary">Termos de Serviço</a>
+                <a href="/dpo" class="btn btn-secondary">Contato do DPO</a>
+            </div>
+        </div>
+    </div>"""
+    return base_html("Contrato de Operador (DPA)", content)
+
+
+@app.route("/dpo")
+def dpo_contact():
+    """Página oficial do Encarregado pelo Tratamento de Dados (LGPD Art. 41)."""
+    content = """
+    <div class="container" style="max-width:720px">
+        <div class="card" style="margin-top:40px;padding:40px">
+            <h1 style="font-size:28px;font-weight:700;margin-bottom:8px">Encarregado pelo Tratamento de Dados</h1>
+            <p style="color:var(--text2);margin-bottom:24px;font-size:14px">
+                <strong>DPO — Data Protection Officer</strong> · LGPD Art. 41
+            </p>
+
+            <div style="background:var(--bg2);padding:24px;border-radius:8px;margin-bottom:24px">
+                <h2 style="color:var(--text);font-size:18px;margin-bottom:16px">Identificação do Encarregado</h2>
+                <p style="color:var(--text2);line-height:1.9;font-size:15px">
+                    <strong style="color:var(--text)">Nome:</strong> Clériston Almeida Capistrano<br>
+                    <strong style="color:var(--text)">Função:</strong> Encarregado pelo Tratamento de Dados Pessoais (DPO)<br>
+                    <strong style="color:var(--text)">E-mail:</strong> <a href="mailto:contato@atendente.online">contato@atendente.online</a><br>
+                    <strong style="color:var(--text)">Localização:</strong> Quixadá-CE, Brasil<br>
+                    <strong style="color:var(--text)">Prazo de resposta:</strong> até 15 dias úteis
+                </p>
+            </div>
+
+            <div style="color:var(--text2);font-size:15px;line-height:1.8">
+                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">Atribuições do DPO (LGPD Art. 41, §2º)</h2>
+                <p>• Aceitar reclamações e comunicações dos titulares, prestar esclarecimentos e adotar providências;</p>
+                <p>• Receber comunicações da Autoridade Nacional de Proteção de Dados (ANPD) e adotar providências;</p>
+                <p>• Orientar funcionários e contratados sobre práticas a serem tomadas em relação à proteção de dados pessoais;</p>
+                <p>• Executar as demais atribuições determinadas pelo controlador ou estabelecidas em normas complementares.</p>
+
+                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">Como contatar</h2>
+                <p>Para exercer seus direitos previstos na LGPD (Art. 18) — acesso, correção, exclusão, portabilidade,
+                revogação de consentimento etc. — você pode:</p>
+                <p>• <strong style="color:var(--text)">Usuários logados:</strong> acessar diretamente a página
+                <a href="/conta/meus-dados">Meus Dados</a> no painel;</p>
+                <p>• <strong style="color:var(--text)">Por email:</strong> escrever para
+                <a href="mailto:contato@atendente.online">contato@atendente.online</a> com:</p>
+                <p style="margin-left:24px">– Assunto: "Solicitação LGPD"</p>
+                <p style="margin-left:24px">– Descrição do direito que deseja exercer</p>
+                <p style="margin-left:24px">– Dados para verificação da identidade (email da conta)</p>
+
+                <h2 style="color:var(--text);font-size:18px;margin:24px 0 12px">Autoridade Nacional</h2>
+                <p>Caso não esteja satisfeito com nossa resposta, você pode apresentar reclamação à ANPD
+                em <a href="https://www.gov.br/anpd" target="_blank" rel="noopener">gov.br/anpd</a>.</p>
+            </div>
+
+            <div style="margin-top:32px;text-align:center;display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+                <a href="/" class="btn btn-secondary">← Voltar ao início</a>
+                <a href="/privacy" class="btn btn-secondary">Política de Privacidade</a>
+            </div>
+        </div>
+    </div>"""
+    return base_html("Encarregado de Dados (DPO)", content)
+
+
+# ════════════════════════════════════════════════════════════════
+#  ROTAS LGPD — Direitos do Titular (Art. 18 da Lei 13.709/2018)
+# ════════════════════════════════════════════════════════════════
+
+@app.route("/conta/meus-dados")
+@login_required
+def lgpd_my_data():
+    """LGPD Art. 18, II — Acesso aos dados pessoais.
+    Mostra ao titular tudo que está armazenado sobre ele."""
+    user = g.user
+    db = get_db()
+
+    # Resumo numérico (sem carregar dados pesados na tela)
+    counts = {}
+    try:
+        counts["contatos"] = db.execute("SELECT COUNT(*) FROM contacts WHERE user_id=?", (user["id"],)).fetchone()[0]
+        counts["conversas"] = db.execute("SELECT COUNT(*) FROM conversations WHERE user_id=?", (user["id"],)).fetchone()[0]
+        counts["mensagens"] = db.execute(
+            """SELECT COUNT(*) FROM messages m JOIN conversations c ON c.id=m.conversation_id
+               WHERE c.user_id=?""", (user["id"],)
+        ).fetchone()[0]
+        counts["pedidos"] = db.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (user["id"],)).fetchone()[0]
+        counts["pagamentos"] = db.execute("SELECT COUNT(*) FROM payments WHERE user_id=?", (user["id"],)).fetchone()[0]
+        counts["base_conhecimento"] = db.execute("SELECT COUNT(*) FROM knowledge_base WHERE user_id=?", (user["id"],)).fetchone()[0]
+        counts["produtos"] = db.execute("SELECT COUNT(*) FROM product_gallery WHERE user_id=?", (user["id"],)).fetchone()[0]
+        counts["campanhas"] = db.execute("SELECT COUNT(*) FROM campaigns WHERE user_id=?", (user["id"],)).fetchone()[0]
+    except Exception as e:
+        print(f"[LGPD MY_DATA] Erro contagem: {e}")
+        counts = {k: 0 for k in ["contatos","conversas","mensagens","pedidos","pagamentos","base_conhecimento","produtos","campanhas"]}
+
+    # Plano e retenção
+    plan_label = PLANS.get(user["plan"], PLANS["starter"])["name"]
+    retention_days = {"starter": 90, "pro": 180, "business": 365, "agency": 730}.get(user["plan"], 90)
+    retention_label = {"starter": "3 meses", "pro": "6 meses", "business": "12 meses", "agency": "24 meses"}.get(user["plan"], "3 meses")
+
+    # Última atualização de consentimento
+    last_consent = db.execute(
+        """SELECT consent_version, created_at FROM consent_log
+           WHERE user_id=? AND consent_type='privacy_policy'
+           ORDER BY created_at DESC LIMIT 1""", (user["id"],)
+    ).fetchone()
+    last_consent_str = f"Versão {last_consent['consent_version']} em {last_consent['created_at']}" if last_consent else "Nunca aceito explicitamente (cliente anterior à LGPD)"
+
+    content = f"""
+    <div class="container" style="max-width:980px;padding:24px">
+        <div style="margin-bottom:24px">
+            <h1 style="font-size:26px;font-weight:700;margin-bottom:8px">🛡️ Meus Dados</h1>
+            <p style="color:var(--text2);font-size:14px">
+                Esta página garante seus direitos previstos no Art. 18 da LGPD.
+                Aqui você pode <strong>visualizar, exportar, corrigir ou solicitar a exclusão</strong> dos seus dados pessoais.
+            </p>
+        </div>
+
+        <div class="card" style="padding:24px;margin-bottom:20px">
+            <h2 style="font-size:18px;margin-bottom:16px">📋 Dados de Cadastro</h2>
+            <table style="width:100%;font-size:14px;line-height:1.9">
+                <tr><td style="color:var(--text2);width:35%">Nome</td><td><strong>{(user['name'] or '—')}</strong></td></tr>
+                <tr><td style="color:var(--text2)">Email</td><td><strong>{user['email']}</strong></td></tr>
+                <tr><td style="color:var(--text2)">Empresa</td><td>{user.get('company') or '—'}</td></tr>
+                <tr><td style="color:var(--text2)">Telefone</td><td>{user.get('phone') or '—'}</td></tr>
+                <tr><td style="color:var(--text2)">Plano contratado</td><td><strong>{plan_label}</strong> ({user['plan_status']})</td></tr>
+                <tr><td style="color:var(--text2)">Conta criada em</td><td>{user.get('created_at') or '—'}</td></tr>
+                <tr><td style="color:var(--text2)">Último login</td><td>{user.get('last_login') or '—'}</td></tr>
+                <tr><td style="color:var(--text2)">Mensagens usadas</td><td>{user.get('msgs_used',0)} / {user.get('msgs_limit',0)}</td></tr>
+            </table>
+        </div>
+
+        <div class="card" style="padding:24px;margin-bottom:20px">
+            <h2 style="font-size:18px;margin-bottom:16px">📊 Volume de Dados Armazenados</h2>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;text-align:center">
+                    <div style="font-size:24px;font-weight:700;color:var(--accent2)">{counts['contatos']}</div>
+                    <div style="font-size:12px;color:var(--text2);margin-top:4px">Contatos</div>
+                </div>
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;text-align:center">
+                    <div style="font-size:24px;font-weight:700;color:var(--accent2)">{counts['conversas']}</div>
+                    <div style="font-size:12px;color:var(--text2);margin-top:4px">Conversas</div>
+                </div>
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;text-align:center">
+                    <div style="font-size:24px;font-weight:700;color:var(--accent2)">{counts['mensagens']}</div>
+                    <div style="font-size:12px;color:var(--text2);margin-top:4px">Mensagens</div>
+                </div>
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;text-align:center">
+                    <div style="font-size:24px;font-weight:700;color:var(--accent2)">{counts['pedidos']}</div>
+                    <div style="font-size:12px;color:var(--text2);margin-top:4px">Pedidos</div>
+                </div>
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;text-align:center">
+                    <div style="font-size:24px;font-weight:700;color:var(--accent2)">{counts['pagamentos']}</div>
+                    <div style="font-size:12px;color:var(--text2);margin-top:4px">Pagamentos</div>
+                </div>
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;text-align:center">
+                    <div style="font-size:24px;font-weight:700;color:var(--accent2)">{counts['base_conhecimento']}</div>
+                    <div style="font-size:12px;color:var(--text2);margin-top:4px">Base de conhecimento</div>
+                </div>
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;text-align:center">
+                    <div style="font-size:24px;font-weight:700;color:var(--accent2)">{counts['produtos']}</div>
+                    <div style="font-size:12px;color:var(--text2);margin-top:4px">Produtos</div>
+                </div>
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;text-align:center">
+                    <div style="font-size:24px;font-weight:700;color:var(--accent2)">{counts['campanhas']}</div>
+                    <div style="font-size:12px;color:var(--text2);margin-top:4px">Campanhas</div>
+                </div>
+            </div>
+            <p style="font-size:13px;color:var(--text2);margin-top:16px;background:var(--bg2);padding:10px;border-radius:6px">
+                ℹ️ <strong>Política de retenção do seu plano ({plan_label}):</strong> mensagens são automaticamente
+                excluídas após <strong>{retention_label}</strong>. Para retenção maior, faça upgrade de plano.
+            </p>
+        </div>
+
+        <div class="card" style="padding:24px;margin-bottom:20px">
+            <h2 style="font-size:18px;margin-bottom:16px">✅ Status dos Consentimentos</h2>
+            <p style="color:var(--text2);font-size:14px;margin-bottom:12px">
+                Último aceite registrado: <strong>{last_consent_str}</strong>
+            </p>
+            <a href="/conta/consentimentos" class="btn btn-secondary btn-sm">📜 Ver histórico completo de consentimentos →</a>
+        </div>
+
+        <div class="card" style="padding:24px;margin-bottom:20px">
+            <h2 style="font-size:18px;margin-bottom:16px">🎯 Exercer seus direitos (LGPD Art. 18)</h2>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">
+                <a href="/conta/exportar" class="btn btn-primary" style="text-align:center;padding:14px">
+                    📦 Exportar meus dados<br><span style="font-size:11px;font-weight:400;opacity:0.85">Portabilidade (Art. 18, V)</span>
+                </a>
+                <a href="/profile" class="btn btn-secondary" style="text-align:center;padding:14px">
+                    ✏️ Corrigir cadastro<br><span style="font-size:11px;font-weight:400;opacity:0.85">Correção (Art. 18, III)</span>
+                </a>
+                <a href="/conta/consentimentos" class="btn btn-secondary" style="text-align:center;padding:14px">
+                    🔧 Gerenciar consentimentos<br><span style="font-size:11px;font-weight:400;opacity:0.85">Revogação (Art. 18, IX)</span>
+                </a>
+                <a href="/conta/excluir" class="btn" style="background:#fef2f2;color:#dc2626;border:1px solid #fecaca;text-align:center;padding:14px">
+                    🗑️ Excluir minha conta<br><span style="font-size:11px;font-weight:400;opacity:0.85">Eliminação (Art. 18, VI)</span>
+                </a>
+            </div>
+            <p style="font-size:12px;color:var(--text2);margin-top:16px">
+                Dúvidas? Contate o Encarregado (DPO) em <a href="mailto:contato@atendente.online">contato@atendente.online</a>.
+                Prazo de resposta: até 15 dias úteis.
+            </p>
+        </div>
+    </div>
+    """
+    return base_html("Meus Dados — LGPD", content, dict(user))
+
+
+@app.route("/conta/exportar")
+@login_required
+def lgpd_export_data():
+    """LGPD Art. 18, V — Portabilidade.
+    Gera download JSON com todos os dados do titular."""
+    user = g.user
+    data = export_user_data_as_json(user["id"])
+    if data is None:
+        return "Erro ao gerar exportação. Tente novamente ou contate contato@atendente.online", 500
+
+    # Log na auditoria
+    try:
+        register_consent(user["id"], user["email"], "data_processing", PRIVACY_POLICY_VERSION, accepted=True,
+                         details="Exportação de dados realizada (LGPD Art. 18, V)")
+    except Exception:
+        pass
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"atendente_online_meus_dados_{user['id']}_{timestamp}.json"
+    response = make_response(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+    response.headers["Content-Type"] = "application/json; charset=utf-8"
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
+@app.route("/conta/consentimentos", methods=["GET","POST"])
+@login_required
+def lgpd_consents():
+    """LGPD Art. 18, IX — Revogação de consentimento.
+    Mostra histórico e permite revogar/conceder opt-ins voluntários."""
+    user = g.user
+    success = ""
+    error = ""
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        consent_type = request.form.get("consent_type", "")
+        if action not in ("grant", "revoke") or consent_type not in CONSENT_TYPES:
+            error = "Solicitação inválida."
+        else:
+            # Tipos obrigatórios não podem ser revogados (somente excluindo a conta)
+            if action == "revoke" and consent_type in ("privacy_policy", "terms_of_service", "dpa", "data_processing"):
+                error = "Este consentimento é base para uso do serviço. Para revogá-lo, exclua sua conta."
+            else:
+                accepted = (action == "grant")
+                ok = register_consent(
+                    user["id"], user["email"], consent_type, PRIVACY_POLICY_VERSION,
+                    accepted=accepted,
+                    details=f"{'Concedido' if accepted else 'Revogado'} via página de consentimentos"
+                )
+                if ok:
+                    success = f"Consentimento '{CONSENT_TYPES[consent_type]}' {'concedido' if accepted else 'revogado'} com sucesso."
+                else:
+                    error = "Erro ao registrar. Tente novamente."
+
+    consents = get_user_consents(user["id"])
+    # Status atual de cada tipo: pega o registro mais recente
+    current_status = {}
+    for c in consents:
+        if c["consent_type"] not in current_status:
+            current_status[c["consent_type"]] = c["accepted"]
+
+    # Render do histórico
+    if consents:
+        history_rows = ""
+        for c in consents[:50]:  # últimos 50
+            badge_color = "#10b981" if c["accepted"] else "#dc2626"
+            badge_text = "Aceito" if c["accepted"] else "Revogado"
+            type_label = CONSENT_TYPES.get(c["consent_type"], c["consent_type"])
+            history_rows += f"""
+            <tr>
+                <td style="padding:10px;border-bottom:1px solid var(--border);font-size:13px">{c['created_at']}</td>
+                <td style="padding:10px;border-bottom:1px solid var(--border);font-size:13px">{type_label}</td>
+                <td style="padding:10px;border-bottom:1px solid var(--border);font-size:13px">v{c['consent_version']}</td>
+                <td style="padding:10px;border-bottom:1px solid var(--border)">
+                    <span style="background:{badge_color};color:white;padding:2px 8px;border-radius:4px;font-size:11px">{badge_text}</span>
+                </td>
+            </tr>"""
+        history_table = f"""
+            <table style="width:100%;border-collapse:collapse;font-size:14px">
+                <thead><tr style="background:var(--bg2)">
+                    <th style="padding:10px;text-align:left">Data</th>
+                    <th style="padding:10px;text-align:left">Tipo</th>
+                    <th style="padding:10px;text-align:left">Versão</th>
+                    <th style="padding:10px;text-align:left">Status</th>
+                </tr></thead>
+                <tbody>{history_rows}</tbody>
+            </table>"""
+    else:
+        history_table = '<p style="color:var(--text2)">Nenhum registro de consentimento encontrado.</p>'
+
+    marketing_status = current_status.get("marketing_email", 0)
+    marketing_button = (
+        '<form method="POST" style="display:inline">' + csrf_field() +
+        '<input type="hidden" name="action" value="revoke">' +
+        '<input type="hidden" name="consent_type" value="marketing_email">' +
+        '<button type="submit" class="btn btn-secondary btn-sm">🚫 Revogar opt-in de marketing</button></form>'
+        if marketing_status else
+        '<form method="POST" style="display:inline">' + csrf_field() +
+        '<input type="hidden" name="action" value="grant">' +
+        '<input type="hidden" name="consent_type" value="marketing_email">' +
+        '<button type="submit" class="btn btn-primary btn-sm">✅ Aceitar comunicações de marketing</button></form>'
+    )
+
+    alert = ""
+    if success: alert = f'<div class="alert alert-success">{success}</div>'
+    if error: alert = f'<div class="alert alert-error">{error}</div>'
+
+    content = f"""
+    <div class="container" style="max-width:880px;padding:24px">
+        <a href="/conta/meus-dados" style="color:var(--text2);font-size:13px;text-decoration:none">← Voltar para Meus Dados</a>
+        <h1 style="font-size:26px;font-weight:700;margin:8px 0 16px">📜 Consentimentos</h1>
+        {alert}
+
+        <div class="card" style="padding:24px;margin-bottom:20px">
+            <h2 style="font-size:18px;margin-bottom:12px">Consentimentos atuais</h2>
+            <table style="width:100%;font-size:14px">
+                <tr><td style="padding:8px 0;color:var(--text2)">Política de Privacidade (obrigatório)</td>
+                    <td style="text-align:right"><span style="background:#10b981;color:white;padding:2px 8px;border-radius:4px;font-size:11px">Aceito</span></td></tr>
+                <tr><td style="padding:8px 0;color:var(--text2)">Termos de Serviço (obrigatório)</td>
+                    <td style="text-align:right"><span style="background:#10b981;color:white;padding:2px 8px;border-radius:4px;font-size:11px">Aceito</span></td></tr>
+                <tr><td style="padding:8px 0;color:var(--text2)">DPA — Contrato de Operador (obrigatório)</td>
+                    <td style="text-align:right"><span style="background:#10b981;color:white;padding:2px 8px;border-radius:4px;font-size:11px">Aceito</span></td></tr>
+                <tr><td style="padding:8px 0">Comunicações de marketing (opcional)</td>
+                    <td style="text-align:right">{marketing_button}</td></tr>
+            </table>
+            <p style="font-size:12px;color:var(--text2);margin-top:14px">
+                Os 3 consentimentos obrigatórios são base contratual e legal para uso do serviço.
+                Para revogá-los, é necessário <a href="/conta/excluir">excluir sua conta</a>.
+            </p>
+        </div>
+
+        <div class="card" style="padding:24px">
+            <h2 style="font-size:18px;margin-bottom:12px">Histórico completo (últimos 50 registros)</h2>
+            {history_table}
+            <p style="font-size:11px;color:var(--text2);margin-top:12px">
+                💾 Estes registros são mantidos por 5 anos para comprovação perante a ANPD, conforme LGPD.
+            </p>
+        </div>
+    </div>
+    """
+    return base_html("Consentimentos — LGPD", content, dict(user))
+
+
+@app.route("/conta/excluir", methods=["GET","POST"])
+@login_required
+def lgpd_delete_account():
+    """LGPD Art. 18, VI — Exclusão de dados (anonimização híbrida).
+    Fluxo:
+    1. GET: tela de aviso + checkbox "entendo que é irreversível"
+    2. POST step=request_code: envia código por email
+    3. POST step=confirm: valida código + senha + anonimiza conta
+    """
+    user = g.user
+    error = ""
+    success = ""
+    step = request.args.get("step", "warning")  # warning | confirm
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+
+        # ── Etapa 1: solicitar código por email ──
+        if action == "request_code":
+            understand = request.form.get("understand") == "on"
+            if not understand:
+                error = "Você precisa confirmar que entende que esta ação é irreversível."
+            else:
+                code = generate_deletion_code(user["id"], user["email"])
+                if not code:
+                    error = "Erro ao gerar código. Tente novamente em alguns minutos."
+                else:
+                    # Enviar email com o código
+                    try:
+                        html_body = f"""
+                        <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:20px;background:#fff">
+                            <h2 style="color:#dc2626">⚠️ Confirmação de exclusão de conta</h2>
+                            <p>Olá, {esc(user.get('name') or user['email'])}!</p>
+                            <p>Recebemos uma solicitação para excluir sua conta no <strong>atendente.online</strong>.</p>
+                            <p>Para confirmar, digite o código abaixo na tela de confirmação:</p>
+                            <div style="background:#f3f4f6;padding:20px;text-align:center;font-size:32px;letter-spacing:6px;font-weight:700;border-radius:8px;margin:20px 0">
+                                {code}
+                            </div>
+                            <p style="font-size:13px;color:#6b7280">
+                                <strong>Este código expira em 15 minutos.</strong><br>
+                                Se você não solicitou esta ação, ignore este email e altere sua senha imediatamente.
+                            </p>
+                            <hr style="margin:24px 0;border:none;border-top:1px solid #e5e7eb">
+                            <p style="font-size:12px;color:#9ca3af">
+                                Esta ação removerá: conversas, mensagens, contatos, base de conhecimento, campanhas e configurações.<br>
+                                Dados de pagamento serão mantidos anonimizados por 5 anos por obrigação fiscal.
+                            </p>
+                        </div>"""
+                        sent = send_email(user["email"], "🗑️ Confirmação de exclusão de conta — atendente.online", html_body)
+                        if sent:
+                            session["deletion_pending"] = True
+                            return redirect("/conta/excluir?step=confirm")
+                        else:
+                            error = "Não foi possível enviar o email. Tente novamente ou contate o suporte."
+                    except Exception as e:
+                        print(f"[DELETE] Erro envio email: {e}")
+                        error = "Erro ao enviar email de confirmação."
+
+        # ── Etapa 2: confirmar com código + senha ──
+        elif action == "confirm_delete":
+            if not session.get("deletion_pending"):
+                error = "Sessão de exclusão expirada. Reinicie o processo."
+            else:
+                code = request.form.get("code", "").strip()
+                password = request.form.get("password", "")
+                if not code or len(code) != 6:
+                    error = "Digite o código de 6 dígitos enviado por email."
+                elif not password:
+                    error = "Digite sua senha para confirmar."
+                elif not check_password(password, user["password_hash"]):
+                    error = "Senha incorreta."
+                elif not verify_deletion_code(user["email"], code):
+                    error = "Código inválido ou expirado."
+                else:
+                    # Executar anonimização
+                    ok = anonymize_user_account(user["id"], reason="user_self_service")
+                    if ok:
+                        session.clear()
+                        # Render página final de despedida
+                        farewell = """
+                        <div class="container" style="max-width:560px;padding:60px 24px;text-align:center">
+                            <div style="font-size:48px;margin-bottom:16px">👋</div>
+                            <h1 style="font-size:24px;margin-bottom:12px">Sua conta foi excluída</h1>
+                            <p style="color:var(--text2);line-height:1.7;margin-bottom:24px">
+                                Suas conversas, mensagens, contatos e configurações foram removidos.<br>
+                                Dados de pagamento permanecem anonimizados por 5 anos (obrigação fiscal).<br>
+                                Obrigado por ter usado o atendente.online.
+                            </p>
+                            <a href="/" class="btn btn-primary">← Voltar para o início</a>
+                        </div>
+                        """
+                        return base_html("Conta excluída", farewell)
+                    else:
+                        error = "Erro ao processar exclusão. Contate o suporte: contato@atendente.online"
+
+    alert = ""
+    if error: alert = f'<div class="alert alert-error">{error}</div>'
+    if success: alert = f'<div class="alert alert-success">{success}</div>'
+
+    # ── Render da tela conforme o step ──
+    if step == "confirm" and session.get("deletion_pending"):
+        masked = mask_email(user["email"])
+        content = f"""
+        <div class="container" style="max-width:560px;padding:24px">
+            <a href="/conta/meus-dados" style="color:var(--text2);font-size:13px;text-decoration:none">← Cancelar e voltar</a>
+            <div class="card" style="padding:32px;margin-top:12px;border:2px solid #fecaca">
+                <h1 style="font-size:22px;color:#dc2626;margin-bottom:12px">🗑️ Confirmar exclusão</h1>
+                <p style="color:var(--text2);margin-bottom:20px">
+                    Enviamos um código de 6 dígitos para <strong>{masked}</strong>.
+                    Digite-o abaixo junto com sua senha para confirmar a exclusão.
+                </p>
+                {alert}
+                <form method="POST">
+                    {csrf_field()}
+                    <input type="hidden" name="action" value="confirm_delete">
+                    <div class="form-group">
+                        <label class="form-label">Código recebido por email</label>
+                        <input type="text" name="code" class="form-input" maxlength="6"
+                            placeholder="000000" required autofocus
+                            style="text-align:center;font-size:24px;letter-spacing:6px;font-weight:700">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Sua senha atual</label>
+                        <input type="password" name="password" class="form-input" required>
+                    </div>
+                    <button type="submit" class="btn btn-block" style="background:#dc2626;color:white;padding:12px">
+                        ⚠️ Excluir minha conta DEFINITIVAMENTE
+                    </button>
+                </form>
+                <p style="font-size:12px;color:var(--text2);margin-top:16px;text-align:center">
+                    O código expira em 15 minutos. <a href="/conta/excluir">Reiniciar processo</a>
+                </p>
+            </div>
+        </div>
+        """
+    else:
+        # Tela inicial de aviso
+        content = f"""
+        <div class="container" style="max-width:680px;padding:24px">
+            <a href="/conta/meus-dados" style="color:var(--text2);font-size:13px;text-decoration:none">← Voltar para Meus Dados</a>
+            <div class="card" style="padding:32px;margin-top:12px;border:2px solid #fecaca">
+                <h1 style="font-size:24px;color:#dc2626;margin-bottom:12px">⚠️ Excluir minha conta</h1>
+                <p style="color:var(--text2);line-height:1.7;margin-bottom:16px">
+                    Esta é uma ação <strong>irreversível</strong>. Ao confirmar, executaremos:
+                </p>
+
+                <h3 style="font-size:15px;color:#dc2626;margin:16px 0 8px">🗑️ Será permanentemente apagado:</h3>
+                <ul style="color:var(--text2);font-size:14px;line-height:1.9;padding-left:20px">
+                    <li>Todas as suas conversas, mensagens e contatos</li>
+                    <li>Base de conhecimento treinada</li>
+                    <li>Campanhas e listas de envio</li>
+                    <li>Pipeline CRM (cards e etapas)</li>
+                    <li>Produtos cadastrados e galeria social</li>
+                    <li>Tokens da Meta (Instagram/Messenger/WhatsApp), Telegram, Mercado Pago</li>
+                    <li>Configurações de 2FA</li>
+                </ul>
+
+                <h3 style="font-size:15px;color:#92400e;margin:20px 0 8px">📦 Será mantido (anonimizado) por 5 anos:</h3>
+                <ul style="color:var(--text2);font-size:14px;line-height:1.9;padding-left:20px">
+                    <li>Histórico de pagamentos (obrigação fiscal — Lei nº 5.172/66, CTN Art. 195)</li>
+                    <li>Pedidos com valor financeiro</li>
+                    <li>Logs de auditoria com seu ID anonimizado</li>
+                    <li>Registros de consentimento (prova perante ANPD)</li>
+                </ul>
+
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;margin:20px 0;font-size:13px;color:var(--text2);line-height:1.6">
+                    💡 <strong>Quer apenas pausar?</strong> Você pode <a href="/dashboard/settings">cancelar seu plano</a>
+                    sem excluir a conta — assim você pode retornar depois com seus dados intactos.
+                </div>
+
+                {alert}
+
+                <form method="POST">
+                    {csrf_field()}
+                    <input type="hidden" name="action" value="request_code">
+                    <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:14px;color:var(--text2);background:#fef2f2;padding:14px;border-radius:6px;margin-bottom:16px">
+                        <input type="checkbox" name="understand" required style="margin-top:3px;flex-shrink:0;width:16px;height:16px">
+                        <span>Entendo que esta ação é <strong>irreversível</strong>, que perderei acesso ao sistema imediatamente,
+                        e que dados de pagamento serão mantidos por obrigação fiscal.</span>
+                    </label>
+                    <button type="submit" class="btn btn-block" style="background:#dc2626;color:white;padding:12px">
+                        📧 Enviar código de confirmação por email
+                    </button>
+                </form>
+            </div>
+        </div>
+        """
+    return base_html("Excluir conta", content, dict(user))
+
+
+@app.route("/conta/aceitar-termos", methods=["GET","POST"])
+@login_required
+def lgpd_reaccept_terms():
+    """Tela exibida quando o usuário precisa aceitar termos novos ou atualizados.
+    Bloqueia o resto do sistema até aceitar (exceto whitelist em login_required)."""
+    user = g.user
+    error = ""
+
+    # Se o usuário já está em dia, redireciona para o dashboard
+    if not user_needs_to_reaccept_terms(user["id"]):
+        return redirect("/dashboard")
+
+    if request.method == "POST":
+        accept = request.form.get("accept_terms") == "on"
+        if not accept:
+            error = "Você precisa aceitar os documentos para continuar usando o serviço."
+        else:
+            register_consent(user["id"], user["email"], "privacy_policy", PRIVACY_POLICY_VERSION,
+                             accepted=True, details="Re-aceite após atualização dos termos")
+            register_consent(user["id"], user["email"], "terms_of_service", TERMS_OF_SERVICE_VERSION,
+                             accepted=True, details="Re-aceite após atualização dos termos")
+            register_consent(user["id"], user["email"], "dpa", DPA_VERSION,
+                             accepted=True, details="Re-aceite após atualização dos termos")
+            register_consent(user["id"], user["email"], "data_processing", PRIVACY_POLICY_VERSION,
+                             accepted=True, details="Base legal: execução de contrato (LGPD Art. 7º, V) — re-aceite")
+            return redirect("/dashboard")
+
+    alert = f'<div class="alert alert-error">{error}</div>' if error else ""
+
+    content = f"""
+    <div class="container" style="max-width:680px;padding:24px">
+        <div class="card" style="padding:32px;margin-top:40px">
+            <div style="font-size:48px;text-align:center;margin-bottom:12px">📜</div>
+            <h1 style="font-size:24px;font-weight:700;text-align:center;margin-bottom:8px">Atualização dos Termos</h1>
+            <p style="color:var(--text2);text-align:center;margin-bottom:24px;font-size:14px;line-height:1.6">
+                Atualizamos nossa <strong>Política de Privacidade</strong>, <strong>Termos de Serviço</strong> e adicionamos o
+                <strong>Contrato de Operador (DPA)</strong> em conformidade com a LGPD.<br>
+                Para continuar usando o atendente.online, por favor revise e aceite os documentos atualizados.
+            </p>
+
+            <div style="background:var(--bg2);padding:16px;border-radius:8px;margin-bottom:20px">
+                <h3 style="font-size:14px;margin-bottom:10px">📋 O que mudou:</h3>
+                <ul style="color:var(--text2);font-size:13px;line-height:1.8;padding-left:20px">
+                    <li>Política de Privacidade reescrita com detalhamento LGPD</li>
+                    <li>Termos de Serviço atualizados com cláusulas profissionais</li>
+                    <li>Novo: Contrato de Operador (DPA) anexo aos termos</li>
+                    <li>Designamos formalmente um Encarregado de Dados (DPO)</li>
+                    <li>Você agora pode exercer todos os direitos do Art. 18 da LGPD</li>
+                </ul>
+            </div>
+
+            <div style="text-align:center;margin-bottom:20px">
+                <a href="/privacy" target="_blank" class="btn btn-secondary btn-sm" style="margin:4px">📄 Política de Privacidade</a>
+                <a href="/terms" target="_blank" class="btn btn-secondary btn-sm" style="margin:4px">📄 Termos de Serviço</a>
+                <a href="/dpa" target="_blank" class="btn btn-secondary btn-sm" style="margin:4px">📄 DPA</a>
+            </div>
+
+            {alert}
+
+            <form method="POST">
+                {csrf_field()}
+                <div style="background:var(--bg2);padding:14px;border-radius:8px;margin-bottom:16px">
+                    <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:14px;color:var(--text2);line-height:1.5">
+                        <input type="checkbox" name="accept_terms" required style="margin-top:3px;flex-shrink:0;width:16px;height:16px">
+                        <span>Li e aceito a <a href="/privacy" target="_blank" style="color:var(--accent2)">Política de Privacidade</a>,
+                        os <a href="/terms" target="_blank" style="color:var(--accent2)">Termos de Serviço</a> e o
+                        <a href="/dpa" target="_blank" style="color:var(--accent2)">Contrato de Operador (DPA)</a> atualizados.</span>
+                    </label>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block btn-lg">✅ Aceitar e continuar</button>
+            </form>
+
+            <p style="font-size:12px;color:var(--text2);text-align:center;margin-top:16px">
+                Se não concorda, você pode <a href="/conta/excluir">excluir sua conta</a> ou
+                <a href="/logout">sair</a>.
+            </p>
+        </div>
+    </div>
+    """
+    return base_html("Aceitar Termos Atualizados", content)
 
 
 @app.route("/")
@@ -2404,10 +3762,15 @@ def register():
         password = request.form.get("password","")
         company = request.form.get("company","").strip()
         plan = request.form.get("plan","starter")
+        # LGPD: aceite obrigatório de Política, Termos e DPA
+        accept_terms = request.form.get("accept_terms") == "on"
+        accept_marketing = request.form.get("accept_marketing") == "on"  # opcional
         if not name or not email or not password:
             error = "Preencha todos os campos obrigatórios."
         elif len(password) < 6:
             error = "Senha deve ter pelo menos 6 caracteres."
+        elif not accept_terms:
+            error = "Você precisa aceitar a Política de Privacidade, os Termos de Serviço e o DPA para criar uma conta."
         else:
             db = get_db()
             existing = db.execute("SELECT id, email_verified FROM users WHERE email=?", (email,)).fetchone()
@@ -2421,6 +3784,20 @@ def register():
                 db.execute("INSERT INTO users (email,password_hash,name,company,plan,plan_status,msgs_limit,trial_ends_at,email_verified) VALUES (?,?,?,?,?,?,?,?,0)",
                     (email, hash_password(password), name, company, plan, "trial", msgs_limit, trial_end))
                 db.commit()
+                # LGPD: registrar consentimentos formais para comprovação perante ANPD
+                new_user = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+                new_user_id = new_user["id"] if new_user else None
+                register_consent(new_user_id, email, "privacy_policy", PRIVACY_POLICY_VERSION, accepted=True,
+                                 details=f"Aceite no signup. Plano: {plan}")
+                register_consent(new_user_id, email, "terms_of_service", TERMS_OF_SERVICE_VERSION, accepted=True,
+                                 details=f"Aceite no signup. Plano: {plan}")
+                register_consent(new_user_id, email, "dpa", DPA_VERSION, accepted=True,
+                                 details=f"Aceite no signup. Plano: {plan}")
+                register_consent(new_user_id, email, "data_processing", PRIVACY_POLICY_VERSION, accepted=True,
+                                 details="Base legal: execução de contrato (LGPD Art. 7º, V)")
+                if accept_marketing:
+                    register_consent(new_user_id, email, "marketing_email", PRIVACY_POLICY_VERSION, accepted=True,
+                                     details="Opt-in voluntário no signup")
                 send_verification_code(email)
                 session["pending_email"] = email
                 return redirect("/verify-email")
@@ -2433,7 +3810,24 @@ def register():
         <div class="form-group"><label class="form-label">Email *</label><input type="email" name="email" class="form-input" required></div>
         <div class="form-group"><label class="form-label">Empresa</label><input type="text" name="company" class="form-input"></div>
         <div class="form-group"><label class="form-label">Senha *</label><input type="password" name="password" class="form-input" required></div>
-        <button type="submit" class="btn btn-primary btn-block btn-lg">Criar conta →</button></form>
+
+        <div class="form-group" style="background:var(--bg2);padding:14px;border-radius:8px;margin-top:20px">
+            <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:13px;line-height:1.5;color:var(--text2)">
+                <input type="checkbox" name="accept_terms" required style="margin-top:3px;flex-shrink:0;width:16px;height:16px">
+                <span>Li e aceito a <a href="/privacy" target="_blank" style="color:var(--accent2)">Política de Privacidade</a>,
+                os <a href="/terms" target="_blank" style="color:var(--accent2)">Termos de Serviço</a> e o
+                <a href="/dpa" target="_blank" style="color:var(--accent2)">Contrato de Operador (DPA)</a>. *</span>
+            </label>
+        </div>
+
+        <div class="form-group" style="padding:0 14px">
+            <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:13px;line-height:1.5;color:var(--text2)">
+                <input type="checkbox" name="accept_marketing" style="margin-top:3px;flex-shrink:0;width:16px;height:16px">
+                <span>Aceito receber novidades, dicas e ofertas por email (opcional, pode ser cancelado a qualquer momento).</span>
+            </label>
+        </div>
+
+        <button type="submit" class="btn btn-primary btn-block btn-lg" style="margin-top:8px">Criar conta →</button></form>
         <div class="auth-divider">Já tem conta? <a href="/login">Entrar</a></div></div></div>"""
     return base_html("Criar Conta", content)
 
@@ -3603,9 +4997,8 @@ def api_conv_messages(conv_id):
 def api_conv_toggle_human(conv_id):
     """Alterna entre IA respondendo automaticamente vs atendente humano.
     is_human_takeover=1 -> IA NAO responde mensagens dessa conversa.
-    is_human_takeover=0 -> IA volta a responder automaticamente."""
-    if not csrf_protect():
-        return jsonify({"error": "CSRF invalido"}), 403
+    is_human_takeover=0 -> IA volta a responder automaticamente.
+    CSRF eh validado automaticamente pelo @app.before_request csrf_protect."""
     try:
         db = get_db()
         conv = db.execute(
@@ -7337,7 +8730,11 @@ def admin_login():
             if code_ok:
                 reset_login_attempts(client_ip)
                 session.pop("admin_awaiting_2fa", None)
+                # Preserva CSRF token ao limpar sessao para evitar 403 na primeira acao admin
+                _preserved_csrf = session.get("_csrf_token")
                 session.clear()
+                if _preserved_csrf:
+                    session["_csrf_token"] = _preserved_csrf
                 session.permanent = True
                 session["is_admin"] = True
                 log_admin_action("login_success", details="2FA ok")
@@ -7358,7 +8755,11 @@ def admin_login():
                 else:
                     # 2FA não configurado — entra direto (compatibilidade inicial)
                     reset_login_attempts(client_ip)
+                    # Preserva CSRF token ao limpar sessao para evitar 403 na primeira acao admin
+                    _preserved_csrf = session.get("_csrf_token")
                     session.clear()
+                    if _preserved_csrf:
+                        session["_csrf_token"] = _preserved_csrf
                     session.permanent = True
                     session["is_admin"] = True
                     log_admin_action("login_success", details="sem 2FA")

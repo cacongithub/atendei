@@ -87,8 +87,33 @@ def csv_safe(value):
 
 # ─── CONFIG ────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
-app.config['SESSION_COOKIE_SECURE'] = os.getenv("FLASK_ENV") != "development"
+
+# LGPD/Segurança: SECRET_KEY deve ser definida em produção.
+# Sem ela, sessões não persistem entre restarts E podem ser forjadas se a chave aleatória
+# vazar em logs. Em produção (Railway), exigir env var explícita.
+_secret_key_env = os.getenv("SECRET_KEY", "").strip()
+_flask_env = os.getenv("FLASK_ENV", "production").lower()
+if _secret_key_env:
+    if len(_secret_key_env) < 32:
+        print(f"⚠️  AVISO: SECRET_KEY tem apenas {len(_secret_key_env)} caracteres. Recomendado: 64+ caracteres.")
+    app.secret_key = _secret_key_env
+elif _flask_env == "development":
+    # Dev local: fallback aleatório com aviso explícito
+    app.secret_key = secrets.token_hex(32)
+    print("⚠️  DEV: SECRET_KEY não definida, usando fallback aleatório. Sessões serão perdidas a cada restart.")
+else:
+    # PRODUÇÃO sem SECRET_KEY: falha alto antes de iniciar
+    print("=" * 60)
+    print("❌ ERRO CRÍTICO: SECRET_KEY não está definida em produção!")
+    print("   Defina SECRET_KEY no Railway → Variables com pelo menos 32 caracteres.")
+    print("   Gere uma com: python -c \"import secrets; print(secrets.token_hex(32))\"")
+    print("=" * 60)
+    raise RuntimeError(
+        "SECRET_KEY environment variable is required in production. "
+        "Set FLASK_ENV=development to bypass this check (local dev only)."
+    )
+
+app.config['SESSION_COOKIE_SECURE'] = _flask_env != "development"
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=12)
@@ -148,10 +173,10 @@ def _get_redis():
         import redis
         _redis_client = redis.Redis.from_url(redis_url, decode_responses=True, socket_timeout=2, socket_connect_timeout=2)
         _redis_client.ping()
-        print("[REDIS] Conectado com sucesso — rate limit distribuído ativo")
+        safe_log("[REDIS] Conectado com sucesso — rate limit distribuído ativo")
         return _redis_client
     except Exception as e:
-        print(f"[REDIS] Falha ao conectar ({e}) — usando rate limit em memória")
+        safe_log(f"[REDIS] Falha ao conectar ({e}) — usando rate limit em memória", level="ERROR")
         _redis_client = "disabled"
         return None
 
@@ -201,7 +226,7 @@ def check_rate_limit(ip, max_attempts=5, window=300):
                 return False
             return True
         except Exception as e:
-            print(f"[REDIS] Erro no check: {e}")
+            safe_log(f"[REDIS] Erro no check: {e}", level="ERROR")
             # Fallback para memória
     # Fallback: memória local
     now = time.time()
@@ -226,7 +251,7 @@ def record_login_attempt(ip, window=300):
             pipe.execute()
             return
         except Exception as e:
-            print(f"[REDIS] Erro no record: {e}")
+            safe_log(f"[REDIS] Erro no record: {e}", level="ERROR")
     # Fallback memória
     now = time.time()
     if ip not in login_attempts:
@@ -701,6 +726,10 @@ def init_db():
         ("messages", "external_message_id", "TEXT DEFAULT ''"),
         ("verification_codes", "code_type", "TEXT DEFAULT 'signup'"),
         ("users", "deleted_at", "TEXT DEFAULT ''"),
+        ("users", "totp_secret", "TEXT DEFAULT ''"),
+        ("users", "totp_enabled", "INTEGER DEFAULT 0"),
+        ("users", "totp_backup_codes", "TEXT DEFAULT ''"),
+        ("users", "mp_webhook_secret", "TEXT DEFAULT ''"),
     ]
     for table, column, col_type in migrations:
         try:
@@ -727,20 +756,61 @@ def init_db():
     db.close()
 
 
+def _build_fernet_from_key(key_string):
+    """Constrói instância Fernet a partir de uma string-chave qualquer.
+    Usa SHA-256 da string como base, depois base64 urlsafe (formato Fernet).
+    Retorna None se a chave estiver vazia ou cryptography não estiver instalada.
+
+    IMPORTANTE: esta função é determinística — mesma string-chave produz mesma chave Fernet.
+    Útil pra migração: podemos criar Fernet "antigo" com SECRET_KEY e Fernet "novo" com
+    DATA_ENCRYPTION_KEY no mesmo runtime."""
+    if not key_string:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        import hashlib as _h
+        key_bytes = _h.sha256(str(key_string).encode()).digest()
+        fernet_key = base64.urlsafe_b64encode(key_bytes)
+        return Fernet(fernet_key)
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
 def _get_fernet():
-    """Retorna instância Fernet derivada do SECRET_KEY (cacheada)"""
+    """Retorna instância Fernet ATIVA para criptografia de dados em repouso.
+
+    Prioridade da chave:
+    1. DATA_ENCRYPTION_KEY (env var) — RECOMENDADO em produção (separada da SECRET_KEY)
+    2. SECRET_KEY (env var) — fallback para compatibilidade com dados criptografados antes
+       da introdução de DATA_ENCRYPTION_KEY. NÃO troque SECRET_KEY sem migrar antes.
+
+    ⚠️ ATENÇÃO: ativar DATA_ENCRYPTION_KEY enquanto há dados criptografados com SECRET_KEY
+    causa falhas silenciosas de descriptografia. SEMPRE rode migrate_recrypt_to_new_data_key()
+    antes (chamada automaticamente no startup se necessário).
+
+    Cacheia a instância. Para forçar reload, reinicie o app."""
     if not hasattr(_get_fernet, "_instance"):
-        try:
-            from cryptography.fernet import Fernet
-            import hashlib as _h
-            secret = os.getenv("SECRET_KEY") or (app.secret_key if isinstance(app.secret_key, str) else app.secret_key.decode('utf-8', errors='ignore'))
-            if not secret:
-                secret = "fallback-key-please-set-SECRET_KEY"
-            key_bytes = _h.sha256(secret.encode()).digest()
-            fernet_key = base64.urlsafe_b64encode(key_bytes)
-            _get_fernet._instance = Fernet(fernet_key)
-        except ImportError:
-            _get_fernet._instance = None
+        # Tenta a chave dedicada primeiro
+        data_key = os.getenv("DATA_ENCRYPTION_KEY", "").strip()
+        secret = os.getenv("SECRET_KEY", "").strip() or (
+            app.secret_key if isinstance(app.secret_key, str) else (app.secret_key or b"").decode('utf-8', errors='ignore')
+        )
+
+        if data_key:
+            base = data_key
+            _get_fernet._source = "DATA_ENCRYPTION_KEY"
+        elif secret:
+            base = secret
+            _get_fernet._source = "SECRET_KEY (legacy fallback)"
+        else:
+            base = "fallback-key-please-set-DATA_ENCRYPTION_KEY"
+            _get_fernet._source = "FALLBACK (INSEGURO!)"
+
+        _get_fernet._instance = _build_fernet_from_key(base)
+        if _get_fernet._instance is None:
+            _get_fernet._source = "cryptography não instalada"
     return _get_fernet._instance
 
 
@@ -771,13 +841,13 @@ def _encrypt_value(plaintext):
     if not fernet:
         _assert_crypto_available()
         # Se chegou aqui, está em dev explícito — permite fallback com aviso
-        print("[CRYPTO] ⚠️ AVISO DEV: salvando em texto puro (cryptography não instalada)")
+        safe_log("[CRYPTO] ⚠️ AVISO DEV: salvando em texto puro (cryptography não instalada)", level="WARN")
         return plaintext
     try:
         token = fernet.encrypt(plaintext.encode('utf-8'))
         return f"fer:v1:{token.decode('ascii')}"
     except Exception as e:
-        print(f"[CRYPTO] Erro ao criptografar: {e}")
+        safe_log(f"[CRYPTO] Erro ao criptografar: {e}", level="ERROR")
         _assert_crypto_available()
         return plaintext
 
@@ -794,7 +864,7 @@ def _decrypt_value(encrypted):
         try:
             return fernet.decrypt(encrypted[7:].encode('ascii')).decode('utf-8')
         except Exception as e:
-            print(f"[CRYPTO] Erro ao descriptografar Fernet: {e}")
+            safe_log(f"[CRYPTO] Erro ao descriptografar Fernet: {e}", level="ERROR")
             return ""
     # Formato antigo (XOR custom — compatibilidade com dados antigos)
     if encrypted.startswith("enc:v1:"):
@@ -810,6 +880,8 @@ USER_ENCRYPTED_FIELDS = {
     "instagram_token",
     "messenger_token",
     "telegram_bot_token",
+    "totp_secret",
+    "mp_webhook_secret",
 }
 
 
@@ -819,7 +891,7 @@ def generate_totp_secret():
         import pyotp
         return pyotp.random_base32()
     except ImportError:
-        print("[2FA] pyotp não instalado")
+        safe_log("[2FA] pyotp não instalado")
         return None
 
 
@@ -847,7 +919,7 @@ def generate_totp_qr_base64(uri):
         img.save(buf, format='PNG')
         return "data:image/png;base64," + b64_mod.b64encode(buf.getvalue()).decode('ascii')
     except Exception as e:
-        print(f"[2FA] Erro gerando QR: {e}")
+        safe_log(f"[2FA] Erro gerando QR: {e}", level="ERROR")
         return None
 
 
@@ -863,7 +935,7 @@ def verify_totp_code(secret, code):
         totp = pyotp.TOTP(secret)
         return totp.verify(code, valid_window=1)
     except Exception as e:
-        print(f"[2FA] Erro validando TOTP: {e}")
+        safe_log(f"[2FA] Erro validando TOTP: {e}", level="ERROR")
         return False
 
 
@@ -878,12 +950,24 @@ def generate_backup_codes(n=8):
     return codes
 
 
+def user_2fa_enabled(user):
+    """True se o usuário tem TOTP habilitado (opt-in).
+    Aceita dict ou sqlite3.Row. Tolerante a colunas ausentes (pré-migração)."""
+    if not user:
+        return False
+    try:
+        u = dict(user)
+        return bool(u.get("totp_enabled", 0)) and bool(u.get("totp_secret", ""))
+    except Exception:
+        return False
+
+
 def is_admin_2fa_enabled():
     """Verifica se admin configurou 2FA.
     MECANISMO DE EMERGÊNCIA: se env var ADMIN_2FA_DISABLE_EMERGENCY=1, desabilita 2FA temporariamente.
     Use APENAS se perder celular e backup codes. Depois, configure de novo."""
     if os.getenv("ADMIN_2FA_DISABLE_EMERGENCY", "").strip() == "1":
-        print("[2FA] ⚠️ EMERGÊNCIA: 2FA bypassed via ADMIN_2FA_DISABLE_EMERGENCY")
+        safe_log("[2FA] ⚠️ EMERGÊNCIA: 2FA bypassed via ADMIN_2FA_DISABLE_EMERGENCY", level="WARN")
         return False
     return bool(get_setting("ADMIN_TOTP_SECRET", ""))
 
@@ -902,7 +986,7 @@ def log_admin_action(action, target_type="", target_id="", details=""):
         db_conn.commit()
         db_conn.close()
     except Exception as e:
-        print(f"[AUDIT] Falha ao registrar: {e}")
+        safe_log(f"[AUDIT] Falha ao registrar: {e}", level="ERROR")
 
 
 def _safe_payload_preview(payload, limit=500):
@@ -960,7 +1044,7 @@ def register_consent(user_id, email, consent_type, version, accepted=True, detai
         True se registrou com sucesso, False em caso de erro.
     """
     if consent_type not in CONSENT_TYPES:
-        print(f"[CONSENT] Tipo inválido: {consent_type}")
+        safe_log(f"[CONSENT] Tipo inválido: {consent_type}")
         return False
     try:
         ip = request.remote_addr if request else ""
@@ -975,7 +1059,7 @@ def register_consent(user_id, email, consent_type, version, accepted=True, detai
         db.commit()
         return True
     except Exception as e:
-        print(f"[CONSENT] Erro ao registrar consentimento: {e}")
+        safe_log(f"[CONSENT] Erro ao registrar consentimento: {e}", level="ERROR")
         return False
 
 
@@ -992,7 +1076,7 @@ def get_user_consents(user_id):
         ).fetchall()
         return [dict(r) for r in rows]
     except Exception as e:
-        print(f"[CONSENT] Erro ao buscar consentimentos: {e}")
+        safe_log(f"[CONSENT] Erro ao buscar consentimentos: {e}", level="ERROR")
         return []
 
 
@@ -1042,6 +1126,63 @@ def mask_phone(phone):
     if len(s) <= 6:
         return s
     return s[:6] + "*" * (len(s) - 10) + s[-4:] if len(s) >= 10 else s[:3] + "*" * (len(s) - 3)
+
+
+# ════════════════════════════════════════════════════════════════
+#  LOGGING SEGURO (mascaramento PII)
+# ════════════════════════════════════════════════════════════════
+#  Substitui safe_log() em pontos sensíveis. Os logs do Railway/produção
+#  são logs operacionais; PII (email, telefone, token, conteúdo de
+#  mensagem) NÃO deve aparecer em texto puro neles.
+#  Princípio LGPD Art. 6º, VII (segurança) e Art. 46 (medidas técnicas).
+
+import re as _re_log
+
+_EMAIL_RE = _re_log.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
+_PHONE_RE = _re_log.compile(r'\+?\b\d{10,15}\b')
+_TOKEN_LIKE_RE = _re_log.compile(r'\b(EA[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9-]{20,}|gAAAAA[A-Za-z0-9_-]{30,}|TEST-[A-Za-z0-9-]{20,}|APP_USR-[A-Za-z0-9-]{20,})\b')
+
+
+def _scrub_pii(text):
+    """Remove/mascara PII de uma string antes de logar."""
+    if not text:
+        return text
+    s = str(text)
+    # Mascara emails
+    s = _EMAIL_RE.sub(lambda m: mask_email(m.group(0)), s)
+    # Mascara telefones longos (10+ dígitos)
+    s = _PHONE_RE.sub(lambda m: mask_phone(m.group(0)), s)
+    # Esconde tokens longos (Meta, Anthropic, Fernet, MercadoPago)
+    s = _TOKEN_LIKE_RE.sub(lambda m: m.group(0)[:6] + "***[REDACTED]", s)
+    return s
+
+
+def _short_resp_text(resp, n=80):
+    """Snippet curto e single-line da resposta de um provedor externo.
+    Reduz vazamento de detalhe técnico em logs (ainda passa por _scrub_pii via safe_log)."""
+    try:
+        txt = (resp.text or "")[:n]
+    except Exception:
+        return "[no body]"
+    # Remove quebras de linha e espaços extras
+    txt = " ".join(txt.split())
+    if len(txt) >= n:
+        txt += "...[truncated]"
+    return txt or "[empty]"
+
+
+def safe_log(*args, level="INFO"):
+    """safe_log() seguro que mascara PII automaticamente.
+    Use no lugar de safe_log() para logs operacionais.
+    Args podem ser quaisquer valores; todos passam por _scrub_pii."""
+    try:
+        parts = [_scrub_pii(a) for a in args]
+        msg = " ".join(str(p) for p in parts)
+        # Prefixa com nível
+        print(f"[{level}] {msg}")
+    except Exception:
+        # Fallback ultra-conservador: se algo falhar, não logue NADA do conteúdo
+        print(f"[{level}] [log scrub failed]")
 
 
 def export_user_data_as_json(user_id):
@@ -1100,7 +1241,7 @@ def export_user_data_as_json(user_id):
                 rows = db.execute(sql, params).fetchall()
                 return [dict(r) for r in rows]
             except Exception as e:
-                print(f"[EXPORT] Erro lendo {table}: {e}")
+                safe_log(f"[EXPORT] Erro lendo {table}: {e}", level="ERROR")
                 return []
 
         export["consentimentos"]       = _fetch_table("consent_log", order="created_at DESC")
@@ -1129,7 +1270,7 @@ def export_user_data_as_json(user_id):
             ).fetchall()
             export["mensagens"] = [dict(r) for r in rows]
         except Exception as e:
-            print(f"[EXPORT] Erro lendo messages: {e}")
+            safe_log(f"[EXPORT] Erro lendo messages: {e}", level="ERROR")
 
         # Resumo numérico
         export["_resumo"] = {
@@ -1143,7 +1284,7 @@ def export_user_data_as_json(user_id):
 
         return export
     except Exception as e:
-        print(f"[EXPORT] Erro fatal: {e}")
+        safe_log(f"[EXPORT] Erro fatal: {e}", level="ERROR")
         return None
 
 
@@ -1159,6 +1300,9 @@ def anonymize_user_account(user_id, reason="user_request"):
               api_usage_log (necessário pra obrigação fiscal/contábil 5 anos)
     - PRESERVA: consent_log (prova legal perpétua de aceites/revogações)
 
+    Importante: usa PRAGMA table_info() para detectar quais colunas existem e só
+    atualiza as que realmente fazem parte do schema (evita falha silenciosa).
+
     Retorna True se executou sem erros críticos.
     """
     if not user_id:
@@ -1171,6 +1315,48 @@ def anonymize_user_account(user_id, reason="user_request"):
         # 1. Registrar a revogação ANTES de anonimizar (precisamos do email original)
         original = db.execute("SELECT email FROM users WHERE id=?", (user_id,)).fetchone()
         original_email = original["email"] if original else ""
+
+        # ANTES de deletar mensagens, captura caminhos de mídia anexada pra apagar depois.
+        # (Após DELETE, perdemos os media_url da tabela.)
+        media_urls_to_clean = []
+        try:
+            rows = db.execute(
+                """SELECT DISTINCT m.media_url FROM messages m
+                   JOIN conversations c ON c.id = m.conversation_id
+                   WHERE c.user_id = ? AND m.media_url != ''""", (user_id,)
+            ).fetchall()
+            for r in rows:
+                url = (r["media_url"] or "").strip()
+                if url and url.startswith("/") and "media_files" in url:
+                    media_urls_to_clean.append(url)
+        except Exception as e:
+            safe_log(f"[ANONYMIZE] Aviso ao listar media_urls: {e}", level="WARN")
+
+        # Captura também file_path da biblioteca social
+        try:
+            rows = db.execute(
+                "SELECT file_path FROM social_media_library WHERE user_id=? AND file_path != ''",
+                (user_id,)
+            ).fetchall()
+            for r in rows:
+                fp = (r["file_path"] or "").strip()
+                if fp and "media_files" in fp:
+                    media_urls_to_clean.append(fp)
+        except Exception:
+            pass
+
+        # E captura paths da galeria de produtos
+        try:
+            rows = db.execute(
+                "SELECT file_path FROM product_gallery WHERE user_id=? AND file_path != ''",
+                (user_id,)
+            ).fetchall()
+            for r in rows:
+                fp = (r["file_path"] or "").strip()
+                if fp and "media_files" in fp:
+                    media_urls_to_clean.append(fp)
+        except Exception:
+            pass
 
         # Tabelas a DELETAR (conteúdo operacional, sem obrigação legal de manter)
         tables_to_delete = [
@@ -1189,109 +1375,213 @@ def anonymize_user_account(user_id, reason="user_request"):
             ("social_media_library", "user_id=?"),
             ("scheduled_posts", "user_id=?"),
         ]
+        delete_summary = {}
         for table, where in tables_to_delete:
             try:
-                db.execute(f"DELETE FROM {table} WHERE {where}", (user_id,))
+                cur = db.execute(f"DELETE FROM {table} WHERE {where}", (user_id,))
+                delete_summary[table] = cur.rowcount or 0
             except Exception as e:
-                print(f"[ANONYMIZE] Erro deletando {table}: {e}")
+                safe_log(f"[ANONYMIZE] Erro deletando {table}: {e}", level="WARN")
 
-        # Tabelas a ANONIMIZAR (mantém pra obrigação fiscal/legal)
-        # orders e payments: anonimizar referência ao cliente, manter dados financeiros
+        # ── Anonimizar ORDERS (obrigação fiscal mantém o registro)
+        # Detecta dinamicamente quais colunas de PII existem antes de tentar atualizar
         try:
+            orders_cols = {row[1] for row in db.execute("PRAGMA table_info(orders)").fetchall()}
+            updates = []
+            params = []
+            if "customer_name" in orders_cols:
+                updates.append("customer_name=?"); params.append("Cliente Excluído")
+            if "customer_phone" in orders_cols:
+                updates.append("customer_phone=?"); params.append("")
+            if "customer_email" in orders_cols:  # caso seja adicionada no futuro
+                updates.append("customer_email=?"); params.append("")
+            if "notes" in orders_cols:
+                updates.append("notes=?"); params.append("")
+            if updates:
+                params.append(user_id)
+                db.execute(f"UPDATE orders SET {', '.join(updates)} WHERE user_id=?", params)
+        except Exception as e:
+            safe_log(f"[ANONYMIZE] Erro anonimizando orders: {e}", level="WARN")
+
+        # ── Anonimizar USERS: detecta colunas REAIS do schema antes de atualizar
+        # Mapeia colunas a serem zeradas: name → "Usuário Excluído", senha → "", tokens/PII → ""
+        # Mantém apenas o registro mínimo para integridade referencial (payments etc.)
+        try:
+            user_cols = {row[1] for row in db.execute("PRAGMA table_info(users)").fetchall()}
+
+            # Colunas que recebem valor especial
+            special_updates = {
+                "email": anon_email,
+                "name": "Usuário Excluído",
+                "is_active": 0,
+                "plan_status": "deleted",
+                "email_verified": 0,
+            }
+            # Colunas a apagar completamente (vão ficar string vazia)
+            blank_columns = [
+                "password_hash", "company", "phone",
+                "whatsapp_phone_id", "whatsapp_token",
+                "instagram_page_id", "instagram_token",
+                "messenger_page_id", "messenger_token",
+                "telegram_bot_token", "telegram_chat_id",
+                "mp_access_token", "mp_public_key",
+                "mp_subscription_id",
+                "ai_system_prompt", "ai_greeting",
+                "social_business_context", "social_last_run",
+                "auto_reply_off_hours",
+            ]
+
+            updates = []
+            params = []
+            for col, val in special_updates.items():
+                if col in user_cols:
+                    updates.append(f"{col}=?")
+                    params.append(val)
+            for col in blank_columns:
+                if col in user_cols:
+                    updates.append(f"{col}=?")
+                    params.append("")
+            # deleted_at se existir
+            if "deleted_at" in user_cols:
+                updates.append("deleted_at=?")
+                params.append(deleted_at)
+
+            if not updates:
+                safe_log("[ANONYMIZE] ERRO: nenhuma coluna esperada encontrada em users", level="ERROR")
+                return False
+
+            params.append(user_id)
+            sql = f"UPDATE users SET {', '.join(updates)} WHERE id=?"
+            db.execute(sql, params)
+            safe_log(f"[ANONYMIZE] Atualizadas {len(updates)} colunas em users para id={user_id}")
+        except Exception as e:
+            safe_log(f"[ANONYMIZE] ERRO crítico anonimizando users: {e}", level="ERROR")
+            return False
+
+        # Limpar mídia física associada (LGPD: dados pessoais não podem permanecer em disco)
+        # 1. Arquivos referenciados em messages/social/gallery (capturados ANTES dos DELETEs)
+        # 2. Arquivos com prefixo user{id}_ em subpastas social/gallery (varredura por glob)
+        # 3. Subpasta legada media_files/user_{id}/ (se existir)
+        try:
+            import glob, shutil
+            media_root = MEDIA_FOLDER if 'MEDIA_FOLDER' in globals() else os.path.join(os.path.dirname(DATABASE), "media_files")
+            files_removed = 0
+
+            # (1) Apaga arquivos referenciados explicitamente no DB (capturados antes)
+            for path in media_urls_to_clean:
+                try:
+                    # Resolve para caminho absoluto seguro dentro de media_root
+                    abs_path = os.path.abspath(path)
+                    abs_root = os.path.abspath(media_root)
+                    if abs_path.startswith(abs_root) and os.path.isfile(abs_path):
+                        os.remove(abs_path)
+                        files_removed += 1
+                except Exception as e:
+                    safe_log(f"[ANONYMIZE] Falha removendo {os.path.basename(path)}: {e}", level="WARN")
+
+            # (2) Varredura por padrão user{id}_* (catch-all caso o DB não registre tudo)
+            patterns = [
+                os.path.join(media_root, "social", f"user{user_id}_*"),
+                os.path.join(media_root, "gallery", f"user{user_id}_*"),
+            ]
+            for pat in patterns:
+                for path in glob.glob(pat):
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                            files_removed += 1
+                    except Exception as e:
+                        safe_log(f"[ANONYMIZE] Falha removendo {os.path.basename(path)}: {e}", level="WARN")
+
+            # (3) Subpasta user_X legada (se algum dia existir)
+            legacy_dir = os.path.join(media_root, f"user_{user_id}")
+            if os.path.isdir(legacy_dir):
+                shutil.rmtree(legacy_dir, ignore_errors=True)
+                files_removed += 1
+
+            if files_removed:
+                safe_log(f"[ANONYMIZE] {files_removed} arquivo(s) de mídia removido(s) para user {user_id}")
+        except Exception as e:
+            safe_log(f"[ANONYMIZE] Aviso ao limpar mídia: {e}", level="WARN")
+
+        # Registra a anonimização no consent_log (prova legal) - usa email mascarado, não o original em texto puro
+        try:
+            ua_short = ""
+            if request:
+                ua_short = (request.headers.get("User-Agent", "") or "")[:300]
             db.execute(
-                "UPDATE orders SET customer_name='Usuário Excluído', customer_phone='', customer_email='' WHERE user_id=?",
-                (user_id,)
+                """INSERT INTO consent_log
+                   (user_id, email, consent_type, consent_version, accepted, ip_address, user_agent, details)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, anon_email, "data_processing", PRIVACY_POLICY_VERSION, 0,
+                 request.remote_addr if request else "",
+                 ua_short,
+                 f"Conta anonimizada/excluída a pedido do titular em {deleted_at}. Motivo: {reason}. "
+                 f"Deletadas: {delete_summary}")
             )
         except Exception as e:
-            print(f"[ANONYMIZE] Erro anonimizando orders: {e}")
+            safe_log(f"[ANONYMIZE] Erro ao registrar log de exclusão: {e}", level="WARN")
 
-        # Anonimiza o registro principal de users — mas mantém a linha
-        # pra preservar integridade referencial de payments (5 anos obrigatórios)
-        try:
-            db.execute(
-                """UPDATE users SET
-                    email = ?,
-                    password_hash = '',
-                    name = 'Usuário Excluído',
-                    company = '',
-                    phone = '',
-                    whatsapp_token = '',
-                    whatsapp_phone_id = '',
-                    whatsapp_business_account_id = '',
-                    instagram_token = '',
-                    messenger_token = '',
-                    telegram_chat_id = '',
-                    mercadopago_token = '',
-                    is_active = 0,
-                    plan_status = 'deleted',
-                    email_verified = 0,
-                    twofa_secret = '',
-                    twofa_enabled = 0,
-                    twofa_backup_codes = ''
-                   WHERE id = ?""",
-                (anon_email, user_id)
-            )
-        except Exception as e:
-            # Algumas colunas podem não existir — tenta versão mínima
-            print(f"[ANONYMIZE] Erro UPDATE users completo: {e} — tentando versão mínima")
-            db.execute(
-                """UPDATE users SET email=?, password_hash='', name='Usuário Excluído',
-                   company='', is_active=0, plan_status='deleted' WHERE id=?""",
-                (anon_email, user_id)
-            )
-
-        # Registra a anonimização no consent_log (prova legal)
-        db.execute(
-            """INSERT INTO consent_log
-               (user_id, email, consent_type, consent_version, accepted, ip_address, user_agent, details)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, original_email, "data_processing", PRIVACY_POLICY_VERSION, 0,
-             request.remote_addr if request else "",
-             (request.headers.get("User-Agent", "")[:300] if request else ""),
-             f"Conta anonimizada/excluída a pedido do titular em {deleted_at}. Motivo: {reason}")
-        )
         db.commit()
-        print(f"[ANONYMIZE] Usuário {user_id} ({original_email}) anonimizado com sucesso")
+        safe_log(f"[ANONYMIZE] Usuário {user_id} ({mask_email(original_email)}) anonimizado com sucesso")
         return True
     except Exception as e:
-        print(f"[ANONYMIZE] Erro fatal: {e}")
+        safe_log(f"[ANONYMIZE] Erro fatal: {e}", level="ERROR")
         return False
 
 
 def generate_deletion_code(user_id, email):
     """Gera código de 6 dígitos pra confirmar exclusão de conta via email.
-    Reutiliza tabela verification_codes com tipo 'deletion'.
+    Armazena apenas o HASH (HMAC-SHA256 + pepper).
+    Cooldown de 60s entre reenvios (anti-flood).
     Código válido por 15 minutos."""
     if not email:
         return None
     try:
-        code = f"{secrets.randbelow(900000) + 100000}"  # 6 dígitos
         db = get_db()
+        # Cooldown: verifica se já foi enviado um há menos de 60s
+        recent = db.execute(
+            """SELECT created_at FROM verification_codes
+               WHERE email=? AND code_type='deletion'
+               ORDER BY created_at DESC LIMIT 1""", (email,)
+        ).fetchone()
+        if recent and recent["created_at"]:
+            try:
+                last_time = datetime.fromisoformat(recent["created_at"])
+                if (datetime.now() - last_time).total_seconds() < 60:
+                    safe_log(f"[DELETION_CODE] Cooldown ativo para {mask_email(email)}", level="WARN")
+                    return None
+            except Exception:
+                pass
+
+        code = f"{secrets.randbelow(900000) + 100000}"  # 6 dígitos
+        code_hash = hash_verification_code(code)
         # Limpar códigos antigos do mesmo email
         db.execute("DELETE FROM verification_codes WHERE email=? AND code_type='deletion'", (email,))
         db.execute(
             """INSERT INTO verification_codes (email, code, code_type, expires_at)
                VALUES (?, ?, 'deletion', datetime('now', '+15 minutes'))""",
-            (email, code)
+            (email, code_hash)
         )
         db.commit()
-        return code
+        return code  # retorna o código em texto para enviar por email; só o HASH fica no banco
     except Exception as e:
-        print(f"[DELETION_CODE] Erro: {e}")
+        safe_log(f"[DELETION_CODE] Erro: {e}", level="ERROR")
         return None
 
 
 def verify_deletion_code(email, code):
-    """Verifica se o código de exclusão é válido."""
+    """Verifica se o código de exclusão é válido (compara hash)."""
     if not email or not code:
         return False
     try:
         db = get_db()
+        code_hash = hash_verification_code(code)
         row = db.execute(
             """SELECT id FROM verification_codes
                WHERE email=? AND code=? AND code_type='deletion'
                  AND expires_at > datetime('now')
-               LIMIT 1""", (email, code)
+               LIMIT 1""", (email, code_hash)
         ).fetchone()
         if row:
             db.execute("DELETE FROM verification_codes WHERE id=?", (row["id"],))
@@ -1299,8 +1589,264 @@ def verify_deletion_code(email, code):
             return True
         return False
     except Exception as e:
-        print(f"[DELETION_CODE] Erro verificação: {e}")
+        safe_log(f"[DELETION_CODE] Erro verificação: {e}", level="ERROR")
         return False
+
+
+# ════════════════════════════════════════════════════════════════
+#  BACKUP AUTOMATIZADO (LGPD Art. 46 — medidas técnicas)
+# ════════════════════════════════════════════════════════════════
+#  Backup diário do SQLite no próprio volume Railway com:
+#  - Cópia consistente via sqlite3.backup() (sem corrupção)
+#  - Criptografia opcional Fernet (se DATA_ENCRYPTION_KEY/SECRET_KEY ok)
+#  - Rotação automática: mantém últimos N backups, apaga antigos
+#  - Hashing SHA-256 pra verificação de integridade
+
+BACKUP_DIR = os.path.join(os.path.dirname(DATABASE), "backups") if "/" in DATABASE else "backups"
+BACKUP_RETENTION_DAYS = int(os.getenv("BACKUP_RETENTION_DAYS", "30"))
+
+
+def perform_database_backup():
+    """Faz backup consistente do banco SQLite.
+    - Usa sqlite3.backup() (não cp) para evitar corrupção com escritas concorrentes.
+    - Salva em /app/data/backups/atendeia-YYYYMMDD-HHMMSS.db
+    - Calcula SHA-256 para integridade.
+    - Criptografa com Fernet se a chave estiver disponível.
+    - Roda rotação: apaga backups com mais de BACKUP_RETENTION_DAYS dias.
+
+    Retorna dict com status ou None em caso de falha grave.
+    """
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_filename = f"atendeia-{timestamp}.db"
+        backup_path = os.path.join(BACKUP_DIR, backup_filename)
+
+        # 1. Backup consistente via API SQLite (não copia arquivo bruto)
+        src = sqlite3.connect(DATABASE)
+        dst = sqlite3.connect(backup_path)
+        with dst:
+            src.backup(dst)
+        src.close()
+        dst.close()
+
+        # 2. Hash SHA-256 para integridade
+        sha = hashlib.sha256()
+        with open(backup_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha.update(chunk)
+        digest = sha.hexdigest()
+
+        # 3. Criptografar com Fernet — em produção, é OBRIGATÓRIO (fail-closed):
+        #    se a chave não existir OU a criptografia falhar, apaga o .db em claro e aborta.
+        #    Em dev (FLASK_ENV=development), mantém o backup em claro com aviso.
+        encrypted_path = None
+        is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+        fernet = _get_fernet()
+
+        if fernet:
+            try:
+                with open(backup_path, "rb") as f:
+                    raw = f.read()
+                encrypted = fernet.encrypt(raw)
+                encrypted_path = backup_path + ".enc"
+                with open(encrypted_path, "wb") as f:
+                    f.write(encrypted)
+                # Remove a versão não-criptografada
+                os.remove(backup_path)
+                final_path = encrypted_path
+            except Exception as e:
+                err_id = secrets.token_hex(6)
+                safe_log(f"[BACKUP] Falha ao criptografar id={err_id}: {e}", level="ERROR")
+                # Fail-closed em produção: apaga o .db em claro e aborta.
+                if not is_dev:
+                    try:
+                        if os.path.exists(backup_path):
+                            os.remove(backup_path)
+                    except OSError:
+                        pass
+                    safe_log(f"[BACKUP] PRODUÇÃO: backup em claro REMOVIDO e operação ABORTADA (err_id={err_id})", level="ERROR")
+                    return None
+                safe_log("[BACKUP] DEV: mantendo backup em claro (FLASK_ENV=development)", level="WARN")
+                final_path = backup_path
+        else:
+            # Sem chave Fernet: fail-closed em produção.
+            if not is_dev:
+                try:
+                    if os.path.exists(backup_path):
+                        os.remove(backup_path)
+                except OSError:
+                    pass
+                safe_log("[BACKUP] PRODUÇÃO: chave de criptografia ausente — backup em claro REMOVIDO e operação ABORTADA. Configure DATA_ENCRYPTION_KEY ou SECRET_KEY.", level="ERROR")
+                return None
+            safe_log("[BACKUP] DEV: criptografia indisponível, mantendo backup em claro", level="WARN")
+            final_path = backup_path
+
+        # 4. Salvar metadata em arquivo .json (sha, tamanho, criptografado?)
+        meta_path = final_path + ".meta.json"
+        size_bytes = os.path.getsize(final_path)
+        metadata = {
+            "filename": os.path.basename(final_path),
+            "created_at": datetime.now().isoformat(),
+            "size_bytes": size_bytes,
+            "sha256_unencrypted": digest,
+            "encrypted": bool(encrypted_path),
+            "source_db": DATABASE,
+        }
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        # 5. Rotação: apagar backups antigos
+        removed = 0
+        cutoff = time.time() - (BACKUP_RETENTION_DAYS * 86400)
+        for entry in os.listdir(BACKUP_DIR):
+            full = os.path.join(BACKUP_DIR, entry)
+            try:
+                if os.path.getmtime(full) < cutoff and (entry.startswith("atendeia-") and (entry.endswith(".db") or entry.endswith(".enc") or entry.endswith(".meta.json"))):
+                    os.remove(full)
+                    removed += 1
+            except Exception:
+                pass
+
+        size_mb = size_bytes / (1024 * 1024)
+        safe_log(f"[BACKUP] OK: {os.path.basename(final_path)} ({size_mb:.2f}MB) — rotação: {removed} arquivos antigos removidos")
+        return {
+            "ok": True,
+            "path": final_path,
+            "size_mb": round(size_mb, 2),
+            "encrypted": bool(encrypted_path),
+            "removed_old": removed,
+        }
+    except Exception as e:
+        safe_log(f"[BACKUP] ERRO: {e}", level="ERROR")
+        return None
+
+
+# ════════════════════════════════════════════════════════════════
+#  RETENÇÃO AUTOMÁTICA DE DADOS (LGPD Art. 16)
+# ════════════════════════════════════════════════════════════════
+#  Apaga permanentemente mensagens antigas conforme plano do usuário:
+#    Starter:    90 dias
+#    Pro:       180 dias
+#    Business:  365 dias
+#    Agência:   730 dias
+
+RETENTION_DAYS_BY_PLAN = {
+    "starter": 90,
+    "pro": 180,
+    "business": 365,
+    "agency": 730,
+}
+
+
+def perform_retention_cleanup():
+    """Apaga mensagens (e conversas vazias) cujo prazo de retenção do plano expirou.
+    Roda diariamente. Resultado: respeita LGPD e reduz tamanho do banco.
+
+    Retorna dict com estatísticas ou None em caso de falha.
+    """
+    try:
+        db = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+        total_msgs_deleted = 0
+        total_convs_deleted = 0
+        by_plan = {}
+
+        for plan, days in RETENTION_DAYS_BY_PLAN.items():
+            # Apaga mensagens com mais de N dias para conversas de usuários nesse plano
+            cur = db.execute(
+                """DELETE FROM messages
+                   WHERE conversation_id IN (
+                       SELECT c.id FROM conversations c
+                       JOIN users u ON u.id = c.user_id
+                       WHERE u.plan = ?
+                   )
+                   AND created_at < datetime('now', ?)""",
+                (plan, f"-{days} days")
+            )
+            msgs_deleted = cur.rowcount or 0
+            total_msgs_deleted += msgs_deleted
+
+            # Apaga conversas que ficaram totalmente vazias (sem mensagens)
+            cur = db.execute(
+                """DELETE FROM conversations
+                   WHERE user_id IN (SELECT id FROM users WHERE plan = ?)
+                   AND id NOT IN (SELECT DISTINCT conversation_id FROM messages)
+                   AND last_message_at < datetime('now', ?)""",
+                (plan, f"-{days} days")
+            )
+            convs_deleted = cur.rowcount or 0
+            total_convs_deleted += convs_deleted
+
+            by_plan[plan] = {"msgs": msgs_deleted, "convs": convs_deleted}
+
+        # Limpa também logs antigos
+        # Audit log admin: 180 dias
+        cur = db.execute("DELETE FROM admin_audit_log WHERE created_at < datetime('now', '-180 days')")
+        audit_deleted = cur.rowcount or 0
+        # Webhook errors: 60 dias
+        cur = db.execute("DELETE FROM webhook_errors WHERE created_at < datetime('now', '-60 days')")
+        webhook_errors_deleted = cur.rowcount or 0
+        # Processed webhook events: 30 dias (dedupe não precisa de histórico longo)
+        try:
+            cur = db.execute("DELETE FROM processed_webhook_events WHERE created_at < datetime('now', '-30 days')")
+            webhook_events_deleted = cur.rowcount or 0
+        except Exception:
+            webhook_events_deleted = 0
+        # Verification codes expirados
+        cur = db.execute("DELETE FROM verification_codes WHERE expires_at < datetime('now')")
+        codes_deleted = cur.rowcount or 0
+
+        db.commit()
+        db.close()
+
+        result = {
+            "ok": True,
+            "messages_deleted": total_msgs_deleted,
+            "conversations_deleted": total_convs_deleted,
+            "by_plan": by_plan,
+            "audit_log_deleted": audit_deleted,
+            "webhook_errors_deleted": webhook_errors_deleted,
+            "webhook_events_deleted": webhook_events_deleted,
+            "verification_codes_deleted": codes_deleted,
+        }
+        safe_log(f"[RETENTION] OK: {total_msgs_deleted} msgs, {total_convs_deleted} convs, {audit_deleted} audit, {codes_deleted} códigos expirados")
+        return result
+    except Exception as e:
+        safe_log(f"[RETENTION] ERRO: {e}", level="ERROR")
+        return None
+
+
+def start_daily_maintenance_scheduler():
+    """Inicia thread daemon que roda backup + retenção diariamente às 3h da manhã (BRT/UTC-3).
+    Em produção/Railway, o servidor está em UTC, então usa-se UTC+0 03h = 00h BRT.
+    Mas como queremos 3h BRT (horário de menor uso), agendamos para 06h UTC."""
+    def loop():
+        last_run_date = None
+        target_hour_utc = int(os.getenv("MAINTENANCE_HOUR_UTC", "6"))  # 06h UTC = 03h BRT
+
+        while True:
+            try:
+                now = datetime.utcnow()
+                today_key = now.strftime("%Y-%m-%d")
+
+                # Roda uma vez por dia, na hora alvo
+                if now.hour == target_hour_utc and last_run_date != today_key:
+                    safe_log(f"[MAINTENANCE] Iniciando rotina diária às {now.isoformat()} UTC")
+                    perform_database_backup()
+                    perform_retention_cleanup()
+                    last_run_date = today_key
+                    safe_log("[MAINTENANCE] Rotina diária concluída")
+
+            except Exception as e:
+                safe_log(f"[MAINTENANCE LOOP] Erro: {e}", level="ERROR")
+
+            # Verifica a cada 30 minutos
+            time.sleep(1800)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    safe_log("[MAINTENANCE] Scheduler diário (backup + retenção) iniciado — roda às 06h UTC (~03h BRT)")
 
 
 def register_processed_webhook_event(source, event_key, user_id=None, payload=None):
@@ -1320,7 +1866,7 @@ def register_processed_webhook_event(source, event_key, user_id=None, payload=No
     except sqlite3.IntegrityError:
         return False
     except Exception as e:
-        print(f"[WEBHOOK EVENT] Falha ao registrar {source}:{event_key} -> {e}")
+        safe_log(f"[WEBHOOK EVENT] Falha ao registrar {source}:{event_key} -> {e}", level="ERROR")
         return False
 
 
@@ -1444,18 +1990,18 @@ def validate_mp_signature(request_obj, webhook_secret=None):
     # Sem secret = FALHA em produção, aceita em dev
     if not webhook_secret:
         if is_dev:
-            print("[MP SIG] ⚠️ DEV: MP_WEBHOOK_SECRET não configurado — aceito sem validação")
+            safe_log("[MP SIG] ⚠️ DEV: MP_WEBHOOK_SECRET não configurado — aceito sem validação", level="WARN")
             return True
         # Produção: REJEITA
-        print("[MP SIG] ❌ PRODUÇÃO: MP_WEBHOOK_SECRET não configurado. Webhook rejeitado.")
-        print("[MP SIG] Configure em /admin/api-settings → MP Webhook Secret")
+        safe_log("[MP SIG] ❌ PRODUÇÃO: MP_WEBHOOK_SECRET não configurado. Webhook rejeitado.", level="ERROR")
+        safe_log("[MP SIG] Configure em /admin/api-settings → MP Webhook Secret")
         return False
 
     signature_header = request_obj.headers.get("x-signature", "")
     request_id = request_obj.headers.get("x-request-id", "")
 
     if not signature_header:
-        print("[MP SIG] Rejeitado: x-signature ausente")
+        safe_log("[MP SIG] Rejeitado: x-signature ausente", level="WARN")
         return False
 
     parts = dict(p.split("=", 1) for p in signature_header.split(",") if "=" in p)
@@ -1463,7 +2009,26 @@ def validate_mp_signature(request_obj, webhook_secret=None):
     received_hash = parts.get("v1", "")
 
     if not ts or not received_hash:
-        print("[MP SIG] Rejeitado: header malformado")
+        safe_log("[MP SIG] Rejeitado: header malformado", level="ERROR")
+        return False
+
+    # Anti-replay: rejeita ts fora da janela de 5 minutos.
+    # MP envia ts como milissegundos desde epoch.
+    try:
+        ts_int = int(ts)
+        # Detecta automaticamente se está em ms ou em segundos
+        if ts_int > 10_000_000_000:  # > ano 2286 em segundos -> só pode ser ms
+            ts_seconds = ts_int / 1000.0
+        else:
+            ts_seconds = float(ts_int)
+        now_seconds = time.time()
+        delta = abs(now_seconds - ts_seconds)
+        MP_REPLAY_WINDOW = 300  # 5 minutos (igual ao padrão Slack/Stripe)
+        if delta > MP_REPLAY_WINDOW:
+            safe_log(f"[MP SIG] Rejeitado: ts fora da janela ({int(delta)}s de diferença, max {MP_REPLAY_WINDOW}s)", level="ERROR")
+            return False
+    except (ValueError, TypeError) as e:
+        safe_log(f"[MP SIG] Rejeitado: ts inválido ({e})", level="ERROR")
         return False
 
     try:
@@ -1480,7 +2045,7 @@ def validate_mp_signature(request_obj, webhook_secret=None):
     ).hexdigest()
 
     if not hmac_mod.compare_digest(expected_hash, received_hash):
-        print(f"[MP SIG] Rejeitado: hash inválido (data_id={data_id})")
+        safe_log(f"[MP SIG] Rejeitado: hash inválido (data_id={data_id})", level="ERROR")
         return False
 
     return True
@@ -1550,10 +2115,10 @@ def migrate_encrypt_user_tokens():
                 migrated += 1
         if migrated > 0:
             db.commit()
-            print(f"[CRYPTO] Migração: {migrated} usuário(s) com tokens criptografados")
+            safe_log(f"[CRYPTO] Migração: {migrated} usuário(s) com tokens criptografados")
         db.close()
     except Exception as e:
-        print(f"[CRYPTO] Erro na migração de tokens: {e}")
+        safe_log(f"[CRYPTO] Erro na migração de tokens: {e}", level="ERROR")
 
 
 def _decrypt_legacy(encrypted):
@@ -1620,12 +2185,13 @@ def set_setting(key, value):
 
 # ─── EMAIL ─────────────────────────────────────────────────────
 def send_email(to_email, subject, html_body):
-    """Envia email via Resend API"""
+    """Envia email via Resend API. Logs mascarados (LGPD)."""
     resend_key = get_setting("RESEND_API_KEY", "")
     from_email = get_setting("RESEND_FROM_EMAIL", "atendente.online <onboarding@resend.dev>")
+    masked = mask_email(to_email) if to_email else "(empty)"
 
     if not resend_key:
-        print(f"[EMAIL] RESEND_API_KEY não configurada. Email para {to_email} não enviado.")
+        safe_log(f"[EMAIL] RESEND_API_KEY não configurada. Email para {masked} não enviado.", level="WARN")
         return False
 
     try:
@@ -1635,24 +2201,38 @@ def send_email(to_email, subject, html_body):
             json={"from": from_email, "to": [to_email], "subject": subject, "html": html_body},
             timeout=15)
         if resp.status_code == 200:
-            print(f"[EMAIL] Enviado para {to_email}: {subject}")
+            # Loga só o tipo do email (primeira palavra do subject), nunca código nem email completo
+            subject_kind = (subject or "").split(":")[0][:50]
+            safe_log(f"[EMAIL] Enviado para {masked} ({subject_kind})")
             return True
         else:
-            print(f"[EMAIL] Erro {resp.status_code}: {resp.text}")
+            safe_log(f"[EMAIL] Erro {resp.status_code} ao enviar para {masked}", level="ERROR")
             return False
     except Exception as e:
-        print(f"[EMAIL] Erro ao enviar para {to_email}: {e}")
+        safe_log(f"[EMAIL] Erro ao enviar para {masked}: {e}", level="ERROR")
         return False
 
 
+# ════════════════════════════════════════════════════════════════
+#  Helpers de hash para códigos de verificação (LGPD/segurança)
+# ════════════════════════════════════════════════════════════════
+def hash_verification_code(code):
+    """HMAC-SHA256 do código + pepper derivado da SECRET_KEY.
+    Se o banco vazar, atacante não consegue usar os códigos diretamente.
+    Códigos têm vida curta (15-30 min), mas hash em repouso é boa prática."""
+    pepper = (app.secret_key or "").encode() if isinstance(app.secret_key, str) else (app.secret_key or b"")
+    return hashlib.sha256(pepper + (str(code) or "").encode()).hexdigest()
+
+
 def send_verification_code(email):
-    """Gera e envia código de verificação"""
+    """Gera e envia código de verificação. Armazena apenas o HASH."""
     code = str(random.randint(100000, 999999))
     expires = (datetime.now() + timedelta(minutes=30)).isoformat()
+    code_hash = hash_verification_code(code)
 
     db_conn = sqlite3.connect(DATABASE)
     db_conn.execute("DELETE FROM verification_codes WHERE email=?", (email,))
-    db_conn.execute("INSERT INTO verification_codes (email, code, expires_at) VALUES (?,?,?)", (email, code, expires))
+    db_conn.execute("INSERT INTO verification_codes (email, code, expires_at) VALUES (?,?,?)", (email, code_hash, expires))
     db_conn.commit()
     db_conn.close()
 
@@ -1675,10 +2255,16 @@ def send_verification_code(email):
 
 
 def verify_code(email, code):
-    """Verifica se o código é válido"""
+    """Verifica se o código é válido. Compara hash, não texto puro."""
+    if not email or not code:
+        return False
     db_conn = sqlite3.connect(DATABASE)
     db_conn.row_factory = sqlite3.Row
-    row = db_conn.execute("SELECT * FROM verification_codes WHERE email=? AND code=? AND used=0 ORDER BY created_at DESC LIMIT 1", (email, code)).fetchone()
+    code_hash = hash_verification_code(code)
+    row = db_conn.execute(
+        "SELECT * FROM verification_codes WHERE email=? AND code=? AND used=0 ORDER BY created_at DESC LIMIT 1",
+        (email, code_hash)
+    ).fetchone()
     if not row:
         db_conn.close()
         return False
@@ -1733,13 +2319,75 @@ def log_webhook_error(source, user_id, error_type, error_message, payload=None):
         db_conn.commit()
         db_conn.close()
     except Exception as e:
-        print(f"[WEBHOOK ERROR LOG] Falhou: {e}")
+        safe_log(f"[WEBHOOK ERROR LOG] Falhou: {e}", level="ERROR")
 
 
-def hash_password(pw):
+# ════════════════════════════════════════════════════════════════
+#  Política de senhas (LGPD/segurança)
+# ════════════════════════════════════════════════════════════════
+# Senhas curtas (6 chars) eram permitidas — agora exige mínimo razoável
+# com requisitos de complexidade que reduzem dicionários comuns.
+def validate_password_strength(password):
+    """Valida que a senha atende à política mínima. Retorna (ok: bool, msg: str)."""
+    if not password:
+        return False, "Senha é obrigatória."
+    if len(password) < 10:
+        return False, "Senha deve ter pelo menos 10 caracteres."
+    if len(password) > 128:
+        return False, "Senha não pode ter mais de 128 caracteres."
+    has_lower = any(c.islower() for c in password)
+    has_upper = any(c.isupper() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    # Combinação razoável: pelo menos 3 dos 4 (lower, upper, digit, symbol)
+    has_symbol = any(not c.isalnum() for c in password)
+    score = sum([has_lower, has_upper, has_digit, has_symbol])
+    if score < 3:
+        return False, "Senha precisa misturar pelo menos 3 de: letras maiúsculas, minúsculas, números e símbolos."
+    # Senhas óbvias proibidas
+    common = {"senha", "password", "123456", "qwerty", "admin", "abc123", "atendente", "whatsapp"}
+    if password.lower() in common:
+        return False, "Senha muito comum, escolha uma diferente."
+    return True, ""
+
+
+# Iterações PBKDF2-SHA256 — OWASP 2023 recomenda ≥600k.
+# Formato novo do hash: "pbkdf2$<iters>$<salt_hex>$<hash_hex>".
+# Formato legado mantido para compatibilidade: "<salt_hex>:<hash_hex>" (100k iters fixas).
+PBKDF2_ITERATIONS = 600000
+
+
+def hash_password(pw, iterations=PBKDF2_ITERATIONS):
     salt = secrets.token_hex(16)
-    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100000)
-    return f"{salt}:{h.hex()}"
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), iterations)
+    return f"pbkdf2${iterations}${salt}${h.hex()}"
+
+
+def _parse_stored_hash(stored):
+    """Retorna (iters, salt, hash_hex) ou None se formato inválido."""
+    if not stored or not isinstance(stored, str):
+        return None
+    if stored.startswith("pbkdf2$"):
+        try:
+            _, iters_s, salt, h = stored.split("$", 3)
+            return int(iters_s), salt, h
+        except (ValueError, AttributeError):
+            return None
+    if ":" in stored:
+        try:
+            salt, h = stored.split(":", 1)
+            return 100000, salt, h
+        except (ValueError, AttributeError):
+            return None
+    return None
+
+
+def needs_password_rehash(stored):
+    """True se o hash usa parâmetros abaixo do padrão atual (precisa re-hash no próximo login)."""
+    parsed = _parse_stored_hash(stored)
+    if not parsed:
+        return False
+    iters, _, _ = parsed
+    return iters < PBKDF2_ITERATIONS
 
 
 def validate_and_normalize_image(image_bytes, max_width=2048, max_height=2048):
@@ -1780,19 +2428,36 @@ def validate_and_normalize_image(image_bytes, max_width=2048, max_height=2048):
         content_type = f"image/{save_format.lower()}"
         return output.read(), content_type
     except Exception as e:
-        print(f"[IMAGE VALIDATION] Rejeitado: {e}")
+        safe_log(f"[IMAGE VALIDATION] Rejeitado: {e}", level="ERROR")
         return None, None
 
 
 def check_password(pw, stored):
+    parsed = _parse_stored_hash(stored)
+    if not parsed:
+        return False
+    iters, salt, h = parsed
     try:
-        salt, h = stored.split(":")
-        computed = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100000).hex()
-        # Uso hmac.compare_digest para comparação timing-safe (proteção contra ataques de timing)
+        computed = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), iters).hex()
         import hmac as hmac_mod
         return hmac_mod.compare_digest(computed, h)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return False
+
+
+def maybe_upgrade_password_hash(user_id, password, stored):
+    """Re-hash transparente: se o hash armazenado usa params antigos, recalcula com PBKDF2_ITERATIONS atual.
+    Chame APÓS check_password retornar True. Falha silenciosamente — segurança best-effort, não bloqueia o login."""
+    if not needs_password_rehash(stored):
+        return
+    try:
+        new_hash = hash_password(password)
+        db = get_db()
+        db.execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, user_id))
+        db.commit()
+        safe_log(f"[AUTH] Hash de senha atualizado (user_id={user_id})", level="INFO")
+    except Exception as e:
+        safe_log(f"[AUTH] Falha ao atualizar hash de senha (user_id={user_id}): {e}", level="WARN")
 
 def login_required(f):
     @wraps(f)
@@ -1873,7 +2538,7 @@ def download_whatsapp_media(media_id, token):
             f.write(resp2.content)
         return filepath
     except Exception as e:
-        print(f"Erro ao baixar mídia: {e}")
+        safe_log(f"Erro ao baixar mídia: {e}", level="ERROR")
         return None
 
 
@@ -1895,12 +2560,12 @@ def transcribe_audio(filepath):
                 resp = req.post(url, headers=headers, files=files, data=data, timeout=60)
             if resp.status_code == 200:
                 text = resp.json().get("text", "")
-                print(f"[GROQ] Áudio transcrito: {text[:80]}...")
+                safe_log(f"[GROQ] Áudio transcrito: {text[:80]}...")
                 return text if text else "[Não foi possível transcrever]"
             else:
-                print(f"Groq API error: {resp.status_code} {resp.text}")
+                safe_log(f"Groq API error: {resp.status_code} {_short_resp_text(resp)}", level="ERROR")
         except Exception as e:
-            print(f"Groq transcription error: {e}")
+            safe_log(f"Groq transcription error: {e}", level="ERROR")
     
     # Fallback para OpenAI
     if openai_key:
@@ -1914,14 +2579,14 @@ def transcribe_audio(filepath):
                 resp = req.post(url, headers=headers, files=files, data=data, timeout=60)
             if resp.status_code == 200:
                 text = resp.json().get("text", "")
-                print(f"[OPENAI] Áudio transcrito: {text[:80]}...")
+                safe_log(f"[OPENAI] Áudio transcrito: {text[:80]}...")
                 return text if text else "[Não foi possível transcrever]"
             else:
-                print(f"Whisper API error: {resp.status_code} {resp.text}")
+                safe_log(f"Whisper API error: {resp.status_code} {_short_resp_text(resp)}", level="ERROR")
         except Exception as e:
-            print(f"OpenAI transcription error: {e}")
+            safe_log(f"OpenAI transcription error: {e}", level="ERROR")
     
-    print("[AUDIO] Nenhuma API de transcrição configurada")
+    safe_log("[AUDIO] Nenhuma API de transcrição configurada")
     return "[Transcrição indisponível — configure GROQ_API_KEY no painel admin]"
 
 
@@ -1956,7 +2621,7 @@ def analyze_image_with_claude(filepath, user_question=""):
             return resp.json()["content"][0]["text"]
         return "[Não foi possível analisar a imagem]"
     except Exception as e:
-        print(f"Image analysis error: {e}")
+        safe_log(f"Image analysis error: {e}", level="ERROR")
         return "[Erro ao analisar imagem]"
 
 
@@ -1985,7 +2650,7 @@ def extract_pdf_text(filepath, max_pages=100):
 
         return "[Instale pdfplumber ou PyPDF2 para ler PDFs: pip install pdfplumber]"
     except Exception as e:
-        print(f"PDF extraction error: {e}")
+        safe_log(f"PDF extraction error: {e}", level="ERROR")
         return "[Erro ao extrair texto do PDF]"
 
 
@@ -2029,7 +2694,7 @@ def extract_spreadsheet_text(file_obj):
 
         return "[Instale openpyxl para ler planilhas: pip install openpyxl]"
     except Exception as e:
-        print(f"Spreadsheet extraction error: {e}")
+        safe_log(f"Spreadsheet extraction error: {e}", level="ERROR")
         return f"[Erro ao extrair planilha: {str(e)}]"
 
 
@@ -2380,6 +3045,8 @@ def admin_html(title, content):
             <a href="/admin/usage" class="nav-link">Uso API</a>
             <a href="/admin/logs" class="nav-link">Logs</a>
             <a href="/admin/audit-log" class="nav-link">📋 Auditoria</a>
+            <a href="/admin/backups" class="nav-link">💾 Backups</a>
+            <a href="/admin/recrypt-status" class="nav-link">🔐 Recriptografia</a>
             <a href="/admin/webhook-errors" class="nav-link">🚨 Erros</a>
             <a href="/admin/mp-debug" class="nav-link">🧪 MP Debug</a>
             <a href="/admin/2fa" class="nav-link">🔐 2FA</a>
@@ -2514,7 +3181,7 @@ def privacy_policy():
                 <p>Quando seus clientes (terceiros) interagem com sua conta WhatsApp Business, processamos:</p>
                 <p>• Número de telefone, nome de perfil (fornecido pelo WhatsApp).</p>
                 <p>• Conteúdo das mensagens trocadas (texto, áudio, imagem, documentos).</p>
-                <p>• Mensagens são armazenadas criptografadas no banco de dados.</p>
+                <p>• Mensagens são armazenadas em banco de dados com acesso restrito, isolamento do volume e medidas de segurança da infraestrutura. Backups são criptografados.</p>
                 <p style="background:#fff8e1;padding:12px;border-radius:6px;color:#5d4037;margin:8px 0">
                     ⚠️ <strong>Importante:</strong> Para esses dados, atuamos como <strong>Operador</strong> (LGPD Art. 5º, VII),
                     e você (usuário do atendente.online) é o <strong>Controlador</strong>. Você é responsável por obter
@@ -2570,8 +3237,9 @@ def privacy_policy():
                 <h2 style="color:var(--text);font-size:20px;margin:28px 0 12px">6. Segurança da Informação</h2>
                 <p>Adotamos medidas técnicas e administrativas alinhadas com padrões internacionais (ISO 27001 como referência):</p>
                 <p>• <strong style="color:var(--text)">Em trânsito:</strong> HTTPS/TLS 1.2+ obrigatório em todas as comunicações.</p>
-                <p>• <strong style="color:var(--text)">Em repouso:</strong> mensagens, contatos e tokens criptografados (Fernet AES-128 + HMAC-SHA256).</p>
-                <p>• <strong style="color:var(--text)">Senhas:</strong> hash PBKDF2-SHA256 com 100.000 iterações + salt aleatório.</p>
+                <p>• <strong style="color:var(--text)">Em repouso — segredos:</strong> tokens de integração (Meta, Mercado Pago, Telegram), chaves de API e demais segredos do sistema são criptografados em nível de aplicação com Fernet (AES-128-CBC + HMAC-SHA256).</p>
+                <p>• <strong style="color:var(--text)">Em repouso — mensagens e contatos:</strong> armazenados em banco de dados protegido por controles de acesso, isolamento do volume e medidas de segurança da infraestrutura de hospedagem. O acesso é restrito à própria conta do usuário e à equipe técnica autorizada.</p>
+                <p>• <strong style="color:var(--text)">Senhas:</strong> hash PBKDF2-SHA256 com 600.000 iterações + salt aleatório (alinhado às recomendações OWASP 2023).</p>
                 <p>• <strong style="color:var(--text)">Acesso administrativo:</strong> 2FA (TOTP) obrigatório + códigos de backup.</p>
                 <p>• <strong style="color:var(--text)">Auditoria:</strong> registro de ações sensíveis (audit log).</p>
                 <p>• <strong style="color:var(--text)">Proteção:</strong> rate limiting, CSRF tokens, CSP, HSTS, X-Frame-Options.</p>
@@ -2978,7 +3646,7 @@ def lgpd_my_data():
         counts["produtos"] = db.execute("SELECT COUNT(*) FROM product_gallery WHERE user_id=?", (user["id"],)).fetchone()[0]
         counts["campanhas"] = db.execute("SELECT COUNT(*) FROM campaigns WHERE user_id=?", (user["id"],)).fetchone()[0]
     except Exception as e:
-        print(f"[LGPD MY_DATA] Erro contagem: {e}")
+        safe_log(f"[LGPD MY_DATA] Erro contagem: {e}", level="ERROR")
         counts = {k: 0 for k in ["contatos","conversas","mensagens","pedidos","pagamentos","base_conhecimento","produtos","campanhas"]}
 
     # Plano e retenção
@@ -3066,6 +3734,14 @@ def lgpd_my_data():
                 Último aceite registrado: <strong>{last_consent_str}</strong>
             </p>
             <a href="/conta/consentimentos" class="btn btn-secondary btn-sm">📜 Ver histórico completo de consentimentos →</a>
+        </div>
+
+        <div class="card" style="padding:24px;margin-bottom:20px">
+            <h2 style="font-size:18px;margin-bottom:16px">🔐 Segurança da Conta</h2>
+            <p style="color:var(--text2);font-size:14px;margin-bottom:12px">
+                {'✅ <strong style="color:var(--green, #16a34a)">2FA ativado</strong> — sua conta tem proteção em duas camadas.' if user_2fa_enabled(user) else '⚠️ <strong>2FA não ativado</strong> — adicione uma segunda camada de proteção ao seu login.'}
+            </p>
+            <a href="/conta/2fa" class="btn btn-secondary btn-sm">🔐 {'Gerenciar 2FA' if user_2fa_enabled(user) else 'Ativar 2FA'} →</a>
         </div>
 
         <div class="card" style="padding:24px;margin-bottom:20px">
@@ -3238,6 +3914,213 @@ def lgpd_consents():
     return base_html("Consentimentos — LGPD", content, dict(user))
 
 
+@app.route("/conta/2fa", methods=["GET", "POST"])
+@login_required
+def user_2fa_setup():
+    """Setup/gerenciamento de 2FA (TOTP) do usuário comum — opt-in.
+    Fluxo:
+    1. GET sem 2FA → tela de início com botão "Ativar 2FA"
+    2. GET ?start=1 → gera secret pendente, mostra QR code para escanear
+    3. POST action=verify_setup → valida código, ativa 2FA e gera backup codes
+    4. GET ?setup=success → mostra backup codes uma única vez
+    5. POST action=disable → exige senha de confirmação para desativar
+    6. POST action=regenerate_backup → exige senha, gera novos backup codes
+    """
+    user = g.user
+    db = get_db()
+    msg = ""
+    is_enabled = user_2fa_enabled(user)
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+
+        if action == "disable" and is_enabled:
+            confirm_pw = request.form.get("confirm_password", "")
+            raw = db.execute("SELECT password_hash FROM users WHERE id=?", (user["id"],)).fetchone()
+            if not raw or not check_password(confirm_pw, raw["password_hash"]):
+                msg = '<div class="alert alert-error">Senha incorreta. 2FA não foi desativado.</div>'
+            else:
+                db.execute("UPDATE users SET totp_secret='', totp_enabled=0, totp_backup_codes='' WHERE id=?", (user["id"],))
+                db.commit()
+                safe_log(f"[2FA] Desativado pelo próprio usuário (user_id={user['id']})", level="WARN")
+                is_enabled = False
+                msg = '<div class="alert alert-warning">⚠️ 2FA desativado. Sua conta está agora protegida apenas por senha. Recomendamos reativar.</div>'
+
+        elif action == "regenerate_backup" and is_enabled:
+            confirm_pw = request.form.get("confirm_password", "")
+            raw = db.execute("SELECT password_hash FROM users WHERE id=?", (user["id"],)).fetchone()
+            if not raw or not check_password(confirm_pw, raw["password_hash"]):
+                msg = '<div class="alert alert-error">Senha incorreta. Backup codes não foram regenerados.</div>'
+            else:
+                new_codes = generate_backup_codes(8)
+                enc = _encrypt_value(",".join(new_codes))
+                db.execute("UPDATE users SET totp_backup_codes=? WHERE id=?", (enc, user["id"]))
+                db.commit()
+                session["2fa_backup_codes_shown"] = new_codes
+                safe_log(f"[2FA] Backup codes regenerados (user_id={user['id']})")
+                return redirect("/conta/2fa?setup=success")
+
+        elif action == "verify_setup":
+            pending_secret = session.get("pending_user_totp_secret", "")
+            code = request.form.get("totp_code", "").strip()
+            if not pending_secret:
+                msg = '<div class="alert alert-error">Sessão expirada. Inicie o setup novamente.</div>'
+            elif verify_totp_code(pending_secret, code):
+                backup_codes = generate_backup_codes(8)
+                enc_secret = _encrypt_value(pending_secret)
+                enc_backup = _encrypt_value(",".join(backup_codes))
+                db.execute(
+                    "UPDATE users SET totp_secret=?, totp_enabled=1, totp_backup_codes=? WHERE id=?",
+                    (enc_secret, enc_backup, user["id"])
+                )
+                db.commit()
+                session.pop("pending_user_totp_secret", None)
+                session["2fa_backup_codes_shown"] = backup_codes
+                safe_log(f"[2FA] Ativado pelo usuário (user_id={user['id']})")
+                return redirect("/conta/2fa?setup=success")
+            else:
+                msg = '<div class="alert alert-error">Código inválido. Tente novamente.</div>'
+
+    # Página de sucesso (mostra backup codes uma única vez)
+    if request.args.get("setup") == "success":
+        codes = session.pop("2fa_backup_codes_shown", [])
+        if not codes:
+            return redirect("/conta/2fa")
+        codes_html = "".join([f'<li style="font-family:monospace;font-size:16px;padding:8px 0;border-bottom:1px solid var(--border)">{c}</li>' for c in codes])
+        content = f"""
+        <div class="container" style="max-width:680px;padding:32px 24px">
+            <h1 style="font-size:24px;margin-bottom:8px">✅ 2FA Ativado!</h1>
+            <p style="color:var(--text2);margin-bottom:24px">Anote seus backup codes em local seguro — eles só aparecem agora.</p>
+            <div class="alert alert-warning" style="margin-bottom:16px">
+                ⚠️ <strong>IMPORTANTE:</strong> Cada backup code funciona <strong>uma vez</strong>. Use se perder o celular.
+                Esses códigos <strong>não serão mostrados novamente</strong>.
+            </div>
+            <div class="card" style="padding:24px">
+                <h2 style="font-size:16px;margin-bottom:12px">🔑 Seus 8 Backup Codes</h2>
+                <ul style="list-style:none;padding:16px 20px;background:var(--bg2);border-radius:8px;margin:0">{codes_html}</ul>
+                <div style="margin-top:20px;display:flex;gap:10px">
+                    <a href="/conta/2fa" class="btn btn-primary">Já anotei, continuar</a>
+                    <a href="/conta/meus-dados" class="btn btn-secondary">Voltar para Meus Dados</a>
+                </div>
+            </div>
+        </div>
+        """
+        return base_html("Backup Codes 2FA", content, dict(user))
+
+    # Iniciar novo setup (gera secret temporário)
+    if not is_enabled and request.args.get("start") == "1":
+        new_secret = generate_totp_secret()
+        if not new_secret:
+            content = '<div class="container" style="padding:32px"><div class="alert alert-error">❌ Biblioteca pyotp não instalada no servidor. Contate o suporte.</div></div>'
+            return base_html("Erro 2FA", content, dict(user))
+
+        session["pending_user_totp_secret"] = new_secret
+        uri = generate_totp_uri(new_secret, issuer="atendente.online", account=user["email"])
+        qr_data = generate_totp_qr_base64(uri)
+        qr_html = (f'<img src="{qr_data}" alt="QR Code 2FA" style="width:220px;height:220px;background:white;padding:12px;border-radius:8px;display:block;margin:0 auto">'
+                   if qr_data else '<p style="color:var(--red)">Erro ao gerar QR code. Cole o código manualmente abaixo.</p>')
+
+        content = f"""
+        <div class="container" style="max-width:880px;padding:32px 24px">
+            <h1 style="font-size:24px;margin-bottom:8px">🔐 Configurar Autenticação em Dois Fatores</h1>
+            <p style="color:var(--text2);margin-bottom:24px">Adicione uma segunda camada de proteção à sua conta usando um app autenticador.</p>
+            {msg}
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+                <div class="card" style="padding:20px">
+                    <h2 style="font-size:16px;margin-bottom:12px">📱 Passo 1: Escaneie o QR code</h2>
+                    <p style="color:var(--text2);font-size:13px;margin-bottom:16px">Use Google Authenticator, Authy, Microsoft Authenticator, 1Password ou Bitwarden.</p>
+                    {qr_html}
+                    <p style="color:var(--text3);font-size:12px;text-align:center;margin-top:12px">Ou cole este código manualmente:</p>
+                    <code style="display:block;padding:10px;background:var(--bg2);border-radius:6px;font-size:11px;word-break:break-all;text-align:center;border:1px solid var(--border)">{new_secret}</code>
+                </div>
+                <div class="card" style="padding:20px">
+                    <h2 style="font-size:16px;margin-bottom:12px">✅ Passo 2: Confirme o código</h2>
+                    <p style="color:var(--text2);font-size:13px;margin-bottom:16px">Digite o código de 6 dígitos que aparece no seu app:</p>
+                    <form method="POST">{csrf_field()}
+                        <input type="hidden" name="action" value="verify_setup">
+                        <div class="form-group">
+                            <input type="text" name="totp_code" class="form-input" required maxlength="6" autofocus
+                                   placeholder="000000" autocomplete="off"
+                                   style="font-size:22px;letter-spacing:6px;text-align:center;font-family:monospace">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">Ativar 2FA</button>
+                        <a href="/conta/2fa" style="display:block;text-align:center;margin-top:10px;color:var(--text3);font-size:12px">Cancelar</a>
+                    </form>
+                </div>
+            </div>
+        </div>
+        """
+        return base_html("Configurar 2FA", content, dict(user))
+
+    # Tela principal: status atual + ativar / desativar / regenerar
+    if is_enabled:
+        body = f"""
+        <div class="card" style="padding:24px;margin-bottom:20px">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+                <div style="font-size:32px">🛡️</div>
+                <div>
+                    <h2 style="font-size:18px;margin:0">2FA Ativado</h2>
+                    <p style="color:var(--text2);font-size:13px;margin:4px 0 0">Sua conta está protegida por autenticação em dois fatores.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="card" style="padding:24px;margin-bottom:20px">
+            <h2 style="font-size:16px;margin-bottom:12px">🔄 Regerar backup codes</h2>
+            <p style="color:var(--text2);font-size:13px;margin-bottom:16px">Use se você usou ou perdeu seus códigos antigos. <strong>Os códigos antigos deixam de funcionar.</strong></p>
+            <form method="POST" onsubmit="return confirm('Tem certeza? Os backup codes antigos deixarão de funcionar.');">
+                {csrf_field()}
+                <input type="hidden" name="action" value="regenerate_backup">
+                <div class="form-group">
+                    <label class="form-label">Confirme sua senha</label>
+                    <input type="password" name="confirm_password" class="form-input" required>
+                </div>
+                <button type="submit" class="btn btn-secondary">Gerar novos backup codes</button>
+            </form>
+        </div>
+
+        <div class="card" style="padding:24px;border-left:3px solid var(--red, #dc2626)">
+            <h2 style="font-size:16px;margin-bottom:12px;color:var(--red, #dc2626)">⚠️ Desativar 2FA</h2>
+            <p style="color:var(--text2);font-size:13px;margin-bottom:16px">Sua conta voltará a depender apenas de senha — <strong>não recomendado</strong>.</p>
+            <form method="POST" onsubmit="return confirm('Tem certeza que quer desativar 2FA?');">
+                {csrf_field()}
+                <input type="hidden" name="action" value="disable">
+                <div class="form-group">
+                    <label class="form-label">Confirme sua senha</label>
+                    <input type="password" name="confirm_password" class="form-input" required>
+                </div>
+                <button type="submit" class="btn" style="background:#fef2f2;color:#dc2626;border:1px solid #fecaca">Desativar 2FA</button>
+            </form>
+        </div>
+        """
+    else:
+        body = f"""
+        <div class="card" style="padding:32px;text-align:center">
+            <div style="font-size:42px;margin-bottom:12px">🔓</div>
+            <h2 style="font-size:18px;margin-bottom:8px">2FA não está ativado</h2>
+            <p style="color:var(--text2);font-size:14px;margin-bottom:24px;max-width:520px;margin-left:auto;margin-right:auto">
+                A autenticação em dois fatores adiciona uma camada extra de proteção: além da senha,
+                o login passa a exigir um código de 6 dígitos gerado por um app no seu celular.
+                Recomendado se você processa pagamentos ou guarda dados de clientes.
+            </p>
+            <a href="/conta/2fa?start=1" class="btn btn-primary btn-lg">🔐 Ativar 2FA agora</a>
+        </div>
+        """
+
+    content = f"""
+    <div class="container" style="max-width:720px;padding:24px">
+        <div style="margin-bottom:24px">
+            <a href="/conta/meus-dados" style="color:var(--text2);font-size:13px;text-decoration:none">← Voltar para Meus Dados</a>
+            <h1 style="font-size:26px;font-weight:700;margin:8px 0">🔐 Segurança da Conta</h1>
+            <p style="color:var(--text2);font-size:14px">Gerencie a autenticação em dois fatores (2FA) da sua conta.</p>
+        </div>
+        {msg}
+        {body}
+    </div>
+    """
+    return base_html("Segurança — 2FA", content, dict(user))
+
+
 @app.route("/conta/excluir", methods=["GET","POST"])
 @login_required
 def lgpd_delete_account():
@@ -3293,7 +4176,7 @@ def lgpd_delete_account():
                         else:
                             error = "Não foi possível enviar o email. Tente novamente ou contate o suporte."
                     except Exception as e:
-                        print(f"[DELETE] Erro envio email: {e}")
+                        safe_log(f"[DELETE] Erro envio email: {e}", level="ERROR")
                         error = "Erro ao enviar email de confirmação."
 
         # ── Etapa 2: confirmar com código + senha ──
@@ -3767,40 +4650,42 @@ def register():
         accept_marketing = request.form.get("accept_marketing") == "on"  # opcional
         if not name or not email or not password:
             error = "Preencha todos os campos obrigatórios."
-        elif len(password) < 6:
-            error = "Senha deve ter pelo menos 6 caracteres."
         elif not accept_terms:
             error = "Você precisa aceitar a Política de Privacidade, os Termos de Serviço e o DPA para criar uma conta."
         else:
-            db = get_db()
-            existing = db.execute("SELECT id, email_verified FROM users WHERE email=?", (email,)).fetchone()
-            if existing and existing["email_verified"]:
-                error = "Este email já está cadastrado."
+            pw_ok, pw_msg = validate_password_strength(password)
+            if not pw_ok:
+                error = pw_msg
             else:
-                if existing and not existing["email_verified"]:
-                    db.execute("DELETE FROM users WHERE id=?", (existing["id"],))
-                trial_end = (datetime.now() + timedelta(days=7)).isoformat()
-                msgs_limit = PLANS.get(plan, PLANS["starter"])["msgs"]
-                db.execute("INSERT INTO users (email,password_hash,name,company,plan,plan_status,msgs_limit,trial_ends_at,email_verified) VALUES (?,?,?,?,?,?,?,?,0)",
-                    (email, hash_password(password), name, company, plan, "trial", msgs_limit, trial_end))
-                db.commit()
-                # LGPD: registrar consentimentos formais para comprovação perante ANPD
-                new_user = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
-                new_user_id = new_user["id"] if new_user else None
-                register_consent(new_user_id, email, "privacy_policy", PRIVACY_POLICY_VERSION, accepted=True,
-                                 details=f"Aceite no signup. Plano: {plan}")
-                register_consent(new_user_id, email, "terms_of_service", TERMS_OF_SERVICE_VERSION, accepted=True,
-                                 details=f"Aceite no signup. Plano: {plan}")
-                register_consent(new_user_id, email, "dpa", DPA_VERSION, accepted=True,
-                                 details=f"Aceite no signup. Plano: {plan}")
-                register_consent(new_user_id, email, "data_processing", PRIVACY_POLICY_VERSION, accepted=True,
-                                 details="Base legal: execução de contrato (LGPD Art. 7º, V)")
-                if accept_marketing:
-                    register_consent(new_user_id, email, "marketing_email", PRIVACY_POLICY_VERSION, accepted=True,
-                                     details="Opt-in voluntário no signup")
-                send_verification_code(email)
-                session["pending_email"] = email
-                return redirect("/verify-email")
+                db = get_db()
+                existing = db.execute("SELECT id, email_verified FROM users WHERE email=?", (email,)).fetchone()
+                if existing and existing["email_verified"]:
+                    error = "Este email já está cadastrado."
+                else:
+                    if existing and not existing["email_verified"]:
+                        db.execute("DELETE FROM users WHERE id=?", (existing["id"],))
+                    trial_end = (datetime.now() + timedelta(days=7)).isoformat()
+                    msgs_limit = PLANS.get(plan, PLANS["starter"])["msgs"]
+                    db.execute("INSERT INTO users (email,password_hash,name,company,plan,plan_status,msgs_limit,trial_ends_at,email_verified) VALUES (?,?,?,?,?,?,?,?,0)",
+                        (email, hash_password(password), name, company, plan, "trial", msgs_limit, trial_end))
+                    db.commit()
+                    # LGPD: registrar consentimentos formais para comprovação perante ANPD
+                    new_user = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+                    new_user_id = new_user["id"] if new_user else None
+                    register_consent(new_user_id, email, "privacy_policy", PRIVACY_POLICY_VERSION, accepted=True,
+                                     details=f"Aceite no signup. Plano: {plan}")
+                    register_consent(new_user_id, email, "terms_of_service", TERMS_OF_SERVICE_VERSION, accepted=True,
+                                     details=f"Aceite no signup. Plano: {plan}")
+                    register_consent(new_user_id, email, "dpa", DPA_VERSION, accepted=True,
+                                     details=f"Aceite no signup. Plano: {plan}")
+                    register_consent(new_user_id, email, "data_processing", PRIVACY_POLICY_VERSION, accepted=True,
+                                     details="Base legal: execução de contrato (LGPD Art. 7º, V)")
+                    if accept_marketing:
+                        register_consent(new_user_id, email, "marketing_email", PRIVACY_POLICY_VERSION, accepted=True,
+                                         details="Opt-in voluntário no signup")
+                    send_verification_code(email)
+                    session["pending_email"] = email
+                    return redirect("/verify-email")
     plan = request.args.get("plan","starter")
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
     content = f"""<div class="auth-container"><div class="auth-card">
@@ -3838,7 +4723,7 @@ def verify_email():
     if not email:
         return redirect("/register")
 
-    error = ""
+    error = request.args.get("error", "")
     success = ""
     if request.method == "POST":
         code = request.form.get("code","").strip()
@@ -3875,9 +4760,42 @@ def verify_email():
 
 @app.route("/resend-code")
 def resend_code():
+    """Reenvia código de verificação por email. Cooldown 60s + rate limit por IP."""
     email = session.get("pending_email", "")
-    if email:
-        send_verification_code(email)
+    if not email:
+        return redirect("/register")
+
+    client_ip = request.remote_addr or "unknown"
+    # Rate limit por IP: 5 reenvios em 1h (impede flood mesmo com vários emails)
+    if not check_rate_limit(client_ip, max_attempts=5, window=3600):
+        safe_log(f"[RESEND] Bloqueado por rate limit: {mask_email(email)} de {client_ip}", level="WARN")
+        return redirect("/verify-email?error=Muitas+tentativas.+Aguarde+1+hora.")
+
+    # Cooldown 60s por email: evita flood do mesmo destinatário
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+        recent = db_conn.execute(
+            """SELECT created_at FROM verification_codes
+               WHERE email=? ORDER BY created_at DESC LIMIT 1""", (email,)
+        ).fetchone()
+        db_conn.close()
+        if recent and recent["created_at"]:
+            try:
+                last_time = datetime.fromisoformat(recent["created_at"])
+                elapsed = (datetime.now() - last_time).total_seconds()
+                if elapsed < 60:
+                    wait = int(60 - elapsed)
+                    safe_log(f"[RESEND] Cooldown ativo para {mask_email(email)} (faltam {wait}s)", level="WARN")
+                    return redirect(f"/verify-email?error=Aguarde+{wait}s+antes+de+reenviar.")
+            except Exception:
+                pass
+    except Exception as e:
+        safe_log(f"[RESEND] Erro verificando cooldown: {e}", level="WARN")
+
+    # Conta no rate limiter (mesmo que o envio falhe)
+    record_login_attempt(client_ip, window=3600)
+    send_verification_code(email)
     return redirect("/verify-email")
 
 
@@ -3885,21 +4803,74 @@ def resend_code():
 def login():
     error = request.args.get("error", "")
     client_ip = request.remote_addr or "unknown"
+    # Etapa 2FA pendente?
+    pending_2fa_user_id = session.get("pending_2fa_user_id")
+    step_2fa = bool(pending_2fa_user_id)
+
     if request.method == "POST":
-        if not check_rate_limit(client_ip):
-            error = "Muitas tentativas de login. Aguarde 5 minutos."
+        # LGPD/Segurança: 3 tentativas em 15 min (rigoroso anti brute-force)
+        if not check_rate_limit(client_ip, max_attempts=3, window=900):
+            error = "Muitas tentativas de login. Aguarde 15 minutos antes de tentar novamente."
+        elif step_2fa:
+            # Etapa 2: valida código TOTP ou backup code do usuário
+            db = get_db()
+            user_row = db.execute("SELECT * FROM users WHERE id=?", (pending_2fa_user_id,)).fetchone()
+            if not user_row:
+                session.pop("pending_2fa_user_id", None)
+                error = "Sessão de login expirada. Faça login novamente."
+            else:
+                user_dec = decrypt_user_row(user_row)
+                code = request.form.get("totp_code", "").strip()
+                code_ok = verify_totp_code(user_dec.get("totp_secret", ""), code)
+                # Tenta backup code se TOTP falhar
+                if not code_ok and code:
+                    backup_raw = user_dec.get("totp_backup_codes", "") or ""
+                    if backup_raw:
+                        codes = [c.strip() for c in backup_raw.split(",") if c.strip()]
+                        code_upper = code.upper().replace(" ", "").replace("-", "")
+                        # Aceita com ou sem hífen
+                        normalized_codes = [c.replace("-", "") for c in codes]
+                        if code_upper in normalized_codes:
+                            idx = normalized_codes.index(code_upper)
+                            codes.pop(idx)
+                            new_backup = ",".join(codes)
+                            # Re-criptografa antes de salvar
+                            enc_backup = _encrypt_value(new_backup) if new_backup else ""
+                            db.execute("UPDATE users SET totp_backup_codes=? WHERE id=?", (enc_backup, pending_2fa_user_id))
+                            db.commit()
+                            code_ok = True
+                            safe_log(f"[2FA] Backup code consumido (user_id={pending_2fa_user_id}, restantes={len(codes)})")
+                if code_ok:
+                    reset_login_attempts(client_ip)
+                    session.pop("pending_2fa_user_id", None)
+                    session.clear()
+                    session.permanent = True
+                    session["user_id"] = pending_2fa_user_id
+                    db.execute("UPDATE users SET last_login=datetime('now') WHERE id=?", (pending_2fa_user_id,))
+                    db.commit()
+                    return redirect("/dashboard")
+                else:
+                    record_login_attempt(client_ip, window=900)
+                    error = "Código inválido. Tente novamente ou use um backup code."
         else:
             email = request.form.get("email","").strip().lower()
             password = request.form.get("password","")
             db = get_db()
             user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
             if user and check_password(password, user["password_hash"]):
-                if not dict(user).get("is_active", 1):
+                maybe_upgrade_password_hash(user["id"], password, user["password_hash"])
+                user_dec = decrypt_user_row(user)
+                if not user_dec.get("is_active", 1):
                     error = "Conta desativada. Entre em contato com o suporte."
-                elif not dict(user).get("email_verified", 0):
+                elif not user_dec.get("email_verified", 0):
                     session["pending_email"] = email
                     send_verification_code(email)
                     return redirect("/verify-email")
+                elif user_2fa_enabled(user_dec):
+                    # Senha OK + 2FA ativo → segue para etapa de código
+                    session["pending_2fa_user_id"] = user["id"]
+                    step_2fa = True
+                    safe_log(f"[2FA] Senha OK, aguardando código (user_id={user['id']})")
                 else:
                     reset_login_attempts(client_ip)
                     session.clear()
@@ -3909,9 +4880,35 @@ def login():
                     db.commit()
                     return redirect("/dashboard")
             else:
-                record_login_attempt(client_ip)
+                # Registra com a mesma janela (15 min) usada no check
+                record_login_attempt(client_ip, window=900)
                 error = "Email ou senha incorretos."
+
+    # Cancelar 2FA pendente
+    if request.args.get("cancel_2fa") == "1":
+        session.pop("pending_2fa_user_id", None)
+        return redirect("/login")
+
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
+
+    if step_2fa:
+        info_2fa = '<div class="alert alert-info" style="margin-bottom:16px">🔐 Digite o código de 6 dígitos do seu app autenticador (Google Authenticator, Authy, etc).</div>'
+        content = f"""<div class="auth-container"><div class="auth-card">
+            <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"></a>
+            <h2>Verificação 2FA</h2>{alert}{info_2fa}
+            <form method="POST">{csrf_field()}
+                <div class="form-group">
+                    <label class="form-label">Código (6 dígitos) ou Backup Code</label>
+                    <input type="text" name="totp_code" class="form-input" required maxlength="12" autocomplete="off" autofocus
+                           placeholder="000000" style="font-size:22px;letter-spacing:6px;text-align:center;font-family:monospace">
+                    <small style="color:var(--text3);font-size:12px;margin-top:6px;display:block">Backup codes têm formato XXXX-XXXX (use um se perdeu o celular).</small>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block btn-lg">Verificar</button>
+            </form>
+            <div class="auth-divider"><a href="/login?cancel_2fa=1">Cancelar e voltar</a></div>
+        </div></div>"""
+        return base_html("Verificação 2FA", content)
+
     content = f"""<div class="auth-container"><div class="auth-card">
         <a href="/" style="display:block;text-align:center;margin-bottom:24px"><img src="data:image/png;base64,{LOGO_NAV_B64}" alt="atendente.online" style="height:56px"></a><h2>Entrar</h2>{alert}
         <form method="POST">{csrf_field()}
@@ -4468,7 +5465,7 @@ def upload_whatsapp_profile_photo(phone_id, token, image_bytes, mime_type="image
 
         if session_resp.status_code != 200:
             # Método alternativo: upload direto via /{phone-number-ID}
-            print(f"[PHOTO] Sessão falhou ({session_resp.status_code}), tentando upload direto...")
+            safe_log(f"[PHOTO] Sessão falhou ({session_resp.status_code}), tentando upload direto...", level="ERROR")
             # Upload direto da foto usando profile_photo_handle
             files = {"file": ("photo.jpg", image_bytes, mime_type)}
             data = {
@@ -4480,7 +5477,7 @@ def upload_whatsapp_profile_photo(phone_id, token, image_bytes, mime_type="image
             media_url = f"https://graph.facebook.com/v18.0/{phone_id}/media"
             media_resp = req.post(media_url, headers=headers_direct, files=files, data=data, timeout=30)
             if media_resp.status_code != 200:
-                return False, f"Upload falhou: {media_resp.status_code} {media_resp.text[:200]}"
+                return False, f"Upload falhou: {media_resp.status_code} {_short_resp_text(media_resp)}"
             media_id = media_resp.json().get("id", "")
 
             # Atualiza perfil com media_id
@@ -4493,7 +5490,7 @@ def upload_whatsapp_profile_photo(phone_id, token, image_bytes, mime_type="image
             profile_resp = req.post(profile_url, headers=profile_headers, json=profile_data, timeout=15)
             if profile_resp.status_code == 200:
                 return True, "Foto atualizada com sucesso!"
-            return False, f"Erro ao definir perfil: {profile_resp.status_code} {profile_resp.text[:200]}"
+            return False, f"Erro ao definir perfil: {profile_resp.status_code} {_short_resp_text(profile_resp)}"
 
         # Sessão criada - continua upload
         upload_session_id = session_resp.json().get("id", "")
@@ -4522,7 +5519,7 @@ def upload_whatsapp_profile_photo(phone_id, token, image_bytes, mime_type="image
 
         if profile_resp.status_code == 200:
             return True, "Foto de perfil atualizada com sucesso!"
-        return False, f"Erro ao definir perfil: {profile_resp.text[:200]}"
+        return False, f"Erro ao definir perfil: {_short_resp_text(profile_resp)}"
 
     except Exception as e:
         return False, f"Exceção: {str(e)}"
@@ -4889,8 +5886,9 @@ def mp_create_preference():
         <a href="{base}/api/mercadopago/callback?status=success&plan={plan_key}&simulated=1" class="btn">Simular aprovação ✓</a><br><br>
         <a href="/dashboard/billing" style="color:#94a3b8;font-size:13px">← Voltar</a></div></body></html>"""
     except Exception as e:
-        print(f"[MP] Erro checkout: {e}")
-        return redirect(f"/dashboard/billing?error={str(e)}")
+        err_id = secrets.token_hex(6)
+        safe_log(f"[MP] Erro checkout id={err_id}: {e}", level="ERROR")
+        return redirect(f"/dashboard/billing?error=Não foi possível iniciar o checkout. Tente novamente (cod {err_id}).")
 
 @app.route("/api/mercadopago/callback")
 @login_required
@@ -4910,7 +5908,7 @@ def mp_callback():
                 user_email = user["email"]
             except:
                 user_email = ""
-            print(f"[SECURITY] Tentativa de bypass com simulated=1 por user {user['id']} ({user_email})")
+            safe_log(f"[SECURITY] Tentativa de bypass com simulated=1 por user {user['id']} ({user_email})", level="WARN")
             return redirect("/dashboard/billing?error=Operação não permitida")
         # Em dev, permite simular
         pid = f"sim_{int(time.time())}"
@@ -4975,9 +5973,9 @@ def mp_webhook():
                     db_c.execute("INSERT OR IGNORE INTO payments (user_id,mp_payment_id,amount,status,plan) VALUES (?,?,?,?,?)", (uid, str(pid), amount, payment.get("status", "pending"), pk))
                 db_c.commit()
                 db_c.close()
-                print(f"[MP] Webhook: payment {pid} status={payment.get('status')} user={uid} plan={pk}")
+                safe_log(f"[MP] Webhook: payment {pid} status={payment.get('status')} user={uid} plan={pk}")
             except Exception as e:
-                print(f"[MP] Webhook error: {e}")
+                safe_log(f"[MP] Webhook error: {e}", level="ERROR")
     return jsonify({"status":"ok"}), 200
 
 
@@ -5015,15 +6013,16 @@ def api_conv_toggle_human(conv_id):
         )
         db.commit()
 
-        print(f"[CONV {conv_id}] Takeover alterado: {'humano' if new_status else 'IA'} (user {g.user['id']})")
+        safe_log(f"[CONV {conv_id}] Takeover alterado: {'humano' if new_status else 'IA'} (user {g.user['id']})")
         return jsonify({
             "success": True,
             "is_human_takeover": new_status,
             "message": "Atendimento humano ativo" if new_status else "IA retomada"
         })
     except Exception as e:
-        print(f"[TOGGLE HUMAN] Erro: {e}")
-        return jsonify({"error": str(e)}), 500
+        err_id = secrets.token_hex(6)
+        safe_log(f"[TOGGLE HUMAN] Erro id={err_id}: {e}", level="ERROR")
+        return jsonify({"error": "Erro interno ao alternar atendimento", "err_id": err_id}), 500
 
 
 @app.route("/api/conversations/<int:conv_id>/send", methods=["POST"])
@@ -5090,8 +6089,9 @@ def api_conv_send_message(conv_id):
         })
 
     except Exception as e:
-        print(f"[SEND MANUAL] Erro: {e}")
-        return jsonify({"error": str(e)}), 500
+        err_id = secrets.token_hex(6)
+        safe_log(f"[SEND MANUAL] Erro id={err_id}: {e}", level="ERROR")
+        return jsonify({"error": "Erro interno ao enviar mensagem", "err_id": err_id}), 500
 
 
 @app.route("/api/conversations")
@@ -5245,11 +6245,11 @@ def whatsapp_webhook(user_id=None):
         # APP_SECRET configurado → valida assinatura
         signature = request.headers.get("X-Hub-Signature-256", "")
         if not verify_whatsapp_signature(request.get_data(), signature, app_secret):
-            print(f"[WEBHOOK] Assinatura inválida de {request.remote_addr}")
+            safe_log(f"[WEBHOOK] Assinatura inválida do WhatsApp/Meta", level="WARN")
             return jsonify({"status":"invalid signature"}), 403
     elif not is_dev:
         # Produção sem APP_SECRET → recusa (força configuração)
-        print(f"[WEBHOOK] REJEITADO: WHATSAPP_APP_SECRET não configurado em produção (user_id={user_id}, IP={request.remote_addr})")
+        safe_log(f"[WEBHOOK] REJEITADO: WHATSAPP_APP_SECRET não configurado em produção", level="ERROR")
         return jsonify({"status":"webhook not configured - APP_SECRET required"}), 503
 
     data = request.json or {}
@@ -5372,7 +6372,7 @@ def whatsapp_webhook(user_id=None):
 
                     product = find_matching_product(resolved_user_id, ai_input)
                     if product and os.path.exists(product["file_path"]):
-                        print(f"[GALLERY] Enviando foto: {product['name']}")
+                        safe_log(f"[GALLERY] Enviando foto: {product['name']}")
                         caption = product["description"] or product["name"]
                         send_whatsapp_image(
                             user["whatsapp_phone_id"],
@@ -5389,7 +6389,7 @@ def whatsapp_webhook(user_id=None):
 
                     audio_sent = False
                     if media_result["type"] == "audio":
-                        print(f"[VOICE] Cliente enviou audio, gerando resposta por voz...")
+                        safe_log(f"[VOICE] Cliente enviou audio, gerando resposta por voz...")
                         audio_path = text_to_audio(ai_response)
                         if audio_path:
                             audio_sent = send_whatsapp_audio(user["whatsapp_phone_id"], user["whatsapp_token"], sender_phone, audio_path)
@@ -5403,17 +6403,17 @@ def whatsapp_webhook(user_id=None):
         db_conn.close()
     except sqlite3.OperationalError as e:
         # Erro transitório de DB — Meta deve retentar
-        print(f"[WA WEBHOOK] DB error (retentativa necessária): {e}")
+        safe_log(f"[WA WEBHOOK] DB error (retentativa necessária): {e}", level="ERROR")
         log_webhook_error("whatsapp", user_id, "DBOperationalError", str(e), data)
         return jsonify({"status": "temporary_error"}), 500
     except (ConnectionError, TimeoutError) as e:
         # Erro de conexão com API externa — retentar
-        print(f"[WA WEBHOOK] Erro de conexão: {e}")
+        safe_log(f"[WA WEBHOOK] Erro de conexão: {e}", level="ERROR")
         log_webhook_error("whatsapp", user_id, type(e).__name__, str(e), data)
         return jsonify({"status": "temporary_error"}), 500
     except Exception as e:
         # Erro permanente — logamos mas respondemos 200 para Meta não retentar infinitamente
-        print(f"[WA WEBHOOK] Erro permanente: {e}")
+        safe_log(f"[WA WEBHOOK] Erro permanente: {e}", level="ERROR")
         import traceback
         traceback.print_exc()
         log_webhook_error("whatsapp", user_id, type(e).__name__, str(e), data)
@@ -5440,12 +6440,12 @@ def send_instagram_message(page_id, token, recipient_id, message):
         }
         resp = req.post(url, params=params, json=payload, timeout=15)
         if resp.status_code == 200:
-            print(f"[IG SEND] ✓ Enviado para {recipient_id}")
+            safe_log(f"[IG SEND] ✓ Enviado para {recipient_id}")
             return True
-        print(f"[IG SEND] Erro {resp.status_code}: {resp.text[:200]}")
+        safe_log(f"[IG SEND] Erro {resp.status_code}: {_short_resp_text(resp)}", level="ERROR")
         return False
     except Exception as e:
-        print(f"[IG SEND] Exceção: {e}")
+        safe_log(f"[IG SEND] Exceção: {e}", level="ERROR")
         return False
 
 
@@ -5468,7 +6468,7 @@ def webhook_instagram(user_id):
     if app_secret:
         signature = request.headers.get("X-Hub-Signature-256", "")
         if not verify_whatsapp_signature(request.get_data(), signature, app_secret):
-            print(f"[IG WEBHOOK] Assinatura inválida")
+            safe_log(f"[IG WEBHOOK] Assinatura inválida")
             return jsonify({"status":"invalid signature"}), 403
     elif not is_dev:
         return jsonify({"status":"APP_SECRET required"}), 503
@@ -5565,15 +6565,15 @@ def webhook_instagram(user_id):
                 )
         db_conn.close()
     except sqlite3.OperationalError as e:
-        print(f"[IG WEBHOOK] DB error: {e}")
+        safe_log(f"[IG WEBHOOK] DB error: {e}", level="ERROR")
         log_webhook_error("instagram", user_id, "DBOperationalError", str(e), data)
         return jsonify({"status": "temporary_error"}), 500
     except (ConnectionError, TimeoutError) as e:
-        print(f"[IG WEBHOOK] Erro de conexão: {e}")
+        safe_log(f"[IG WEBHOOK] Erro de conexão: {e}", level="ERROR")
         log_webhook_error("instagram", user_id, type(e).__name__, str(e), data)
         return jsonify({"status": "temporary_error"}), 500
     except Exception as e:
-        print(f"[IG WEBHOOK] Erro permanente: {e}")
+        safe_log(f"[IG WEBHOOK] Erro permanente: {e}", level="ERROR")
         import traceback
         traceback.print_exc()
         log_webhook_error("instagram", user_id, type(e).__name__, str(e), data)
@@ -5599,12 +6599,12 @@ def send_messenger_message(page_id, token, recipient_id, message):
         }
         resp = req.post(url, params=params, json=payload, timeout=15)
         if resp.status_code == 200:
-            print(f"[MSG SEND] ✓ Enviado para {recipient_id}")
+            safe_log(f"[MSG SEND] ✓ Enviado para {recipient_id}")
             return True
-        print(f"[MSG SEND] Erro {resp.status_code}: {resp.text[:200]}")
+        safe_log(f"[MSG SEND] Erro {resp.status_code}: {_short_resp_text(resp)}", level="ERROR")
         return False
     except Exception as e:
-        print(f"[MSG SEND] Exceção: {e}")
+        safe_log(f"[MSG SEND] Exceção: {e}", level="ERROR")
         return False
 
 
@@ -5716,15 +6716,15 @@ def webhook_messenger(user_id):
                 )
         db_conn.close()
     except sqlite3.OperationalError as e:
-        print(f"[MSG WEBHOOK] DB error: {e}")
+        safe_log(f"[MSG WEBHOOK] DB error: {e}", level="ERROR")
         log_webhook_error("messenger", user_id, "DBOperationalError", str(e), data)
         return jsonify({"status": "temporary_error"}), 500
     except (ConnectionError, TimeoutError) as e:
-        print(f"[MSG WEBHOOK] Erro de conexão: {e}")
+        safe_log(f"[MSG WEBHOOK] Erro de conexão: {e}", level="ERROR")
         log_webhook_error("messenger", user_id, type(e).__name__, str(e), data)
         return jsonify({"status": "temporary_error"}), 500
     except Exception as e:
-        print(f"[MSG WEBHOOK] Erro permanente: {e}")
+        safe_log(f"[MSG WEBHOOK] Erro permanente: {e}", level="ERROR")
         import traceback
         traceback.print_exc()
         log_webhook_error("messenger", user_id, type(e).__name__, str(e), data)
@@ -5750,10 +6750,10 @@ def send_telegram_message(bot_token, chat_id, text, parse_mode="HTML"):
         resp = req.post(url, json=payload, timeout=15)
         if resp.status_code == 200:
             return resp.json().get("result", {}).get("message_id")
-        print(f"[TG] Erro {resp.status_code}: {resp.text[:200]}")
+        safe_log(f"[TG] Erro {resp.status_code}: {_short_resp_text(resp)}", level="ERROR")
         return None
     except Exception as e:
-        print(f"[TG] Exceção: {e}")
+        safe_log(f"[TG] Exceção: {e}", level="ERROR")
         return None
 
 
@@ -5776,10 +6776,10 @@ def send_telegram_photo(bot_token, chat_id, photo_path, caption="", reply_markup
             resp = req.post(url, files=files, data=data, timeout=30)
         if resp.status_code == 200:
             return resp.json().get("result", {}).get("message_id")
-        print(f"[TG PHOTO] Erro {resp.status_code}: {resp.text[:200]}")
+        safe_log(f"[TG PHOTO] Erro {resp.status_code}: {_short_resp_text(resp)}", level="ERROR")
         return None
     except Exception as e:
-        print(f"[TG PHOTO] Exceção: {e}")
+        safe_log(f"[TG PHOTO] Exceção: {e}", level="ERROR")
         return None
 
 
@@ -5829,7 +6829,7 @@ Responda apenas com a LEGENDA e HASHTAGS, nada mais."""
             timeout=30
         )
         if resp.status_code != 200:
-            print(f"[SOCIAL AI] Erro: {resp.status_code}")
+            safe_log(f"[SOCIAL AI] Erro: {resp.status_code}", level="ERROR")
             return None
 
         text = resp.json()["content"][0]["text"]
@@ -5851,7 +6851,7 @@ Responda apenas com a LEGENDA e HASHTAGS, nada mais."""
 
         return {"caption": caption.strip(), "hashtags": hashtags.strip()}
     except Exception as e:
-        print(f"[SOCIAL AI] Exceção: {e}")
+        safe_log(f"[SOCIAL AI] Exceção: {e}", level="ERROR")
         return None
 
 
@@ -5886,7 +6886,7 @@ def describe_image_for_caption(image_path):
             return resp.json()["content"][0]["text"]
         return ""
     except Exception as e:
-        print(f"[VISION] Erro: {e}")
+        safe_log(f"[VISION] Erro: {e}", level="ERROR")
         return ""
 
 
@@ -5919,7 +6919,7 @@ def create_social_post(user_id, media_id=None):
 
         if not media:
             db_conn.close()
-            print(f"[SOCIAL] Usuário {user_id} sem mídia na biblioteca")
+            safe_log(f"[SOCIAL] Usuário {user_id} sem mídia na biblioteca")
             return None
 
         # Descreve a imagem com IA
@@ -5976,7 +6976,7 @@ def create_social_post(user_id, media_id=None):
         db_conn.close()
         return post_id
     except Exception as e:
-        print(f"[SOCIAL] Erro create_social_post: {e}")
+        safe_log(f"[SOCIAL] Erro create_social_post: {e}", level="ERROR")
         return None
 
 
@@ -6573,7 +7573,7 @@ def run_social_scheduler():
                 # Outro worker já pegou essa execução
                 continue
 
-            print(f"[SCHEDULER] Gerando post para user {user['id']} ({user['email']}) às {current_time}")
+            safe_log(f"[SCHEDULER] Gerando post para user {user['id']} ({user['email']}) às {current_time}")
 
             # Gera o post (chama em thread separada para não bloquear)
             import threading
@@ -6581,7 +7581,7 @@ def run_social_scheduler():
 
         db_conn.close()
     except Exception as e:
-        print(f"[SCHEDULER] Erro: {e}")
+        safe_log(f"[SCHEDULER] Erro: {e}", level="ERROR")
 
 
 def start_social_scheduler():
@@ -6593,7 +7593,7 @@ def start_social_scheduler():
             try:
                 run_social_scheduler()
             except Exception as e:
-                print(f"[SCHEDULER LOOP] Erro: {e}")
+                safe_log(f"[SCHEDULER LOOP] Erro: {e}", level="ERROR")
             # Espera até o próximo minuto
             now = datetime.now()
             sleep_seconds = 60 - now.second
@@ -6601,7 +7601,7 @@ def start_social_scheduler():
 
     scheduler_thread = threading.Thread(target=loop, daemon=True)
     scheduler_thread.start()
-    print("[SCHEDULER] Scheduler de posts iniciado (roda a cada minuto)")
+    safe_log("[SCHEDULER] Scheduler de posts iniciado (roda a cada minuto)")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -6645,10 +7645,10 @@ def mp_create_pix_payment(access_token, amount, description, payer_phone, extern
                 "copy_paste": poi.get("qr_code", ""),
                 "status": data.get("status", "pending")
             }
-        print(f"[MP PIX] Erro {resp.status_code}: {resp.text[:200]}")
+        safe_log(f"[MP PIX] Erro {resp.status_code}", level="ERROR")
         return None
     except Exception as e:
-        print(f"[MP PIX] Exceção: {e}")
+        safe_log(f"[MP PIX] Exceção: {e}", level="ERROR")
         return None
 
 
@@ -6724,7 +7724,7 @@ def mp_create_checkout_preference(access_token, items, payer_phone, external_ref
 
         # Erro — log detalhado
         error_detail = resp.text[:500]
-        print(f"[MP CHECKOUT] Erro {resp.status_code}: {error_detail}")
+        safe_log(f"[MP CHECKOUT] Erro {resp.status_code}", level="ERROR")
 
         # Retorna informação do erro para o admin poder ver
         return {
@@ -6733,7 +7733,7 @@ def mp_create_checkout_preference(access_token, items, payer_phone, external_ref
             "detail": error_detail
         }
     except Exception as e:
-        print(f"[MP CHECKOUT] Exceção: {e}")
+        safe_log(f"[MP CHECKOUT] Exceção: {e}", level="ERROR")
         return {
             "error": True,
             "detail": str(e)
@@ -6817,7 +7817,7 @@ Responda apenas com o JSON:"""
 
         return result
     except Exception as e:
-        print(f"[PURCHASE AI] Erro: {e}")
+        safe_log(f"[PURCHASE AI] Erro: {e}", level="ERROR")
         return None
 
 
@@ -6851,7 +7851,7 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
             (user["id"], customer_phone)
         ).fetchone()
         if recent_order:
-            print(f"[ORDER] Bloqueado pedido duplicado (order #{recent_order['id']} recente)")
+            safe_log(f"[ORDER] Bloqueado pedido duplicado (order #{recent_order['id']} recente)")
             db_conn.close()
             return None
 
@@ -6863,13 +7863,13 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
         # Valida input
         raw_items = purchase_data.get("items", [])
         if not raw_items or not isinstance(raw_items, list):
-            print("[ORDER] Rejeitado: sem items válidos")
+            safe_log("[ORDER] Rejeitado: sem items válidos", level="ERROR")
             db_conn.close()
             return None
 
         # Limite de itens por pedido
         if len(raw_items) > MAX_ITEMS_PER_ORDER:
-            print(f"[ORDER] Rejeitado: mais de {MAX_ITEMS_PER_ORDER} itens")
+            safe_log(f"[ORDER] Rejeitado: mais de {MAX_ITEMS_PER_ORDER} itens", level="ERROR")
             log_webhook_error("commerce_ai", user["id"], "TooManyItems",
                             f"Tentativa de pedido com {len(raw_items)} itens", purchase_data)
             db_conn.close()
@@ -6941,19 +7941,19 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
 
         # Valida total final
         if total < MIN_ORDER_TOTAL:
-            print(f"[ORDER] Rejeitado: total R$ {total:.2f} abaixo do mínimo R$ {MIN_ORDER_TOTAL:.2f}")
+            safe_log(f"[ORDER] Rejeitado: total R$ {total:.2f} abaixo do mínimo R$ {MIN_ORDER_TOTAL:.2f}", level="ERROR")
             db_conn.close()
             return None
 
         if total > MAX_ORDER_TOTAL:
-            print(f"[ORDER] Rejeitado: total R$ {total:.2f} acima do máximo R$ {MAX_ORDER_TOTAL:.2f}")
+            safe_log(f"[ORDER] Rejeitado: total R$ {total:.2f} acima do máximo R$ {MAX_ORDER_TOTAL:.2f}", level="ERROR")
             log_webhook_error("commerce_ai", user["id"], "TotalExceedsLimit",
                             f"Total R$ {total:.2f} > limite R$ {MAX_ORDER_TOTAL:.2f}", purchase_data)
             db_conn.close()
             return None
 
         if not items_detail:
-            print(f"[ORDER] Rejeitado: sem itens válidos. Rejeitados: {rejected_items}")
+            safe_log(f"[ORDER] Rejeitado: sem itens válidos. Rejeitados: {rejected_items}", level="ERROR")
             db_conn.close()
             return None
 
@@ -7005,7 +8005,7 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
             "checkout_url": checkout["checkout_url"] if is_valid else None
         }
     except Exception as e:
-        print(f"[ORDER] Erro: {e}")
+        safe_log(f"[ORDER] Erro: {e}", level="ERROR")
         return None
 
 
@@ -7051,11 +8051,28 @@ Na página segura do Mercado Pago, você pode escolher:
 @app.route("/webhook/mp-commerce/<int:user_id>", methods=["POST"])
 def mp_commerce_webhook(user_id):
     """Recebe notificação de pagamento do Mercado Pago.
-    Cada cliente pode ter seu próprio MP_WEBHOOK_SECRET (por enquanto usa global).
-    Em v2, adicionar coluna mp_webhook_secret por usuário."""
+
+    Valida assinatura com o webhook secret do tenant (coluna users.mp_webhook_secret).
+    Se o tenant não tiver secret próprio, usa o global (MP_WEBHOOK_SECRET). Isso permite
+    migração gradual: cada cliente pode mover seu webhook para uma URL com secret próprio
+    sem forçar mudança em massa.
+    """
     try:
-        # Valida assinatura MP — impede fraude de pagamento
-        if not validate_mp_signature(request):
+        # Determina qual secret usar — tenant primeiro, global como fallback
+        tenant_secret = ""
+        try:
+            db_lookup = sqlite3.connect(DATABASE)
+            db_lookup.row_factory = sqlite3.Row
+            row = db_lookup.execute("SELECT mp_webhook_secret FROM users WHERE id=?", (user_id,)).fetchone()
+            db_lookup.close()
+            if row and row["mp_webhook_secret"]:
+                tenant_secret = _decrypt_value(row["mp_webhook_secret"]) or ""
+        except Exception as e:
+            safe_log(f"[MP WEBHOOK] Erro buscando secret do tenant {user_id}: {e}", level="ERROR")
+
+        # Valida assinatura MP — impede fraude de pagamento.
+        # Se tenant_secret estiver vazio, validate_mp_signature cai no global automaticamente.
+        if not validate_mp_signature(request, webhook_secret=tenant_secret or None):
             log_webhook_error("mercadopago", user_id, "InvalidSignature", "Assinatura MP inválida", None)
             return jsonify({"status": "invalid_signature"}), 401
 
@@ -7160,7 +8177,7 @@ Em breve entraremos em contato para combinar a entrega/retirada."""
         db_conn.close()
         return jsonify({"status": "ok"}), 200
     except Exception as e:
-        print(f"[MP COMMERCE WEBHOOK] Erro: {e}")
+        safe_log(f"[MP COMMERCE WEBHOOK] Erro: {e}", level="ERROR")
         return jsonify({"status": "error"}), 200
 
 
@@ -7315,6 +8332,7 @@ def commerce_settings():
 
     if request.method == "POST":
         mp_token_input = request.form.get("mp_access_token", "").strip()
+        mp_webhook_secret_input = request.form.get("mp_webhook_secret", "").strip()
 
         # Se veio vazio, mantém o atual
         if mp_token_input:
@@ -7323,16 +8341,24 @@ def commerce_settings():
             raw = db.execute("SELECT mp_access_token FROM users WHERE id=?", (user["id"],)).fetchone()
             mp_token_final = raw["mp_access_token"] or ""
 
+        if mp_webhook_secret_input:
+            mp_webhook_secret_final = _encrypt_value(mp_webhook_secret_input)
+        else:
+            raw = db.execute("SELECT mp_webhook_secret FROM users WHERE id=?", (user["id"],)).fetchone()
+            mp_webhook_secret_final = (raw["mp_webhook_secret"] if raw else "") or ""
+
         db.execute(
             """UPDATE users SET
                 mp_access_token=?,
                 mp_public_key=?,
+                mp_webhook_secret=?,
                 commerce_enabled=?,
                 auto_payment_enabled=?
                WHERE id=?""",
             (
                 mp_token_final,
                 request.form.get("mp_public_key", "").strip(),
+                mp_webhook_secret_final,
                 1 if request.form.get("commerce_enabled") else 0,
                 1 if request.form.get("auto_payment_enabled") else 0,
                 user["id"]
@@ -7371,6 +8397,20 @@ def commerce_settings():
                     <input type="text" name="mp_public_key" class="form-input"
                            value="{esc(user['mp_public_key'] or '')}"
                            placeholder="APP_USR-...">
+                </div>
+
+                <div class="form-group" style="background:rgba(99,102,241,0.04);border:1px solid rgba(99,102,241,0.18);border-radius:8px;padding:14px">
+                    <label class="form-label">🔐 Webhook Secret (seu, por conta) <span style="font-size:11px;color:var(--text3);font-weight:400">— recomendado</span></label>
+                    <input type="password" name="mp_webhook_secret" class="form-input"
+                           value=""
+                           placeholder="{'••••••••' if user.get('mp_webhook_secret') else 'Cole a chave secreta de assinatura do seu webhook MP'}"
+                           autocomplete="off">
+                    <small style="color:var(--text3);display:block;margin-top:6px;line-height:1.5">
+                        {'✓ Secret configurado para sua conta. Deixe em branco para manter.' if user.get('mp_webhook_secret') else 'Se não configurar, é usado o secret global do sistema (menos seguro em ambiente multi-cliente).'}
+                        <br>📍 <strong>URL do seu webhook:</strong>
+                        <code style="display:inline-block;padding:2px 6px;background:var(--bg2);border-radius:4px;font-size:11px">{request.host_url.rstrip('/')}/webhook/mp-commerce/{user['id']}</code>
+                        <br>Configure essa URL e a chave secreta em <a href="https://www.mercadopago.com.br/developers/panel/app" target="_blank" style="color:var(--accent2)">Mercado Pago Developers → Webhooks</a>.
+                    </small>
                 </div>
 
                 <div class="form-group">
@@ -7556,9 +8596,9 @@ def run_campaign(campaign_id):
         )
         db_conn.commit()
         db_conn.close()
-        print(f"[CAMPAIGN] #{campaign_id} completa: {sent} enviadas, {failed} falhas")
+        safe_log(f"[CAMPAIGN] #{campaign_id} completa: {sent} enviadas, {failed} falhas", level="ERROR")
     except Exception as e:
-        print(f"[CAMPAIGN] Erro: {e}")
+        safe_log(f"[CAMPAIGN] Erro: {e}", level="ERROR")
 
 
 @app.route("/dashboard/campaigns")
@@ -7937,19 +8977,19 @@ def fetch_weather(message):
         if not city:
             city = "Fortaleza"
 
-        print(f"[WEATHER] Cidade extraída: '{city}'")
+        safe_log(f"[WEATHER] Cidade extraída: '{city}'")
 
         # 1. Geocodificação: converte nome → coordenadas
         geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=pt&format=json"
         geo_resp = req.get(geo_url, timeout=10)
         if geo_resp.status_code != 200:
-            print(f"[WEATHER] Erro geocoding: {geo_resp.status_code}")
+            safe_log(f"[WEATHER] Erro geocoding: {geo_resp.status_code}", level="ERROR")
             return ""
 
         geo_data = geo_resp.json()
         results = geo_data.get("results", [])
         if not results:
-            print(f"[WEATHER] Cidade não encontrada: {city}")
+            safe_log(f"[WEATHER] Cidade não encontrada: {city}")
             return ""
 
         loc = results[0]
@@ -7968,7 +9008,7 @@ def fetch_weather(message):
         )
         weather_resp = req.get(weather_url, timeout=10)
         if weather_resp.status_code != 200:
-            print(f"[WEATHER] Erro clima: {weather_resp.status_code}")
+            safe_log(f"[WEATHER] Erro clima: {weather_resp.status_code}", level="ERROR")
             return ""
 
         data = weather_resp.json()
@@ -8007,11 +9047,11 @@ def fetch_weather(message):
         parts.append(f"Vento: {wind} km/h")
 
         weather_text = ". ".join(parts) + "."
-        print(f"[WEATHER] ✅ {weather_text}")
+        safe_log(f"[WEATHER] ✅ {weather_text}")
         return weather_text
 
     except Exception as e:
-        print(f"[WEATHER] Exceção: {e}")
+        safe_log(f"[WEATHER] Exceção: {e}", level="ERROR")
         return ""
 
 
@@ -8146,8 +9186,8 @@ REGRAS:
                     (user["id"],"anthropic",tokens_in,tokens_out,cost))
                 return result["content"][0]["text"]
             else:
-                print(f"Claude error: {resp.status_code} {resp.text[:200]}")
-        except Exception as e: print(f"Claude error: {e}")
+                safe_log(f"Claude error: {resp.status_code} {_short_resp_text(resp)}", level="ERROR")
+        except Exception as e: safe_log(f"Claude error: {e}", level="ERROR")
 
     # Tenta OpenAI/ChatGPT (se configurado)
     openai_key = get_setting("OPENAI_API_KEY")
@@ -8168,16 +9208,17 @@ REGRAS:
                     (user["id"],"openai",tokens_in,tokens_out,cost))
                 return result["choices"][0]["message"]["content"]
             else:
-                print(f"OpenAI error: {resp.status_code} {resp.text[:200]}")
-        except Exception as e: print(f"OpenAI error: {e}")
+                safe_log(f"OpenAI error: {resp.status_code} {_short_resp_text(resp)}", level="ERROR")
+        except Exception as e: safe_log(f"OpenAI error: {e}", level="ERROR")
 
     return user["ai_greeting"] or "Olá! Obrigado por entrar em contato. Como posso ajudar?"
 
 
 def send_whatsapp_message(phone_id, token, to, message):
-    print(f"[WA SEND] Tentando enviar para {to}...")
+    masked_to = mask_phone(to)
+    safe_log(f"[WA SEND] Tentando enviar para {masked_to}...")
     if not phone_id or not token:
-        print(f"[WA SEND] ERRO: Phone ID ou Token vazio!")
+        safe_log("[WA SEND] ERRO: Phone ID ou Token vazio!", level="ERROR")
         return {"success": False, "error": "Phone ID ou Token não configurado"}
     try:
         import requests as req
@@ -8186,20 +9227,23 @@ def send_whatsapp_message(phone_id, token, to, message):
         payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": message}}
         resp = req.post(url, headers=headers, json=payload, timeout=15)
         if resp.status_code != 200:
-            print(f"[WA SEND] ERRO! Status {resp.status_code}")
-            print(f"[WA SEND] Resposta: {resp.text[:300]}")
-            # Tenta extrair erro humanizado da resposta
+            safe_log(f"[WA SEND] ERRO! Status {resp.status_code}", level="ERROR")
+            # Tenta extrair erro humanizado da resposta — sem logar o body inteiro (que pode ter PII)
             try:
                 err_data = resp.json()
-                err_msg = err_data.get("error", {}).get("message", resp.text[:200])
-            except:
-                err_msg = resp.text[:200]
+                err_msg = err_data.get("error", {}).get("message", "")
+                err_code = err_data.get("error", {}).get("code", "")
+                safe_log(f"[WA SEND] Meta error code={err_code} msg={err_msg[:200]}", level="ERROR")
+                if not err_msg:
+                    err_msg = "Erro desconhecido da API Meta"
+            except Exception:
+                err_msg = f"HTTP {resp.status_code}"
             return {"success": False, "error": err_msg, "status_code": resp.status_code}
         else:
-            print(f"[WA SEND] ✓ Mensagem enviada para {to}")
+            safe_log(f"[WA SEND] ✓ Mensagem enviada para {masked_to}")
             return {"success": True}
     except Exception as e:
-        print(f"[WA SEND] EXCEÇÃO: {e}")
+        safe_log(f"[WA SEND] EXCEÇÃO: {e}", level="ERROR")
         return {"success": False, "error": str(e)}
 
 
@@ -8269,7 +9313,7 @@ def text_to_audio(text, output_path=None):
 
         # Prepara texto para melhor pronúncia
         clean_text = prepare_tts_text(text)
-        print(f"[TTS] Texto preparado: {clean_text[:80]}...")
+        safe_log(f"[TTS] Texto preparado: {clean_text[:80]}...")
 
         async def _generate():
             voice = "pt-BR-AntonioNeural"
@@ -8289,12 +9333,12 @@ def text_to_audio(text, output_path=None):
             asyncio.run(_generate())
 
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            print(f"[TTS] Áudio gerado: {output_path} ({os.path.getsize(output_path)} bytes)")
+            safe_log(f"[TTS] Áudio gerado: {output_path} ({os.path.getsize(output_path)} bytes)")
             return output_path
-        print("[TTS] Arquivo gerado vazio")
+        safe_log("[TTS] Arquivo gerado vazio")
         return None
     except Exception as e:
-        print(f"[TTS] Erro: {e}")
+        safe_log(f"[TTS] Erro: {e}", level="ERROR")
         return None
 
 
@@ -8310,21 +9354,22 @@ def upload_whatsapp_media(phone_id, token, filepath, mime_type="audio/mpeg"):
             resp = req.post(url, headers=headers, files=files, data=data, timeout=30)
         if resp.status_code == 200:
             media_id = resp.json().get("id", "")
-            print(f"[WA UPLOAD] Mídia enviada: {media_id}")
+            safe_log(f"[WA UPLOAD] Mídia enviada: {media_id}")
             return media_id
         else:
-            print(f"[WA UPLOAD] Erro: {resp.status_code} {resp.text[:200]}")
+            safe_log(f"[WA UPLOAD] Erro: {resp.status_code}", level="ERROR")
             return None
     except Exception as e:
-        print(f"[WA UPLOAD] Exceção: {e}")
+        safe_log(f"[WA UPLOAD] Exceção: {e}", level="ERROR")
         return None
 
 
 def send_whatsapp_image(phone_id, token, to, image_path, caption=""):
     """Envia imagem pelo WhatsApp"""
+    masked_to = mask_phone(to)
     media_id = upload_whatsapp_media(phone_id, token, image_path, "image/jpeg")
     if not media_id:
-        print("[WA IMAGE] Falha no upload")
+        safe_log("[WA IMAGE] Falha no upload", level="ERROR")
         return False
     try:
         import requests as req
@@ -8336,12 +9381,17 @@ def send_whatsapp_image(phone_id, token, to, image_path, caption=""):
             payload["image"]["caption"] = caption[:1024]
         resp = req.post(url, headers=headers, json=payload, timeout=15)
         if resp.status_code == 200:
-            print(f"[WA IMAGE] ✓ Imagem enviada para {to}")
+            safe_log(f"[WA IMAGE] ✓ Imagem enviada para {masked_to}")
             return True
-        print(f"[WA IMAGE] Erro: {resp.text[:200]}")
+        # Extrai code/message do erro sem logar body inteiro
+        try:
+            err = resp.json().get("error", {})
+            safe_log(f"[WA IMAGE] Erro code={err.get('code','')} msg={err.get('message','')[:200]}", level="ERROR")
+        except Exception:
+            safe_log(f"[WA IMAGE] Erro HTTP {resp.status_code}", level="ERROR")
         return False
     except Exception as e:
-        print(f"[WA IMAGE] Exceção: {e}")
+        safe_log(f"[WA IMAGE] Exceção: {e}", level="ERROR")
         return False
 
 
@@ -8399,7 +9449,7 @@ def find_matching_product(user_id, message):
             return best_match
         return None
     except Exception as e:
-        print(f"[GALLERY] Erro busca: {e}")
+        safe_log(f"[GALLERY] Erro busca: {e}", level="ERROR")
         return None
 
 
@@ -8638,7 +9688,7 @@ def gallery_delete():
         if os.path.exists(product["file_path"]):
             os.remove(product["file_path"])
     except Exception as e:
-        print(f"[GALLERY] Erro ao remover arquivo: {e}")
+        safe_log(f"[GALLERY] Erro ao remover arquivo: {e}", level="ERROR")
 
     # Remove do banco
     db.execute("DELETE FROM product_gallery WHERE id=?", (product_id,))
@@ -8666,9 +9716,10 @@ def serve_gallery_image(product_id):
 
 def send_whatsapp_audio(phone_id, token, to, audio_path):
     """Envia áudio pelo WhatsApp"""
+    masked_to = mask_phone(to)
     media_id = upload_whatsapp_media(phone_id, token, audio_path, "audio/mpeg")
     if not media_id:
-        print("[WA AUDIO] Falha no upload, enviando como texto")
+        safe_log("[WA AUDIO] Falha no upload, enviando como texto", level="WARN")
         return False
     try:
         import requests as req
@@ -8676,15 +9727,19 @@ def send_whatsapp_audio(phone_id, token, to, audio_path):
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         payload = {"messaging_product": "whatsapp", "to": to, "type": "audio", "audio": {"id": media_id}}
         resp = req.post(url, headers=headers, json=payload, timeout=15)
-        print(f"[WA AUDIO] Status: {resp.status_code}")
+        safe_log(f"[WA AUDIO] Status: {resp.status_code}")
         if resp.status_code == 200:
-            print(f"[WA AUDIO] Áudio enviado para {to}!")
+            safe_log(f"[WA AUDIO] Áudio enviado para {masked_to}")
             return True
         else:
-            print(f"[WA AUDIO] Erro: {resp.text[:200]}")
+            try:
+                err = resp.json().get("error", {})
+                safe_log(f"[WA AUDIO] Erro code={err.get('code','')} msg={err.get('message','')[:200]}", level="ERROR")
+            except Exception:
+                safe_log(f"[WA AUDIO] Erro HTTP {resp.status_code}", level="ERROR")
             return False
     except Exception as e:
-        print(f"[WA AUDIO] Exceção: {e}")
+        safe_log(f"[WA AUDIO] Exceção: {e}", level="ERROR")
         return False
 
 
@@ -8753,17 +9808,33 @@ def admin_login():
                     step_2fa = True
                     log_admin_action("password_ok_awaiting_2fa")
                 else:
-                    # 2FA não configurado — entra direto (compatibilidade inicial)
-                    reset_login_attempts(client_ip)
-                    # Preserva CSRF token ao limpar sessao para evitar 403 na primeira acao admin
-                    _preserved_csrf = session.get("_csrf_token")
-                    session.clear()
-                    if _preserved_csrf:
-                        session["_csrf_token"] = _preserved_csrf
-                    session.permanent = True
-                    session["is_admin"] = True
-                    log_admin_action("login_success", details="sem 2FA")
-                    return redirect("/admin")
+                    # LGPD/Segurança: em produção, 2FA é OBRIGATÓRIO.
+                    # Só permite login direto em dev local ou se ADMIN_ALLOW_NO_2FA=1 estiver setada
+                    # (apenas para o bootstrap inicial, quando 2FA ainda não foi configurado).
+                    is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
+                    allow_no_2fa = os.getenv("ADMIN_ALLOW_NO_2FA", "").lower() in ("1", "true", "yes")
+                    if not (is_dev or allow_no_2fa):
+                        record_login_attempt(client_ip)
+                        log_admin_action("login_blocked_no_2fa")
+                        error = ("⚠️ Acesso bloqueado: 2FA não está configurado. "
+                                 "Por segurança LGPD, o painel admin exige 2FA em produção. "
+                                 "Defina temporariamente a variável de ambiente ADMIN_ALLOW_NO_2FA=1 "
+                                 "no Railway, faça login uma vez, configure 2FA em /admin/2fa, "
+                                 "remova a variável e refaça login.")
+                    else:
+                        reset_login_attempts(client_ip)
+                        # Preserva CSRF token ao limpar sessao para evitar 403 na primeira acao admin
+                        _preserved_csrf = session.get("_csrf_token")
+                        session.clear()
+                        if _preserved_csrf:
+                            session["_csrf_token"] = _preserved_csrf
+                        session.permanent = True
+                        session["is_admin"] = True
+                        # Marca origem do bypass para auditar
+                        session["bypassed_2fa"] = True
+                        log_admin_action("login_success_bypass_2fa",
+                                         details=f"FLASK_ENV={os.getenv('FLASK_ENV','')} ADMIN_ALLOW_NO_2FA={os.getenv('ADMIN_ALLOW_NO_2FA','')}")
+                        return redirect("/admin/2fa?bootstrap=1")
             else:
                 record_login_attempt(client_ip)
                 error = "Credenciais inválidas."
@@ -8835,6 +9906,11 @@ def admin_dashboard():
         security_alerts.append("⚠️ <strong>SECRET_KEY usando valor aleatório</strong> — sessions serão invalidadas a cada restart. Defina SECRET_KEY no Railway → Variables.")
     if not os.getenv("ADMIN_PASSWORD"):
         security_alerts.append("⚠️ <strong>ADMIN_PASSWORD não configurada</strong> — defina no Railway → Variables para uma senha forte.")
+    # 2FA admin
+    if not is_admin_2fa_enabled():
+        security_alerts.append("🚨 <strong>2FA admin não configurado</strong> — configure imediatamente em <a href='/admin/2fa' style='color:var(--red);text-decoration:underline'>/admin/2fa</a>. Após configurar, remova ADMIN_ALLOW_NO_2FA das env vars do Railway.")
+    if os.getenv("ADMIN_ALLOW_NO_2FA", "").lower() in ("1", "true", "yes"):
+        security_alerts.append("🚨 <strong>ADMIN_ALLOW_NO_2FA ativa!</strong> Esta variável permite login admin sem 2FA — é apenas para bootstrap. <strong>REMOVA AGORA do Railway → Variables</strong> se o 2FA já estiver configurado.")
 
     alerts_html = ""
     if security_alerts:
@@ -9652,6 +10728,447 @@ def admin_logs():
     return admin_html("Logs", content)
 
 
+# ─── ADMIN: BACKUPS E MANUTENÇÃO (LGPD) ─────────────────────────
+@app.route("/admin/emergency-backup-download", methods=["GET", "POST"])
+@admin_required
+def admin_emergency_backup_download():
+    """Baixa cópia consistente do atendeia.db pelo navegador, CRIPTOGRAFADA com passphrase.
+
+    Fluxo:
+    1. GET → mostra formulário pedindo passphrase (mínimo 12 caracteres).
+    2. POST → gera backup com sqlite3.backup() (consistente mesmo com writers ativos),
+       criptografa com Fernet usando chave derivada da passphrase via PBKDF2-SHA256 (600k iters),
+       prefixa 16 bytes de salt no arquivo final, envia como download e LIMPA o tempfile
+       depois que a resposta foi entregue.
+
+    Formato do .enc:
+        [16 bytes de salt][token Fernet (base64 ASCII)]
+
+    Para decriptar offline (Python ≥3.8 com `cryptography`):
+        from cryptography.fernet import Fernet
+        import hashlib, base64
+        blob = open("atendeia-backup.db.enc", "rb").read()
+        salt, ct = blob[:16], blob[16:]
+        key = base64.urlsafe_b64encode(
+            hashlib.pbkdf2_hmac("sha256", PASSPHRASE.encode(), salt, 600000)[:32]
+        )
+        open("atendeia-backup.db", "wb").write(Fernet(key).decrypt(ct))
+    """
+    import tempfile
+    from flask import send_file, after_this_request
+
+    if request.method == "GET":
+        content = f"""
+        <div class="container" style="max-width:680px;padding:32px">
+            <h1 style="font-size:22px;margin-bottom:8px">🔒 Backup de Emergência (criptografado)</h1>
+            <p style="color:var(--text2);font-size:14px;margin-bottom:20px">
+                Gera uma cópia consistente do banco e <strong>criptografa antes do download</strong>.
+                A passphrase NÃO é armazenada — guarde-a em local seguro, pois sem ela o backup é inútil.
+            </p>
+            <div class="alert alert-warning" style="margin-bottom:20px">
+                ⚠️ <strong>Importante:</strong> use uma passphrase forte —
+                <strong>16+ caracteres</strong> OU <strong>12+ caracteres com pelo menos 3 classes</strong>
+                (minúscula, MAIÚSCULA, dígito, símbolo). Se perder a passphrase,
+                <strong>o backup não pode ser restaurado</strong>.
+            </div>
+            <div class="card" style="padding:24px">
+                <form method="POST">{csrf_field()}
+                    <div class="form-group">
+                        <label class="form-label">Passphrase de criptografia (mín. 12 caracteres)</label>
+                        <input type="password" name="passphrase" class="form-input" required minlength="12" autofocus
+                               autocomplete="new-password" placeholder="••••••••••••">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Confirme a passphrase</label>
+                        <input type="password" name="passphrase_confirm" class="form-input" required minlength="12"
+                               autocomplete="new-password" placeholder="••••••••••••">
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block">🔐 Gerar e baixar backup criptografado</button>
+                </form>
+            </div>
+            <div class="card" style="padding:20px;margin-top:16px;background:var(--bg2)">
+                <h3 style="font-size:14px;margin-bottom:8px">Como restaurar</h3>
+                <pre style="font-size:11px;background:rgba(0,0,0,0.3);padding:12px;border-radius:6px;overflow-x:auto;color:#9ca3af">from cryptography.fernet import Fernet
+import hashlib, base64
+blob = open("atendeia-backup.db.enc", "rb").read()
+salt, ct = blob[:16], blob[16:]
+key = base64.urlsafe_b64encode(
+    hashlib.pbkdf2_hmac("sha256", PASSPHRASE.encode(), salt, 600000)[:32]
+)
+open("atendeia-backup.db", "wb").write(Fernet(key).decrypt(ct))</pre>
+            </div>
+        </div>
+        """
+        return admin_html("Backup de Emergência", content)
+
+    # POST: gera e criptografa
+    passphrase = request.form.get("passphrase", "")
+    passphrase_confirm = request.form.get("passphrase_confirm", "")
+
+    # Validação de força: 16+ chars OU 12+ chars com mistura de classes
+    # (minúscula, MAIÚSCULA, dígito, símbolo — exige pelo menos 3 das 4 classes).
+    def _passphrase_strong(p):
+        if not p:
+            return False, "Passphrase obrigatória."
+        if len(p) >= 16:
+            return True, ""
+        if len(p) < 12:
+            return False, "Passphrase muito curta — mínimo 12 caracteres (ou 16 sem mistura de classes)."
+        classes = 0
+        if any(c.islower() for c in p): classes += 1
+        if any(c.isupper() for c in p): classes += 1
+        if any(c.isdigit() for c in p): classes += 1
+        if any(not c.isalnum() for c in p): classes += 1
+        if classes < 3:
+            return False, "Passphrase fraca — use 16+ caracteres OU 12+ com pelo menos 3 destas classes: minúscula, MAIÚSCULA, dígito, símbolo."
+        return True, ""
+
+    ok, err = _passphrase_strong(passphrase)
+    if not ok:
+        return err, 400
+    if passphrase != passphrase_confirm:
+        return "Passphrases não conferem.", 400
+
+    tmp_path = None
+    try:
+        from cryptography.fernet import Fernet
+        import base64 as b64_mod, hashlib as hashlib_mod
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        src = sqlite3.connect(DATABASE)
+        dst = sqlite3.connect(tmp_path)
+        with dst:
+            src.backup(dst)
+        src.close()
+        dst.close()
+
+        with open(tmp_path, "rb") as f:
+            db_bytes = f.read()
+
+        # Apaga o .db em claro o quanto antes
+        try:
+            os.remove(tmp_path)
+            tmp_path = None
+        except OSError:
+            pass
+
+        salt = secrets.token_bytes(16)
+        derived = hashlib_mod.pbkdf2_hmac("sha256", passphrase.encode(), salt, 600000)[:32]
+        fernet_key = b64_mod.urlsafe_b64encode(derived)
+        ct = Fernet(fernet_key).encrypt(db_bytes)
+        encrypted_blob = salt + ct
+
+        # Escreve o blob criptografado em outro tempfile só para servir
+        enc_tmp = tempfile.NamedTemporaryFile(suffix=".db.enc", delete=False)
+        enc_tmp.write(encrypted_blob)
+        enc_tmp.close()
+        enc_path = enc_tmp.name
+
+        @after_this_request
+        def _cleanup_encrypted(response):
+            try:
+                os.remove(enc_path)
+            except OSError:
+                pass
+            return response
+
+        try:
+            log_admin_action("emergency_backup_download", details=f"size_plain={len(db_bytes)}B size_enc={len(encrypted_blob)}B encrypted=1")
+        except Exception:
+            pass
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return send_file(
+            enc_path,
+            as_attachment=True,
+            download_name=f"atendeia-backup-{timestamp}.db.enc",
+            mimetype="application/octet-stream",
+        )
+    except Exception as e:
+        err_id = secrets.token_hex(6)
+        safe_log(f"[EMERGENCY_BACKUP] Erro id={err_id}: {e}", level="ERROR")
+        try:
+            log_admin_action("emergency_backup_error", details=f"err_id={err_id}")
+        except Exception:
+            pass
+        return f"Falha ao gerar backup. Consulte os logs (id={err_id}).", 500
+    finally:
+        # Garante remoção do .db em claro mesmo em erro
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+@app.route("/admin/recrypt-status", methods=["GET","POST"])
+@admin_required
+def admin_recrypt_status():
+    """Inspecionar estado da migração SECRET_KEY → DATA_ENCRYPTION_KEY e rodar manualmente."""
+    msg = ""
+    msg_class = "alert-success"
+    result = None
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        if action == "run_recrypt":
+            result = migrate_recrypt_to_new_data_key()
+            if result and result.get("skipped"):
+                msg = f"⏭️ Migração pulada: {result.get('reason', '')}"
+                msg_class = "alert-info"
+            elif result and "error" in result:
+                msg = f"❌ Erro: {result.get('error')}"
+                msg_class = "alert-error"
+            elif result:
+                tot_migrated = result.get("users_migrated", 0) + result.get("settings_migrated", 0)
+                tot_failed = result.get("users_failed", 0) + result.get("settings_failed", 0)
+                if tot_migrated:
+                    msg = f"✅ Migrados: {result.get('users_migrated',0)} campos users + {result.get('settings_migrated',0)} settings"
+                elif tot_failed:
+                    msg = f"⚠️ {tot_failed} valor(es) falharam na migração — verifique logs"
+                    msg_class = "alert-error"
+                else:
+                    msg = "✅ Tudo já está na chave nova, nada a migrar"
+                    msg_class = "alert-info"
+
+    data_key_set = bool(os.getenv("DATA_ENCRYPTION_KEY", "").strip())
+    secret_key_set = bool(os.getenv("SECRET_KEY", "").strip())
+    keys_equal = (os.getenv("DATA_ENCRYPTION_KEY", "").strip() ==
+                  os.getenv("SECRET_KEY", "").strip()) if data_key_set and secret_key_set else False
+    current_source = getattr(_get_fernet, "_source", "?")
+    _get_fernet()  # garante populado
+    current_source = getattr(_get_fernet, "_source", "?")
+
+    alert = f'<div class="alert {msg_class}">{msg}</div>' if msg else ""
+
+    # Detalhes do resultado
+    result_html = ""
+    if result and not result.get("skipped"):
+        result_html = f"""
+        <div class="card" style="margin-top:20px;padding:20px">
+            <h3 style="font-size:16px;margin-bottom:12px">Resultado da última execução</h3>
+            <table style="width:100%;font-size:14px;line-height:1.8">
+                <tr><td>Campos users migrados</td><td style="text-align:right">{result.get('users_migrated', 0)}</td></tr>
+                <tr><td>Campos users já na chave nova</td><td style="text-align:right">{result.get('users_already_new', 0)}</td></tr>
+                <tr><td>Campos users com falha</td><td style="text-align:right;color:var(--red)">{result.get('users_failed', 0)}</td></tr>
+                <tr><td>Settings migrados</td><td style="text-align:right">{result.get('settings_migrated', 0)}</td></tr>
+                <tr><td>Settings já na chave nova</td><td style="text-align:right">{result.get('settings_already_new', 0)}</td></tr>
+                <tr><td>Settings com falha</td><td style="text-align:right;color:var(--red)">{result.get('settings_failed', 0)}</td></tr>
+            </table>
+            {f'<p style="margin-top:14px;color:var(--red);font-size:13px">Falhas: {esc(", ".join(result.get("failures", [])[:10]))}</p>' if result.get("failures") else ""}
+        </div>
+        """
+
+    explain = """
+    <div class="card" style="padding:20px;margin-bottom:20px;background:rgba(99,102,241,0.05)">
+        <h3 style="font-size:16px;margin-bottom:10px">💡 Como funciona</h3>
+        <p style="font-size:13px;line-height:1.7;color:var(--text2)">
+            A migração só faz alguma coisa se você tiver setado <code>DATA_ENCRYPTION_KEY</code>
+            no Railway com valor diferente da <code>SECRET_KEY</code>. Ela passa em todos os
+            tokens criptografados (em <code>users</code> e <code>system_settings</code>) e:
+        </p>
+        <ol style="margin-top:8px;color:var(--text2);font-size:13px;line-height:1.7">
+            <li>Tenta decifrar com a chave nova — se já funciona, pula.</li>
+            <li>Senão, tenta decifrar com a chave antiga (SECRET_KEY) — se funciona, recriptografa com a nova e salva.</li>
+            <li>Se falhar com as duas, NÃO sobrescreve (dado pode estar corrompido) — só conta como falha e loga.</li>
+        </ol>
+        <p style="font-size:13px;line-height:1.7;color:var(--text2);margin-top:8px">
+            🛡️ <strong>Idempotente:</strong> pode rodar várias vezes sem causar dano. Rodada automaticamente no startup.
+        </p>
+    </div>
+    """
+
+    content = f"""<div class="container">
+        <div class="page-header"><h1>Recriptografia 🔐</h1><p>Migração SECRET_KEY → DATA_ENCRYPTION_KEY</p></div>
+        {alert}
+        {explain}
+
+        <div class="card" style="padding:20px;margin-bottom:20px">
+            <h3 style="font-size:16px;margin-bottom:12px">Estado atual das chaves</h3>
+            <table style="width:100%;font-size:14px;line-height:1.9">
+                <tr><td>SECRET_KEY definida no Railway</td><td style="text-align:right">{"✅ Sim" if secret_key_set else "❌ Não"}</td></tr>
+                <tr><td>DATA_ENCRYPTION_KEY definida</td><td style="text-align:right">{"✅ Sim" if data_key_set else "❌ Não (usando SECRET_KEY)"}</td></tr>
+                <tr><td>Chaves idênticas</td><td style="text-align:right">{"⚠️ Sim — sem benefício de separar" if keys_equal else "✅ Não (corretamente separadas)" if data_key_set else "N/A"}</td></tr>
+                <tr><td>Chave em uso agora</td><td style="text-align:right"><strong>{esc(current_source)}</strong></td></tr>
+            </table>
+        </div>
+
+        <div class="card" style="padding:20px">
+            <h3 style="font-size:16px;margin-bottom:12px">Executar migração manualmente</h3>
+            <p style="font-size:13px;color:var(--text2);margin-bottom:14px">
+                A migração também roda automaticamente no startup. Use isto para verificar
+                ou para forçar uma nova varredura.
+            </p>
+            <form method="POST">{csrf_field()}
+                <input type="hidden" name="action" value="run_recrypt">
+                <button type="submit" class="btn btn-primary">🔐 Rodar migração agora</button>
+            </form>
+        </div>
+
+        {result_html}
+    </div>"""
+    return admin_html("Recriptografia", content)
+
+
+@app.route("/admin/backups", methods=["GET","POST"])
+@admin_required
+def admin_backups():
+    """Painel de backups: listar, executar agora, ver detalhes de integridade."""
+    msg = ""
+    msg_class = "alert-success"
+
+    # Ações
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        if action == "run_backup":
+            result = perform_database_backup()
+            if result and result.get("ok"):
+                msg = f"✅ Backup criado: {result['size_mb']}MB, criptografado: {'sim' if result['encrypted'] else 'não'}, removidos antigos: {result['removed_old']}"
+                log_admin_action("backup_manual", details=f"size={result['size_mb']}MB")
+            else:
+                msg = "❌ Falha ao executar backup. Veja os logs do Railway."
+                msg_class = "alert-error"
+        elif action == "run_retention":
+            result = perform_retention_cleanup()
+            if result and result.get("ok"):
+                msg = f"✅ Retenção: {result['messages_deleted']} msgs, {result['conversations_deleted']} convs, {result['audit_log_deleted']} audit, {result['verification_codes_deleted']} códigos expirados"
+                log_admin_action("retention_manual")
+            else:
+                msg = "❌ Falha ao executar retenção. Veja os logs do Railway."
+                msg_class = "alert-error"
+
+    # Listar backups existentes
+    backups_info = []
+    try:
+        if os.path.isdir(BACKUP_DIR):
+            entries = sorted(os.listdir(BACKUP_DIR), reverse=True)
+            for entry in entries:
+                if entry.endswith(".meta.json"):
+                    continue
+                full = os.path.join(BACKUP_DIR, entry)
+                if not os.path.isfile(full):
+                    continue
+                size_bytes = os.path.getsize(full)
+                mtime = datetime.fromtimestamp(os.path.getmtime(full))
+                meta = {}
+                meta_path = full + ".meta.json"
+                if os.path.isfile(meta_path):
+                    try:
+                        with open(meta_path) as f:
+                            meta = json.load(f)
+                    except Exception:
+                        meta = {}
+                backups_info.append({
+                    "name": entry,
+                    "size_mb": round(size_bytes / (1024 * 1024), 2),
+                    "created_at": mtime.strftime("%Y-%m-%d %H:%M:%S"),
+                    "encrypted": meta.get("encrypted", entry.endswith(".enc")),
+                    "sha256": (meta.get("sha256_unencrypted", "") or "")[:16] + "..." if meta.get("sha256_unencrypted") else "—",
+                })
+    except Exception as e:
+        msg = f"Erro listando backups: {e}"
+        msg_class = "alert-error"
+
+    backup_rows = ""
+    if backups_info:
+        for b in backups_info:
+            enc_badge = '<span class="badge badge-green">🔒 Criptografado</span>' if b["encrypted"] else '<span class="badge badge-orange">⚠️ Não criptografado</span>'
+            backup_rows += f"""<tr>
+                <td style="font-family:monospace;font-size:12px">{esc(b['name'])}</td>
+                <td>{b['size_mb']} MB</td>
+                <td>{b['created_at']}</td>
+                <td>{enc_badge}</td>
+                <td style="font-family:monospace;font-size:11px;color:var(--text3)">{esc(b['sha256'])}</td>
+            </tr>"""
+    else:
+        backup_rows = '<tr><td colspan="5" style="text-align:center;color:var(--text2);padding:30px">Nenhum backup ainda. Execute o primeiro abaixo.</td></tr>'
+
+    alert = f'<div class="alert {msg_class}">{msg}</div>' if msg else ""
+
+    # Detecta dinamicamente qual chave está sendo usada para criptografia
+    _get_fernet()  # garante que _source foi populado
+    crypto_key_source = getattr(_get_fernet, "_source", "desconhecida")
+
+    # Info sobre próxima execução
+    next_hour = int(os.getenv("MAINTENANCE_HOUR_UTC", "6"))
+    now_utc = datetime.utcnow()
+    next_run = now_utc.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+    if next_run <= now_utc:
+        next_run = next_run + timedelta(days=1)
+    next_run_brt = next_run - timedelta(hours=3)
+
+    retention_table = """
+    <table style="width:100%;font-size:14px;line-height:2">
+        <tr><td>Plano <strong>Starter</strong></td><td style="text-align:right">90 dias</td></tr>
+        <tr><td>Plano <strong>Profissional</strong></td><td style="text-align:right">180 dias</td></tr>
+        <tr><td>Plano <strong>Business</strong></td><td style="text-align:right">365 dias</td></tr>
+        <tr><td>Plano <strong>Agência</strong></td><td style="text-align:right">730 dias</td></tr>
+    </table>"""
+
+    content = f"""<div class="container">
+        <div class="page-header"><h1>Backups e Manutenção 💾</h1><p>Backup diário automatizado + retenção de dados LGPD</p></div>
+        {alert}
+
+        <div class="grid-2" style="margin-bottom:20px">
+            <div class="card">
+                <div class="card-header"><span class="card-title">⏰ Próxima execução automática</span></div>
+                <div style="padding:20px">
+                    <p style="font-size:24px;font-weight:700;margin-bottom:4px">{next_run_brt.strftime('%H:%M')} BRT</p>
+                    <p style="color:var(--text2);font-size:13px">{next_run.strftime('%Y-%m-%d %H:%M')} UTC</p>
+                    <p style="color:var(--text2);font-size:13px;margin-top:8px">Backup + retenção rodam juntos diariamente.</p>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header"><span class="card-title">🗑️ Retenção por plano</span></div>
+                <div style="padding:20px">{retention_table}</div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-bottom:20px">
+            <div class="card-header">
+                <span class="card-title">🎯 Executar manualmente</span>
+            </div>
+            <div style="padding:20px;display:flex;gap:12px;flex-wrap:wrap">
+                <form method="POST" style="margin:0">{csrf_field()}
+                    <input type="hidden" name="action" value="run_backup">
+                    <button type="submit" class="btn btn-primary">📦 Rodar backup agora</button>
+                </form>
+                <form method="POST" style="margin:0"
+                      onsubmit="return confirm('Vai APAGAR mensagens antigas conforme a retenção do plano de cada usuário. Continuar?')">{csrf_field()}
+                    <input type="hidden" name="action" value="run_retention">
+                    <button type="submit" class="btn btn-secondary">🧹 Rodar limpeza de retenção agora</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">Backups existentes ({len(backups_info)})</span>
+                <span style="font-size:13px;color:var(--text2)">Rotação: últimos {BACKUP_RETENTION_DAYS} dias</span>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr>
+                        <th>Arquivo</th>
+                        <th>Tamanho</th>
+                        <th>Criado em</th>
+                        <th>Segurança</th>
+                        <th>SHA-256</th>
+                    </tr></thead>
+                    <tbody>{backup_rows}</tbody>
+                </table>
+            </div>
+            <div style="padding:14px 20px;color:var(--text2);font-size:12px;border-top:1px solid var(--border)">
+                📁 Pasta no servidor: <code style="background:var(--bg2);padding:2px 6px;border-radius:4px">{esc(BACKUP_DIR)}</code><br>
+                🔐 Criptografia: Fernet (AES-128 + HMAC-SHA256). Chave em uso: <strong>{esc(crypto_key_source)}</strong>.<br>
+                ✅ Integridade: cada backup tem SHA-256 calculado antes da criptografia.
+            </div>
+        </div>
+    </div>"""
+    return admin_html("Backups", content)
+
+
 # ─── ADMIN: CONFIGURAÇÕES DE API ───────────────────────────────
 @app.route("/admin/api-settings", methods=["GET", "POST"])
 @admin_required
@@ -9828,15 +11345,168 @@ def admin_export(data_type):
     return send_file(output, mimetype="text/csv", as_attachment=True, download_name=f"atendeia_{data_type}_{datetime.now().strftime('%Y%m%d')}.csv")
 
 
+def migrate_recrypt_to_new_data_key():
+    """⚙️ MIGRAÇÃO CRÍTICA: recriptografa dados existentes quando DATA_ENCRYPTION_KEY
+    é ativada pela primeira vez (chave nova ≠ chave antiga SECRET_KEY).
+
+    Estratégia segura:
+    1. Constrói Fernet_OLD (chave SECRET_KEY) e Fernet_NEW (chave DATA_ENCRYPTION_KEY)
+    2. Se as chaves derivadas forem idênticas (caso em que DATA_ENCRYPTION_KEY == SECRET_KEY),
+       não há nada a fazer — retorna.
+    3. Para cada valor com prefixo `fer:v1:`:
+       a. Tenta decifrar com chave NOVA. Se OK, já está migrado, pula.
+       b. Tenta decifrar com chave ANTIGA. Se OK, recriptografa com NOVA e salva.
+       c. Se falhar com as DUAS, NÃO sobrescreve (dado pode estar corrompido) — só conta como falha.
+
+    Idempotente: rodar múltiplas vezes é seguro. Só re-processa o que ainda está com chave antiga.
+
+    Cobre: users (USER_ENCRYPTED_FIELDS) e system_settings (SENSITIVE_SETTINGS)."""
+
+    data_key = os.getenv("DATA_ENCRYPTION_KEY", "").strip()
+    if not data_key:
+        # DATA_ENCRYPTION_KEY não setada → nada a migrar (sistema usa SECRET_KEY como antes)
+        return {"skipped": True, "reason": "DATA_ENCRYPTION_KEY não definida"}
+
+    secret_key = os.getenv("SECRET_KEY", "").strip()
+    if not secret_key:
+        # Sem SECRET_KEY antiga não dá pra decifrar nada existente. Mas se o sistema sempre
+        # funcionou só com DATA_ENCRYPTION_KEY (instalação nova), não há legado pra migrar.
+        return {"skipped": True, "reason": "SECRET_KEY não definida — nada a migrar"}
+
+    if data_key == secret_key:
+        return {"skipped": True, "reason": "DATA_ENCRYPTION_KEY == SECRET_KEY, sem migração necessária"}
+
+    fernet_old = _build_fernet_from_key(secret_key)
+    fernet_new = _build_fernet_from_key(data_key)
+
+    if fernet_old is None or fernet_new is None:
+        safe_log("[RECRYPT] Não foi possível construir Fernet antigo/novo — abortando", level="ERROR")
+        return {"skipped": True, "reason": "Falha ao construir Fernet"}
+
+    # Helper interno: tenta decifrar valor com fernet específico
+    def _try_decrypt(fernet, encrypted_str):
+        if not isinstance(encrypted_str, str) or not encrypted_str.startswith("fer:v1:"):
+            return None
+        try:
+            return fernet.decrypt(encrypted_str[7:].encode("ascii")).decode("utf-8")
+        except Exception:
+            return None
+
+    def _re_encrypt(plaintext):
+        """Re-criptografa com a chave NOVA explicitamente (não usa _encrypt_value pra não
+        depender do cache de _get_fernet)."""
+        try:
+            token = fernet_new.encrypt(plaintext.encode("utf-8"))
+            return f"fer:v1:{token.decode('ascii')}"
+        except Exception:
+            return None
+
+    results = {
+        "users_migrated": 0,
+        "users_already_new": 0,
+        "users_failed": 0,
+        "settings_migrated": 0,
+        "settings_already_new": 0,
+        "settings_failed": 0,
+        "failures": [],
+    }
+
+    try:
+        db_conn = sqlite3.connect(DATABASE)
+        db_conn.row_factory = sqlite3.Row
+
+        # ─── (1) USERS: campos criptografados ───
+        try:
+            cols = list(USER_ENCRYPTED_FIELDS)
+            rows = db_conn.execute(f"SELECT id, {', '.join(cols)} FROM users").fetchall()
+            for row in rows:
+                uid = row["id"]
+                updates = {}
+                for col in cols:
+                    val = row[col]
+                    if not val or not isinstance(val, str) or not val.startswith("fer:v1:"):
+                        continue
+                    # Tenta chave nova primeiro
+                    plain_new = _try_decrypt(fernet_new, val)
+                    if plain_new is not None:
+                        results["users_already_new"] += 1
+                        continue
+                    # Tenta chave antiga
+                    plain_old = _try_decrypt(fernet_old, val)
+                    if plain_old is None:
+                        results["users_failed"] += 1
+                        results["failures"].append(f"users.id={uid} col={col}")
+                        safe_log(f"[RECRYPT] Falha em users.id={uid} col={col} (corrompido?)", level="ERROR")
+                        continue
+                    new_token = _re_encrypt(plain_old)
+                    if new_token:
+                        updates[col] = new_token
+                if updates:
+                    set_clause = ", ".join(f"{c}=?" for c in updates.keys())
+                    params = list(updates.values()) + [uid]
+                    db_conn.execute(f"UPDATE users SET {set_clause} WHERE id=?", params)
+                    results["users_migrated"] += len(updates)
+        except Exception as e:
+            safe_log(f"[RECRYPT] Erro processando users: {e}", level="ERROR")
+
+        # ─── (2) SYSTEM_SETTINGS: chaves sensíveis ───
+        try:
+            sensitive_keys = list(SENSITIVE_SETTINGS) if 'SENSITIVE_SETTINGS' in globals() else []
+            for key in sensitive_keys:
+                r = db_conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+                if not r or not r["value"]:
+                    continue
+                val = r["value"]
+                if not isinstance(val, str) or not val.startswith("fer:v1:"):
+                    # Texto puro ou XOR legado: deixa pra migrate_encrypt_existing_secrets() cuidar
+                    continue
+                plain_new = _try_decrypt(fernet_new, val)
+                if plain_new is not None:
+                    results["settings_already_new"] += 1
+                    continue
+                plain_old = _try_decrypt(fernet_old, val)
+                if plain_old is None:
+                    results["settings_failed"] += 1
+                    results["failures"].append(f"system_settings.key={key}")
+                    safe_log(f"[RECRYPT] Falha em system_settings.{key}", level="ERROR")
+                    continue
+                new_token = _re_encrypt(plain_old)
+                if new_token:
+                    db_conn.execute("UPDATE system_settings SET value=? WHERE key=?", (new_token, key))
+                    results["settings_migrated"] += 1
+        except Exception as e:
+            safe_log(f"[RECRYPT] Erro processando system_settings: {e}", level="ERROR")
+
+        db_conn.commit()
+        db_conn.close()
+
+        total_migrated = results["users_migrated"] + results["settings_migrated"]
+        total_failed = results["users_failed"] + results["settings_failed"]
+
+        if total_migrated:
+            safe_log(f"[RECRYPT] ✅ Migração concluída: {results['users_migrated']} campo(s) users, "
+                     f"{results['settings_migrated']} setting(s). Já-na-nova: "
+                     f"{results['users_already_new']}+{results['settings_already_new']}.")
+        elif total_failed:
+            safe_log(f"[RECRYPT] ⚠️ {total_failed} valor(es) não puderam ser migrados. Verifique logs.", level="ERROR")
+        else:
+            safe_log(f"[RECRYPT] Nada a migrar. Tudo já está na chave nova.")
+
+        return results
+    except Exception as e:
+        safe_log(f"[RECRYPT] Erro fatal na migração: {e}", level="ERROR")
+        return {"error": str(e)}
+
+
 def migrate_encrypt_existing_secrets():
     """Migra segredos: texto puro → Fernet, formato antigo XOR → Fernet"""
     fernet = _get_fernet()
     if not fernet:
         is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
         if not is_dev:
-            print("[MIGRATION] ❌ Criptografia indisponível — migração abortada")
+            safe_log("[MIGRATION] ❌ Criptografia indisponível — migração abortada", level="ERROR")
             return
-        print("[MIGRATION] ⚠️ DEV: criptografia indisponível, migração pulada")
+        safe_log("[MIGRATION] ⚠️ DEV: criptografia indisponível, migração pulada", level="WARN")
         return
     try:
         db_conn = sqlite3.connect(DATABASE)
@@ -9857,25 +11527,30 @@ def migrate_encrypt_existing_secrets():
                     encrypted = _encrypt_value(plaintext)
                     if encrypted.startswith("fer:v1:"):
                         db_conn.execute("UPDATE system_settings SET value=? WHERE key=?", (encrypted, key))
-                        print(f"[MIGRATION] Re-criptografado (XOR → Fernet): {key}")
+                        safe_log(f"[MIGRATION] Re-criptografado (XOR → Fernet): {key}")
                         migrated += 1
                 continue
             # Texto puro → criptografa com Fernet
             encrypted = _encrypt_value(current)
             if encrypted.startswith("fer:v1:"):
                 db_conn.execute("UPDATE system_settings SET value=? WHERE key=?", (encrypted, key))
-                print(f"[MIGRATION] Criptografado (plaintext → Fernet): {key}")
+                safe_log(f"[MIGRATION] Criptografado (plaintext → Fernet): {key}")
                 migrated += 1
         db_conn.commit()
         db_conn.close()
         if migrated:
-            print(f"[MIGRATION] ✅ {migrated} segredo(s) migrado(s) para Fernet")
+            safe_log(f"[MIGRATION] ✅ {migrated} segredo(s) migrado(s) para Fernet")
     except Exception as e:
-        print(f"[MIGRATION] Erro: {e}")
+        safe_log(f"[MIGRATION] Erro: {e}", level="ERROR")
 
 
 def check_production_requirements():
-    """Verifica requisitos obrigatórios de produção. Aborta se algo crítico faltar."""
+    """Verifica requisitos obrigatórios de produção. Aborta se algo crítico faltar.
+
+    Secrets de webhook (MP/WhatsApp) também são exigidos por padrão, com escape hatches:
+    - SKIP_MP_REQUIREMENT=1 → pula MP_WEBHOOK_SECRET (use se não usa MP)
+    - SKIP_WA_REQUIREMENT=1 → pula WHATSAPP_APP_SECRET (use se não usa WhatsApp)
+    """
     is_dev = os.getenv("FLASK_ENV", "").lower() == "development"
     errors = []
 
@@ -9898,6 +11573,33 @@ def check_production_requirements():
         import requests  # noqa: F401
     except ImportError:
         errors.append("requests não instalado — integrações externas não funcionam")
+
+    # 5. Secrets de webhook — fail-fast em produção em vez de só rejeitar no request.
+    # Aceita tanto env var quanto settings do banco (NOTA: settings só consulta após init_db,
+    # então em produção o RECOMENDADO é configurar via env var; aqui só verificamos env).
+    skip_mp = os.getenv("SKIP_MP_REQUIREMENT", "").strip() == "1"
+    if not skip_mp and not os.getenv("MP_WEBHOOK_SECRET"):
+        errors.append("MP_WEBHOOK_SECRET não configurado — webhooks Mercado Pago serão rejeitados (defina SKIP_MP_REQUIREMENT=1 se não usa MP)")
+
+    skip_wa = os.getenv("SKIP_WA_REQUIREMENT", "").strip() == "1"
+    if not skip_wa and not os.getenv("WHATSAPP_APP_SECRET"):
+        errors.append("WHATSAPP_APP_SECRET não configurado — webhooks WhatsApp serão rejeitados (defina SKIP_WA_REQUIREMENT=1 se não usa WhatsApp)")
+
+    # 6. DATA_ENCRYPTION_KEY separada — recomendação forte para SaaS multi-cliente.
+    # Sem ela, o sistema cai em SECRET_KEY (que também assina cookies de sessão); se a
+    # SECRET_KEY vazar, vaza simultaneamente sessões E dados criptografados em repouso.
+    # Não aborta para não quebrar deploys existentes — emite warning evidente.
+    # Para tornar obrigatório, defina REQUIRE_SEPARATE_DATA_KEY=1.
+    require_data_key = os.getenv("REQUIRE_SEPARATE_DATA_KEY", "").strip() == "1"
+    if not os.getenv("DATA_ENCRYPTION_KEY"):
+        msg = ("DATA_ENCRYPTION_KEY não configurada — fallback para SECRET_KEY. "
+               "Para SaaS multi-cliente, recomenda-se chave separada (gere com: "
+               "python3 -c 'import secrets; print(secrets.token_hex(32))'). "
+               "Defina REQUIRE_SEPARATE_DATA_KEY=1 para tornar obrigatório.")
+        if require_data_key:
+            errors.append(msg)
+        elif not is_dev:
+            safe_log(f"[BOOT] ⚠️ {msg}", level="WARN")
 
     if errors and not is_dev:
         print("="*70)
@@ -9930,14 +11632,47 @@ check_production_requirements()
 
 # Inicializa o banco sempre (necessário para gunicorn no Railway)
 init_db()
+# IMPORTANTE: rodar PRIMEIRO a recriptografia (caso DATA_ENCRYPTION_KEY tenha sido ativada
+# enquanto havia dados antigos criptografados com SECRET_KEY).
+# Esta chamada é idempotente e segura — não faz nada se DATA_ENCRYPTION_KEY não estiver setada
+# ou se já estiver tudo migrado.
+try:
+    migrate_recrypt_to_new_data_key()
+except Exception as e:
+    safe_log(f"[RECRYPT] Migração falhou: {e}", level="ERROR")
 migrate_encrypt_existing_secrets()
 migrate_encrypt_user_tokens()
 
-# Inicia scheduler de posts da agência (em background)
-try:
-    start_social_scheduler()
-except Exception as e:
-    print(f"[SCHEDULER] Não foi possível iniciar: {e}")
+# Guard multi-worker: em produção (Railway com gunicorn) cada worker importa o módulo
+# e dispararia o scheduler — rodando backup/retenção N vezes. Em DEV (FLASK_ENV=development)
+# ou single-worker, sempre roda. Em produção, exige SCHEDULER_LEADER=1 num único worker.
+# Defina SCHEDULER_LEADER=1 apenas em UM worker (ex.: usando --preload + condição no gunicorn
+# config, ou rodando um worker dedicado com essa env var).
+def _is_scheduler_leader():
+    if os.getenv("FLASK_ENV", "").strip() == "development":
+        return True
+    if os.getenv("SCHEDULER_LEADER", "").strip() == "1":
+        return True
+    # Heurística: se WEB_CONCURRENCY/GUNICORN_WORKERS não definidos ou == 1, é single-worker
+    workers = os.getenv("WEB_CONCURRENCY", os.getenv("GUNICORN_WORKERS", "1")).strip()
+    return workers == "1"
+
+
+if _is_scheduler_leader():
+    # Inicia scheduler de posts da agência (em background)
+    try:
+        start_social_scheduler()
+    except Exception as e:
+        safe_log(f"[SCHEDULER] Não foi possível iniciar: {e}", level="ERROR")
+
+    # LGPD: Inicia scheduler diário de backup + retenção (em background)
+    try:
+        start_daily_maintenance_scheduler()
+        safe_log("[MAINTENANCE] Scheduler diário ativo (backup + retenção LGPD)")
+    except Exception as e:
+        safe_log(f"[MAINTENANCE] Não foi possível iniciar: {e}", level="ERROR")
+else:
+    safe_log("[SCHEDULER] Worker não-líder — schedulers não iniciados (defina SCHEDULER_LEADER=1 em um worker)")
 
 
 # ─── FAVICON (logo na aba do navegador) ───────────────────
@@ -9952,7 +11687,7 @@ def favicon():
             "Cache-Control": "public, max-age=86400"
         })
     except Exception as e:
-        print(f"[FAVICON] Erro: {e}")
+        safe_log(f"[FAVICON] Erro: {e}", level="ERROR")
         return Response(status=404)
 
 
@@ -9968,7 +11703,7 @@ def apple_touch_icon():
             "Cache-Control": "public, max-age=86400"
         })
     except Exception as e:
-        print(f"[APPLE ICON] Erro: {e}")
+        safe_log(f"[APPLE ICON] Erro: {e}", level="ERROR")
         return Response(status=404)
 
 

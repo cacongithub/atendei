@@ -10765,29 +10765,33 @@ def admin_logs():
 @app.route("/admin/cleanup-unverified", methods=["GET", "POST"])
 @admin_required
 def admin_cleanup_unverified():
-    """Remove contas NÃO verificadas (bots/abandono). FK-safe: apaga filhos antes do user.
-    Filtro de idade evita apagar cadastros legítimos recentes que ainda vão verificar."""
+    """Remove SOMENTE as contas não verificadas que o admin marcar explicitamente.
+    Lista cada conta (email + data) com checkbox; nada é apagado sem seleção manual.
+    FK-safe: apaga filhos antes do user. Contas verificadas NUNCA aparecem aqui."""
     db = get_db()
     msg = ""
 
     if request.method == "POST":
-        try:
-            min_age_hours = int(request.form.get("min_age_hours", "1"))
-        except (ValueError, TypeError):
-            min_age_hours = 1
-        if request.form.get("confirm") != "on":
-            msg = '<div class="alert alert-error">Marque a confirmação para executar a limpeza.</div>'
+        selected_ids = request.form.getlist("delete_ids")
+        # Só aceita IDs que sejam realmente de contas NÃO verificadas (proteção dupla)
+        safe_ids = []
+        for sid in selected_ids:
+            try:
+                uid = int(sid)
+            except (ValueError, TypeError):
+                continue
+            row = db.execute("SELECT email_verified FROM users WHERE id=?", (uid,)).fetchone()
+            if row and not row["email_verified"]:
+                safe_ids.append(uid)
+
+        if not safe_ids:
+            msg = '<div class="alert alert-warning">Nenhuma conta foi selecionada — nada foi apagado.</div>'
         else:
-            cutoff = f"-{min_age_hours} hours"
-            rows = db.execute(
-                "SELECT id, email FROM users WHERE email_verified=0 AND created_at < datetime('now', ?)",
-                (cutoff,)
-            ).fetchall()
-            ids = [r["id"] for r in rows]
-            emails = [r["email"] for r in rows]
             deleted = 0
-            for uid in ids:
+            for uid in safe_ids:
                 try:
+                    em_row = db.execute("SELECT email FROM users WHERE id=?", (uid,)).fetchone()
+                    em = em_row["email"] if em_row else None
                     # Apaga filhos conhecidos antes do user (PRAGMA foreign_keys=ON)
                     for child_sql in (
                         "DELETE FROM consent_log WHERE user_id=?",
@@ -10803,44 +10807,67 @@ def admin_cleanup_unverified():
                         except sqlite3.OperationalError:
                             pass  # tabela pode não existir nessa instalação
                     db.execute("DELETE FROM users WHERE id=?", (uid,))
+                    if em:
+                        try:
+                            db.execute("DELETE FROM verification_codes WHERE email=?", (em,))
+                        except Exception:
+                            pass
                     deleted += 1
                 except Exception as e:
                     safe_log(f"[CLEANUP] Falha ao remover user {uid}: {e}", level="ERROR")
-            # Limpa códigos de verificação órfãos desses emails
-            for em in emails:
-                try:
-                    db.execute("DELETE FROM verification_codes WHERE email=?", (em,))
-                except Exception:
-                    pass
             db.commit()
-            log_admin_action("cleanup_unverified", details=f"deleted={deleted} min_age_hours={min_age_hours}")
-            safe_log(f"[CLEANUP] {deleted} contas não verificadas removidas (idade > {min_age_hours}h)")
-            msg = f'<div class="alert alert-success">✅ {deleted} contas não verificadas removidas.</div>'
+            log_admin_action("cleanup_unverified", details=f"deleted={deleted} selecionadas")
+            safe_log(f"[CLEANUP] {deleted} contas não verificadas removidas (seleção manual)")
+            msg = f'<div class="alert alert-success">✅ {deleted} conta(s) removida(s) com sucesso.</div>'
 
     total_unverified = db.execute("SELECT COUNT(*) FROM users WHERE email_verified=0").fetchone()[0]
-    old_1h = db.execute("SELECT COUNT(*) FROM users WHERE email_verified=0 AND created_at < datetime('now', '-1 hours')").fetchone()[0]
+    # Lista as contas não verificadas (mais recentes primeiro), limitado para não pesar a página
+    unverified_rows = db.execute(
+        "SELECT id, email, name, created_at FROM users WHERE email_verified=0 ORDER BY created_at DESC LIMIT 1000"
+    ).fetchall()
+
+    rows_html = ""
+    for r in unverified_rows:
+        rows_html += f"""<tr>
+            <td style="text-align:center"><input type="checkbox" name="delete_ids" value="{r['id']}" class="cleanup-cb" style="width:18px;height:18px"></td>
+            <td>{esc(r['email'])}</td>
+            <td>{esc(r['name'] or '—')}</td>
+            <td style="white-space:nowrap;color:var(--text2)">{esc(str(r['created_at']) or '—')}</td>
+        </tr>"""
+    if not rows_html:
+        rows_html = '<tr><td colspan="4" style="text-align:center;padding:20px;color:var(--text2)">Nenhuma conta não verificada. 🎉</td></tr>'
+
+    list_card = f"""
+        <div class="card" style="padding:24px">
+            <h2 style="font-size:16px;margin-bottom:8px">Selecione as contas para apagar</h2>
+            <p style="color:var(--text2);font-size:13px;margin-bottom:16px">
+                ⚠️ Confira os emails. <strong>Marque só os bots</strong> e deixe os seus clientes desmarcados.
+                Contas já verificadas (clientes que fizeram login) <strong>não aparecem aqui</strong> e estão a salvo.
+            </p>
+            <form method="POST" onsubmit="return confirm('Apagar as contas marcadas? Esta ação é irreversível.');">{csrf_field()}
+                <div style="margin-bottom:12px;display:flex;gap:10px;flex-wrap:wrap">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="document.querySelectorAll('.cleanup-cb').forEach(c=>c.checked=true)">Marcar todas</button>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="document.querySelectorAll('.cleanup-cb').forEach(c=>c.checked=false)">Desmarcar todas</button>
+                </div>
+                <div class="table-wrap" style="max-height:480px;overflow:auto;border:1px solid var(--border);border-radius:8px">
+                    <table style="width:100%"><thead><tr>
+                        <th style="width:40px"></th><th>Email</th><th>Nome</th><th>Criada em</th>
+                    </tr></thead><tbody>{rows_html}</tbody></table>
+                </div>
+                <button type="submit" class="btn" style="margin-top:16px;background:#fef2f2;color:#dc2626;border:1px solid #fecaca">🧹 Apagar contas marcadas</button>
+            </form>
+        </div>
+    """
+
     content = f"""<div class="container">
         <div class="page-header"><h1>🧹 Limpeza de Contas Não Verificadas</h1>
         <p>Remove contas criadas por bots ou abandonadas (que nunca confirmaram o email).</p></div>
         {msg}
         <div class="card" style="padding:24px;margin-bottom:20px">
             <p style="font-size:15px"><strong>{total_unverified}</strong> contas não verificadas no total.</p>
-            <p style="font-size:14px;color:var(--text2)"><strong>{old_1h}</strong> delas têm mais de 1 hora (mais provável serem bots/abandono).</p>
+            <p style="font-size:13px;color:var(--text2);margin-top:6px">✅ Contas verificadas (clientes que já fizeram login) <strong>não aparecem aqui</strong> e estão protegidas.</p>
         </div>
-        <div class="card" style="padding:24px;border-left:3px solid var(--red,#dc2626)">
-            <h2 style="font-size:16px;margin-bottom:12px">Executar limpeza</h2>
-            <form method="POST" onsubmit="return confirm('Confirmar exclusão das contas não verificadas?');">{csrf_field()}
-                <div class="form-group">
-                    <label class="form-label">Apagar contas não verificadas com mais de (horas):</label>
-                    <input type="number" name="min_age_hours" class="form-input" value="1" min="0" max="720" style="max-width:140px">
-                    <small style="color:var(--text3);display:block;margin-top:6px">Use 1+ para preservar cadastros legítimos muito recentes. Use 0 para apagar todas as não verificadas.</small>
-                </div>
-                <label style="display:flex;align-items:center;gap:8px;margin:12px 0;cursor:pointer">
-                    <input type="checkbox" name="confirm"> Entendo que esta ação é irreversível.
-                </label>
-                <button type="submit" class="btn" style="background:#fef2f2;color:#dc2626;border:1px solid #fecaca">🧹 Remover contas não verificadas</button>
-            </form>
-        </div>
+        {list_card}
     </div>"""
     return admin_html("Limpeza de Contas", content)
 

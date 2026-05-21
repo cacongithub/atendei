@@ -22,7 +22,7 @@ Rodar:
   python app.py
 """
 
-import os, json, sqlite3, hashlib, secrets, time, re, base64, tempfile, io, random
+import os, json, sqlite3, hashlib, secrets, time, re, base64, tempfile, io, random, threading
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import (

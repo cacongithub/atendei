@@ -734,6 +734,8 @@ def init_db():
         ("users", "totp_enabled", "INTEGER DEFAULT 0"),
         ("users", "totp_backup_codes", "TEXT DEFAULT ''"),
         ("users", "mp_webhook_secret", "TEXT DEFAULT ''"),
+        ("users", "einstein_url", "TEXT DEFAULT ''"),
+        ("users", "einstein_token", "TEXT DEFAULT ''"),
     ]
     for table, column, col_type in migrations:
         try:
@@ -886,7 +888,52 @@ USER_ENCRYPTED_FIELDS = {
     "telegram_bot_token",
     "totp_secret",
     "mp_webhook_secret",
+    "einstein_token",
 }
+
+
+# ── Integração Einstein (reservas da pousada) — POR-CLIENTE e isolada ──
+# As tools só entram pro bot do cliente que tiver einstein_url + einstein_token (ex: SmartHotel).
+# Pra todos os outros clientes, nada muda. O token fica criptografado (USER_ENCRYPTED_FIELDS).
+EINSTEIN_RESERVA_TOOLS = [
+    {"name": "consultar_disponibilidade",
+     "description": "Consulta se há quarto disponível na pousada e o preço da diária para um período. "
+                    "Use quando o cliente perguntar sobre reserva, disponibilidade, vaga ou preço de hospedagem.",
+     "input_schema": {"type": "object", "properties": {
+         "entrada": {"type": "string", "description": "data de entrada no formato AAAA-MM-DD"},
+         "saida": {"type": "string", "description": "data de saída no formato AAAA-MM-DD"},
+         "tipo": {"type": "string", "enum": ["single", "duplo", "triplo"], "description": "tipo de quarto"}},
+         "required": ["entrada", "saida", "tipo"]}},
+    {"name": "criar_reserva",
+     "description": "Registra a reserva na pousada. Só chame DEPOIS de consultar_disponibilidade dar vaga "
+                    "E o cliente CONFIRMAR. Pergunte o nome do cliente antes de criar.",
+     "input_schema": {"type": "object", "properties": {
+         "nome": {"type": "string"}, "telefone": {"type": "string"},
+         "entrada": {"type": "string"}, "saida": {"type": "string"},
+         "tipo": {"type": "string", "enum": ["single", "duplo", "triplo"]},
+         "pessoas": {"type": "integer"}},
+         "required": ["nome", "entrada", "saida", "tipo"]}},
+]
+
+def einstein_reserva_tool(user, name, inp):
+    """Executa uma tool de reserva chamando a API do Einstein DAQUELE cliente (nunca global)."""
+    import requests as req
+    base = (user.get("einstein_url") or "").rstrip("/")
+    tok = user.get("einstein_token") or ""
+    if not base or not tok:
+        return {"erro": "integração da pousada não configurada"}
+    headers = {"X-Einstein-Token": tok}
+    try:
+        if name == "consultar_disponibilidade":
+            return req.get(base + "/api/disponibilidade",
+                           params={"entrada": inp.get("entrada"), "saida": inp.get("saida"),
+                                   "tipo": inp.get("tipo", "duplo")}, headers=headers, timeout=20).json()
+        if name == "criar_reserva":
+            return req.post(base + "/api/reserva-externa",
+                            json={**inp, "origem": "whatsapp"}, headers=headers, timeout=20).json()
+    except Exception as e:
+        return {"erro": str(e)}
+    return {"erro": "ferramenta desconhecida"}
 
 
 def generate_totp_secret():
@@ -8381,13 +8428,24 @@ def commerce_settings():
             raw = db.execute("SELECT mp_webhook_secret FROM users WHERE id=?", (user["id"],)).fetchone()
             mp_webhook_secret_final = (raw["mp_webhook_secret"] if raw else "") or ""
 
+        # Integração Einstein (pousada) — por-cliente, token criptografado. Vazio = mantém.
+        einstein_url_input = request.form.get("einstein_url", "").strip()
+        einstein_token_input = request.form.get("einstein_token", "").strip()
+        if einstein_token_input:
+            einstein_token_final = _encrypt_value(einstein_token_input)
+        else:
+            raw = db.execute("SELECT einstein_token FROM users WHERE id=?", (user["id"],)).fetchone()
+            einstein_token_final = (raw["einstein_token"] if raw else "") or ""
+
         db.execute(
             """UPDATE users SET
                 mp_access_token=?,
                 mp_public_key=?,
                 mp_webhook_secret=?,
                 commerce_enabled=?,
-                auto_payment_enabled=?
+                auto_payment_enabled=?,
+                einstein_url=?,
+                einstein_token=?
                WHERE id=?""",
             (
                 mp_token_final,
@@ -8395,6 +8453,8 @@ def commerce_settings():
                 mp_webhook_secret_final,
                 1 if request.form.get("commerce_enabled") else 0,
                 1 if request.form.get("auto_payment_enabled") else 0,
+                einstein_url_input,
+                einstein_token_final,
                 user["id"]
             )
         )
@@ -8465,6 +8525,17 @@ def commerce_settings():
                             <p style="margin:4px 0 0;font-size:12px;color:var(--text3)">A IA envia PIX e link de checkout juntos. Desative se quiser só PIX.</p>
                         </div>
                     </label>
+                </div>
+
+                <div class="form-group" style="background:rgba(250,204,21,0.05);border:1px solid rgba(250,204,21,0.22);border-radius:8px;padding:14px">
+                    <label class="form-label">🏨 Integração Pousada / Einstein (reservas pelo WhatsApp)</label>
+                    <p style="color:var(--text3);font-size:12px;margin:0 0 10px">Preencha SÓ se este bot for de uma pousada com o sistema Einstein. Deixe vazio nos demais clientes (a integração só liga aqui).</p>
+                    <input type="text" name="einstein_url" class="form-input" value="{esc(user.get('einstein_url') or '')}"
+                           placeholder="https://seu-tunel.trycloudflare.com" style="margin-bottom:8px" autocomplete="off">
+                    <input type="password" name="einstein_token" class="form-input" value=""
+                           placeholder="{esc(mask_secret(user.get('einstein_token') or '')) if user.get('einstein_token') else 'token do Einstein (arquivo .einstein_api_token)'}"
+                           autocomplete="off">
+                    <small style="color:var(--text3)">{'✓ Token configurado. Deixe em branco para manter ou cole outro para substituir.' if user.get('einstein_token') else 'Cole a URL do túnel + o token. Vazio = integração desligada.'}</small>
                 </div>
 
                 <button type="submit" class="btn btn-primary">💾 Salvar</button>
@@ -9205,7 +9276,10 @@ REGRAS:
 
     # Tenta Claude primeiro (se configurado e selecionado)
     api_key = get_setting("ANTHROPIC_API_KEY")
-    if api_key and ai_engine == "claude":
+    # Integração Einstein: tools de reserva SÓ pro cliente que configurou (ex: SmartHotel).
+    einstein_on = bool(user.get("einstein_url") and user.get("einstein_token"))
+    if api_key and ai_engine == "claude" and not einstein_on:
+        # ===== COMPORTAMENTO ORIGINAL — inalterado para todos os clientes sem Einstein =====
         try:
             import requests as req
             resp = req.post("https://api.anthropic.com/v1/messages",
@@ -9222,6 +9296,34 @@ REGRAS:
             else:
                 safe_log(f"Claude error: {resp.status_code} {_short_resp_text(resp)}", level="ERROR")
         except Exception as e: safe_log(f"Claude error: {e}", level="ERROR")
+    elif api_key and ai_engine == "claude" and einstein_on:
+        # ===== Bot da POUSADA: tool-use (consultar disponibilidade + criar reserva no Einstein) =====
+        try:
+            import requests as req, json as _json
+            msgs = list(api_messages)
+            for _rodada in range(4):
+                resp = req.post("https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key":api_key,"anthropic-version":"2023-06-01","content-type":"application/json"},
+                    json={"model":"claude-sonnet-4-6","max_tokens":600,"system":system_prompt,
+                          "messages":msgs,"tools":EINSTEIN_RESERVA_TOOLS}, timeout=40)
+                if resp.status_code != 200:
+                    safe_log(f"Claude error: {resp.status_code} {_short_resp_text(resp)}", level="ERROR"); break
+                result = resp.json(); u = result.get("usage",{})
+                db_conn.execute("INSERT INTO api_usage_log (user_id,api_name,tokens_in,tokens_out,cost_estimate) VALUES (?,?,?,?,?)",
+                    (user["id"],"anthropic",u.get("input_tokens",0),u.get("output_tokens",0),
+                     (u.get("input_tokens",0)*3/1000000)+(u.get("output_tokens",0)*15/1000000)))
+                if result.get("stop_reason") == "tool_use":
+                    msgs.append({"role":"assistant","content":result["content"]})
+                    tr = []
+                    for b in result["content"]:
+                        if b.get("type") == "tool_use":
+                            tr.append({"type":"tool_result","tool_use_id":b["id"],
+                                       "content":_json.dumps(einstein_reserva_tool(user, b["name"], b.get("input",{})), ensure_ascii=False)})
+                    msgs.append({"role":"user","content":tr}); continue
+                texto = "".join(b.get("text","") for b in result.get("content",[]) if b.get("type")=="text")
+                if texto: return texto
+                break
+        except Exception as e: safe_log(f"Claude error (pousada): {e}", level="ERROR")
 
     # Tenta OpenAI/ChatGPT (se configurado)
     openai_key = get_setting("OPENAI_API_KEY")

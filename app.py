@@ -969,6 +969,66 @@ def einstein_contexto(user):
     return hit["texto"] if hit else ""
 
 
+def send_whatsapp_interactive_card(phone_id, token, to, body, image_url="", buttons=None, footer=""):
+    """Mensagem interativa (imagem no cabeçalho + até 3 botões de resposta). Se a Meta
+    recusar (ex: link de imagem inacessível), cai para texto simples — nunca perde o card."""
+    import requests as req
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "interactive",
+               "interactive": {"type": "button", "body": {"text": (body or "")[:1024]},
+                               "action": {"buttons": [
+                                   {"type": "reply", "reply": {"id": b.get("id", f"b{i}"),
+                                                               "title": str(b.get("titulo", ""))[:20]}}
+                                   for i, b in enumerate((buttons or [])[:3])]}}}
+    if image_url:
+        payload["interactive"]["header"] = {"type": "image", "image": {"link": image_url}}
+    if footer:
+        payload["interactive"]["footer"] = {"text": footer[:60]}
+    try:
+        r = req.post(f"https://graph.facebook.com/v18.0/{phone_id}/messages",
+                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                     json=payload, timeout=20)
+        if r.status_code == 200:
+            safe_log(f"[CARD] ✓ card interativo enviado para {mask_phone(to)}")
+            return True
+        err = {}
+        try:
+            err = r.json().get("error", {})
+        except Exception:
+            pass
+        safe_log(f"[CARD] interativo recusado (code={err.get('code','')}) — caindo pra texto", level="WARN")
+    except Exception as e:
+        safe_log(f"[CARD] exceção no interativo: {e} — caindo pra texto", level="WARN")
+    return bool(send_whatsapp_message(phone_id, token, to, body).get("success"))
+
+
+def _enviar_card_chegada(user, db_conn, conversation_id, reserva_input):
+    """Depois que criar_reserva dá certo pelo WhatsApp: busca o card no Einstein do
+    cliente e envia. Qualquer falha aqui NÃO pode afetar a resposta da reserva."""
+    import requests as req
+    phone_id = user.get("whatsapp_phone_id") or ""
+    token = user.get("whatsapp_token") or ""
+    base = (user.get("einstein_url") or "").rstrip("/")
+    etok = user.get("einstein_token") or ""
+    if not (phone_id and token and base and etok):
+        return
+    conv = db_conn.execute("SELECT customer_phone FROM conversations WHERE id=?",
+                           (conversation_id,)).fetchone()
+    to = (conv["customer_phone"] if conv else "") or ""
+    if not to.replace("+", "").isdigit():
+        return   # conversa de outro canal (Instagram/Telegram) — card é só WhatsApp
+    r = req.post(base + "/api/atendente/card",
+                 json={"nome": reserva_input.get("nome", ""),
+                       "entrada": reserva_input.get("entrada", ""),
+                       "saida": reserva_input.get("saida", ""),
+                       "tipo": reserva_input.get("tipo", "")},
+                 headers={"X-Einstein-Token": etok}, timeout=20)
+    d = r.json() if r.status_code == 200 else {}
+    if d.get("ok") and d.get("texto"):
+        send_whatsapp_interactive_card(phone_id, token, to, d["texto"],
+                                       image_url=d.get("imagem_url", ""),
+                                       buttons=d.get("botoes"), footer="Smart Center · Quixadá")
+
+
 def generate_totp_secret():
     """Gera novo segredo TOTP (base32)"""
     try:
@@ -9355,8 +9415,16 @@ REGRAS:
                     tr = []
                     for b in result["content"]:
                         if b.get("type") == "tool_use":
+                            _tres = einstein_reserva_tool(user, b["name"], b.get("input",{}))
+                            # Reserva criada com sucesso -> envia o CARD DE CHEGADA
+                            # (imagem + botões). Falha no card jamais afeta a reserva.
+                            if b["name"] == "criar_reserva" and isinstance(_tres, dict) and _tres.get("ok"):
+                                try:
+                                    _enviar_card_chegada(user, db_conn, conversation_id, b.get("input", {}))
+                                except Exception as _ce:
+                                    safe_log(f"[CARD] envio falhou: {_ce}", level="ERROR")
                             tr.append({"type":"tool_result","tool_use_id":b["id"],
-                                       "content":_json.dumps(einstein_reserva_tool(user, b["name"], b.get("input",{})), ensure_ascii=False)})
+                                       "content":_json.dumps(_tres, ensure_ascii=False)})
                     msgs.append({"role":"user","content":tr}); continue
                 texto = "".join(b.get("text","") for b in result.get("content",[]) if b.get("type")=="text")
                 if texto: return texto

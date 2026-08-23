@@ -2931,11 +2931,29 @@ def process_whatsapp_media(msg, token):
         emoji = msg.get("reaction", {}).get("emoji", "")
         result["content"] = f"[Reação: {emoji}]"
         result["description"] = result["content"]
-        
+
+    elif msg_type == "interactive":
+        # Toque em BOTÃO de mensagem interativa (ex: card de chegada) ou item de lista.
+        # O título do botão vira o texto da mensagem — a IA responde como se o cliente
+        # tivesse digitado (ex: "☕ Cardápio" → responde o cardápio do conhecimento).
+        inter = msg.get("interactive", {}) or {}
+        titulo = ((inter.get("button_reply") or {}).get("title")
+                  or (inter.get("list_reply") or {}).get("title") or "")
+        result["type"] = "text"
+        result["content"] = titulo or "[botão sem título]"
+        result["description"] = f"Cliente tocou no botão: {titulo}"
+
+    elif msg_type == "button":
+        # Resposta a botão de TEMPLATE (formato antigo da Meta)
+        titulo = (msg.get("button") or {}).get("text", "")
+        result["type"] = "text"
+        result["content"] = titulo or "[botão sem título]"
+        result["description"] = f"Cliente tocou no botão: {titulo}"
+
     else:
         result["content"] = f"[{msg_type}] Tipo de mensagem não suportado"
         result["description"] = result["content"]
-    
+
     return result
 
 

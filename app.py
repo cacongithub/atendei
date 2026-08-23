@@ -902,7 +902,10 @@ EINSTEIN_RESERVA_TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "entrada": {"type": "string", "description": "data de entrada no formato AAAA-MM-DD"},
          "saida": {"type": "string", "description": "data de saída no formato AAAA-MM-DD"},
-         "tipo": {"type": "string", "enum": ["single", "duplo", "triplo"], "description": "tipo de quarto"}},
+         "tipo": {"type": "string", "enum": ["casal", "solteiros", "casal_solteiro", "quadruplo"],
+                  "description": "tipo de quarto pelas camas: casal (1 cama de casal, 2 pessoas), "
+                                 "solteiros (2 camas de solteiro, 2 pessoas), casal_solteiro (Triplo: "
+                                 "1 casal + 1 solteiro, 3 pessoas), quadruplo (2 camas de casal, 4 pessoas)"}},
          "required": ["entrada", "saida", "tipo"]}},
     {"name": "criar_reserva",
      "description": "Registra a reserva na pousada. Só chame DEPOIS de consultar_disponibilidade dar vaga "
@@ -910,7 +913,7 @@ EINSTEIN_RESERVA_TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "nome": {"type": "string"}, "telefone": {"type": "string"},
          "entrada": {"type": "string"}, "saida": {"type": "string"},
-         "tipo": {"type": "string", "enum": ["single", "duplo", "triplo"]},
+         "tipo": {"type": "string", "enum": ["casal", "solteiros", "casal_solteiro", "quadruplo"]},
          "pessoas": {"type": "integer"}},
          "required": ["nome", "entrada", "saida", "tipo"]}},
 ]
@@ -927,13 +930,43 @@ def einstein_reserva_tool(user, name, inp):
         if name == "consultar_disponibilidade":
             return req.get(base + "/api/disponibilidade",
                            params={"entrada": inp.get("entrada"), "saida": inp.get("saida"),
-                                   "tipo": inp.get("tipo", "duplo")}, headers=headers, timeout=20).json()
+                                   "tipo": inp.get("tipo", "casal")}, headers=headers, timeout=20).json()
         if name == "criar_reserva":
             return req.post(base + "/api/reserva-externa",
                             json={**inp, "origem": "whatsapp"}, headers=headers, timeout=20).json()
     except Exception as e:
         return {"erro": str(e)}
     return {"erro": "ferramenta desconhecida"}
+
+
+# ── Conhecimento VIVO do Einstein (por-cliente, cache 5 min, fallback no último bom) ──
+# O Einstein expõe GET /api/atendente/contexto: treinamento + fatos verificados + tipos
+# de quarto + estado atual. Injetamos no system prompt do Claude SÓ pro cliente com a
+# integração configurada — os demais bots passam longe. Se o Einstein cair, o bot segue
+# respondendo com o último pacote bom (nunca emudece por causa da pousada).
+_EINSTEIN_CTX_CACHE = {}   # user_id -> {"em": epoch, "texto": str}
+
+def einstein_contexto(user):
+    import time as _t
+    import requests as req
+    base = (user.get("einstein_url") or "").rstrip("/")
+    tok = user.get("einstein_token") or ""
+    if not base or not tok:
+        return ""
+    uid = user.get("id")
+    hit = _EINSTEIN_CTX_CACHE.get(uid)
+    if hit and _t.time() - hit["em"] < 300:
+        return hit["texto"]
+    try:
+        r = req.get(base + "/api/atendente/contexto",
+                    headers={"X-Einstein-Token": tok}, timeout=10)
+        d = r.json() if r.status_code == 200 else {}
+        if d.get("ok") and d.get("contexto"):
+            _EINSTEIN_CTX_CACHE[uid] = {"em": _t.time(), "texto": d["contexto"]}
+            return d["contexto"]
+    except Exception as e:
+        safe_log(f"[EINSTEIN] contexto indisponivel (user {uid}): {e}")
+    return hit["texto"] if hit else ""
 
 
 def generate_totp_secret():
@@ -9300,6 +9333,11 @@ REGRAS:
         # ===== Bot da POUSADA: tool-use (consultar disponibilidade + criar reserva no Einstein) =====
         try:
             import requests as req, json as _json
+            # Conhecimento VIVO do Einstein (treinamento + fatos + estado dos quartos),
+            # anexado DEPOIS do prompt do bot — o tom de voz da plataforma continua mandando.
+            _ctx_einstein = einstein_contexto(user)
+            if _ctx_einstein:
+                system_prompt = system_prompt + "\n\n==== CONHECIMENTO DA POUSADA (Einstein, ao vivo) ====\n" + _ctx_einstein
             msgs = list(api_messages)
             for _rodada in range(4):
                 resp = req.post("https://api.anthropic.com/v1/messages",

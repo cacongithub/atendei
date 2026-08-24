@@ -1029,6 +1029,30 @@ def _enviar_card_chegada(user, db_conn, conversation_id, reserva_input):
                                        buttons=d.get("botoes"), footer="Smart Center · Quixadá")
 
 
+def _responder_botao_atalho(user, to, button_id):
+    """Botões CONHECIDOS do card respondem sem IA: busca o texto pronto no Einstein
+    do cliente e envia. Retorna True se tratou (o webhook então pula a IA)."""
+    if button_id not in ("card_cardapio", "card_mapa"):
+        return None   # ex: card_falar -> segue pro fluxo normal da IA
+    import requests as req
+    base = (user.get("einstein_url") or "").rstrip("/")
+    etok = user.get("einstein_token") or ""
+    phone_id = user.get("whatsapp_phone_id") or ""
+    token = user.get("whatsapp_token") or ""
+    if not (base and etok and phone_id and token):
+        return None
+    try:
+        r = req.get(base + "/api/atendente/atalho/" + button_id,
+                    headers={"X-Einstein-Token": etok}, timeout=15)
+        d = r.json() if r.status_code == 200 else {}
+        if d.get("ok") and d.get("texto"):
+            send_whatsapp_message(phone_id, token, to, d["texto"])
+            return d["texto"]
+    except Exception as e:
+        safe_log(f"[ATALHO] falhou ({button_id}): {e} — caindo pra IA", level="WARN")
+    return None
+
+
 def generate_totp_secret():
     """Gera novo segredo TOTP (base32)"""
     try:
@@ -2934,14 +2958,15 @@ def process_whatsapp_media(msg, token):
 
     elif msg_type == "interactive":
         # Toque em BOTÃO de mensagem interativa (ex: card de chegada) ou item de lista.
-        # O título do botão vira o texto da mensagem — a IA responde como se o cliente
-        # tivesse digitado (ex: "☕ Cardápio" → responde o cardápio do conhecimento).
+        # O título vira o texto da mensagem; o ID fica em button_id — botões conhecidos
+        # (cardápio, mapa) são respondidos DETERMINISTICAMENTE no webhook, sem IA.
         inter = msg.get("interactive", {}) or {}
-        titulo = ((inter.get("button_reply") or {}).get("title")
-                  or (inter.get("list_reply") or {}).get("title") or "")
+        br = (inter.get("button_reply") or inter.get("list_reply") or {})
+        titulo = br.get("title") or ""
         result["type"] = "text"
         result["content"] = titulo or "[botão sem título]"
         result["description"] = f"Cliente tocou no botão: {titulo}"
+        result["button_id"] = br.get("id") or ""
 
     elif msg_type == "button":
         # Resposta a botão de TEMPLATE (formato antigo da Meta)
@@ -6514,6 +6539,17 @@ def whatsapp_webhook(user_id=None):
                         )
                         db_conn.commit()
                         continue
+
+                    # Botões do card (cardápio/mapa): resposta pronta do Einstein, sem IA
+                    _btn = media_result.get("button_id") or ""
+                    if _btn:
+                        _resp_btn = _responder_botao_atalho(user, sender_phone, _btn)
+                        if _resp_btn:
+                            db_conn.execute(
+                                "INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
+                                (conv["id"], "bot", _resp_btn, "text"))
+                            db_conn.commit()
+                            continue
 
                     ai_input = media_result.get("description", media_result["content"])
                     if media_result["type"] == "audio":

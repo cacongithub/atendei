@@ -1046,8 +1046,27 @@ def _responder_botao_atalho(user, to, button_id):
                     headers={"X-Einstein-Token": etok}, timeout=15)
         d = r.json() if r.status_code == 200 else {}
         if d.get("ok") and d.get("texto"):
-            send_whatsapp_message(phone_id, token, to, d["texto"])
-            return d["texto"]
+            texto = d["texto"]
+            # Em PARTES de até ~1200 chars (quebra em linha em branco): mensagens longas
+            # cheias de preços podem ser descartadas silenciosamente pelo filtro da Meta.
+            partes, atual = [], ""
+            for bloco in texto.split("\n\n"):
+                cand = (atual + "\n\n" + bloco).strip() if atual else bloco
+                if len(cand) > 1200 and atual:
+                    partes.append(atual)
+                    atual = bloco
+                else:
+                    atual = cand
+            if atual:
+                partes.append(atual)
+            import time as _t
+            for i, p in enumerate(partes):
+                rr = send_whatsapp_message(phone_id, token, to, p)
+                safe_log(f"[ATALHO] {button_id} parte {i+1}/{len(partes)} "
+                         f"({len(p)} chars) -> {'ok' if rr.get('success') else rr.get('error','erro')}")
+                if i < len(partes) - 1:
+                    _t.sleep(0.6)
+            return texto
     except Exception as e:
         safe_log(f"[ATALHO] falhou ({button_id}): {e} — caindo pra IA", level="WARN")
     return None
@@ -6486,6 +6505,17 @@ def whatsapp_webhook(user_id=None):
 
                 user = decrypt_user_row(raw_user)
                 resolved_user_id = user["id"]
+
+                # STATUS callbacks da Meta: é AQUI que aparecem os descartes silenciosos
+                # (mensagem aceita com 200 e depois 'failed' com código). Sem isso, envio
+                # que nunca chega fica invisível no log.
+                for st in value.get("statuses", []):
+                    if st.get("status") == "failed":
+                        for e in (st.get("errors") or [{}]):
+                            safe_log(f"[WA STATUS] ✗ FALHOU id={st.get('id','')[:24]} "
+                                     f"code={e.get('code','')} title={str(e.get('title',''))[:80]} "
+                                     f"detail={str((e.get('error_data') or {}).get('details',''))[:120]}",
+                                     level="ERROR")
 
                 for msg in value.get("messages", []):
                     wamid = msg.get("id", "")

@@ -2065,7 +2065,7 @@ def register_processed_webhook_event(source, event_key, user_id=None, payload=No
     if not source or not event_key:
         return False
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=15)
         db_conn.execute(
             """INSERT INTO processed_webhook_events (source, event_key, user_id, payload_preview)
                VALUES (?,?,?,?)""",
@@ -2077,8 +2077,10 @@ def register_processed_webhook_event(source, event_key, user_id=None, payload=No
     except sqlite3.IntegrityError:
         return False
     except Exception as e:
-        safe_log(f"[WEBHOOK EVENT] Falha ao registrar {source}:{event_key} -> {e}", level="ERROR")
-        return False
+        # Falha de INFRA (ex.: database is locked) não é duplicata: melhor arriscar uma
+        # resposta repetida do que descartar a mensagem do cliente em silêncio.
+        safe_log(f"[WEBHOOK EVENT] Falha ao registrar {source}:{event_key} -> {e} (processando mesmo assim)", level="ERROR")
+        return True
 
 
 def resolve_user_by_whatsapp_phone_id(db_conn, phone_number_id):
@@ -6514,7 +6516,7 @@ def whatsapp_webhook(user_id=None):
 
     data = request.json or {}
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=15)
         db_conn.row_factory = sqlite3.Row
 
         for entry in data.get("entry", []):
@@ -6580,6 +6582,9 @@ def whatsapp_webhook(user_id=None):
                         (conv["id"], "customer", media_result["content"], media_result["type"], media_result.get("media_path", ""), wamid)
                     )
                     db_conn.execute("UPDATE conversations SET last_message_at=datetime('now') WHERE id=?", (conv["id"],))
+                    # Commit JÁ: sem isso a transação de escrita fica aberta durante a
+                    # geração da IA/TTS (5-40s) e trava o dedup de mensagens concorrentes.
+                    db_conn.commit()
 
                     if conv["is_human_takeover"]:
                         db_conn.commit()

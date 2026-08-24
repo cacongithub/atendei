@@ -1024,8 +1024,32 @@ def _enviar_card_chegada(user, db_conn, conversation_id, reserva_input):
                  headers={"X-Einstein-Token": etok}, timeout=20)
     d = r.json() if r.status_code == 200 else {}
     if d.get("ok") and d.get("texto"):
-        send_whatsapp_interactive_card(phone_id, token, to, d["texto"],
-                                       image_url=d.get("imagem_url", ""),
+        # LAYOUT EM DUAS MENSAGENS (imagem separada dos botões): com a imagem no
+        # cabeçalho da interativa, o toque no card abria a foto em tela cheia e o
+        # hóspede não achava os botões. Agora: 1ª msg = imagem com o texto na
+        # legenda; 2ª msg = SÓ os botões, numa bolha própria, impossível de errar.
+        img = d.get("imagem_url", "")
+        if img:
+            try:
+                import requests as _rq
+                _rq.post(f"https://graph.facebook.com/v18.0/{phone_id}/messages",
+                         headers={"Authorization": f"Bearer {token}",
+                                  "Content-Type": "application/json"},
+                         json={"messaging_product": "whatsapp", "to": to, "type": "image",
+                               "image": {"link": img, "caption": d["texto"][:1024]}},
+                         timeout=20)
+            except Exception as e:
+                safe_log(f"[CARD] imagem separada falhou: {e}", level="WARN")
+                img = ""
+        if not img:
+            # sem imagem: o texto vai no corpo da mensagem dos botões mesmo
+            send_whatsapp_interactive_card(phone_id, token, to, d["texto"],
+                                           buttons=d.get("botoes"), footer="Smart Center · Quixadá")
+            return
+        import time as _t
+        _t.sleep(0.6)
+        send_whatsapp_interactive_card(phone_id, token, to,
+                                       "O que você precisa? Toque numa opção 👇",
                                        buttons=d.get("botoes"), footer="Smart Center · Quixadá")
 
 

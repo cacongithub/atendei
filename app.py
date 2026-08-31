@@ -1830,7 +1830,9 @@ def perform_database_backup():
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_filename = f"atendeia-{timestamp}.db"
+        # PID no nome: com 2 workers, o timestamp por segundo colidia — um apagava
+        # o arquivo do outro no meio do backup (Errno 2 em 24/08/2026).
+        backup_filename = f"atendeia-{timestamp}-p{os.getpid()}.db"
         backup_path = os.path.join(BACKUP_DIR, backup_filename)
 
         # 1. Backup consistente via API SQLite (não copia arquivo bruto)
@@ -2043,10 +2045,16 @@ def start_daily_maintenance_scheduler():
 
                 # Roda uma vez por dia, na hora alvo
                 if now.hour == target_hour_utc and last_run_date != today_key:
+                    # ELEIÇÃO DE LÍDER: com 2 workers Gunicorn, os DOIS rodavam a
+                    # rotina ao mesmo tempo (backup duplicado + corrida). O INSERT
+                    # com UNIQUE decide atomicamente quem executa hoje.
+                    last_run_date = today_key
+                    if not register_processed_webhook_event("maintenance", f"daily-{today_key}"):
+                        safe_log("[MAINTENANCE] outro worker ja esta cuidando da rotina de hoje")
+                        continue
                     safe_log(f"[MAINTENANCE] Iniciando rotina diária às {now.isoformat()} UTC")
                     perform_database_backup()
                     perform_retention_cleanup()
-                    last_run_date = today_key
                     safe_log("[MAINTENANCE] Rotina diária concluída")
 
             except Exception as e:
@@ -2058,6 +2066,38 @@ def start_daily_maintenance_scheduler():
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
     safe_log("[MAINTENANCE] Scheduler diário (backup + retenção) iniciado — roda às 06h UTC (~03h BRT)")
+
+
+def start_db_lock_sentinel():
+    """Auto-cura do 'database is locked' eterno (incidentes 24/08 e 01/09/2026):
+    a cada 60s faz um write de teste com timeout de 5s. Se falhar por lock 5
+    minutos SEGUIDOS, o worker se mata (os._exit) — o Gunicorn renasce o worker
+    em ~1s e, como a conexão presa vive dentro de um worker pendurado, a morte
+    dos workers SOLTA a trava. A Meta reenvia os webhooks do intervalo."""
+    def loop():
+        falhas = 0
+        while True:
+            time.sleep(60)
+            try:
+                con = sqlite3.connect(DATABASE, timeout=5)
+                con.execute("CREATE TABLE IF NOT EXISTS db_heartbeat (k INTEGER PRIMARY KEY, ts TEXT)")
+                con.execute("INSERT OR REPLACE INTO db_heartbeat (k, ts) VALUES (1, datetime('now'))")
+                con.commit()
+                con.close()
+                falhas = 0
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower():
+                    falhas += 1
+                    safe_log(f"[DB-SENTINELA] write de teste travado ({falhas}/5)", level="ERROR")
+                    if falhas >= 5:
+                        safe_log("[DB-SENTINELA] banco preso ha 5 min — reiniciando este worker pra soltar a trava", level="ERROR")
+                        os._exit(1)
+                else:
+                    falhas = 0
+            except Exception:
+                pass
+    threading.Thread(target=loop, daemon=True).start()
+    safe_log("[DB-SENTINELA] vigia de trava do banco ativo (write de teste a cada 60s)")
 
 
 def register_processed_webhook_event(source, event_key, user_id=None, payload=None):
@@ -12133,6 +12173,7 @@ if _is_scheduler_leader():
     # LGPD: Inicia scheduler diário de backup + retenção (em background)
     try:
         start_daily_maintenance_scheduler()
+        start_db_lock_sentinel()
         safe_log("[MAINTENANCE] Scheduler diário ativo (backup + retenção LGPD)")
     except Exception as e:
         safe_log(f"[MAINTENANCE] Não foi possível iniciar: {e}", level="ERROR")

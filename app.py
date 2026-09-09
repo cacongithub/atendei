@@ -385,6 +385,14 @@ def close_db(exc):
 
 def init_db():
     db = sqlite3.connect(DATABASE, timeout=30)
+    # (09/09/2026) WAL garantido no arranque e CONFERIDO: em modo 'delete', leitura bloqueia
+    # escrita (backup das 06h e leituras longas viram "database is locked"). print() de proposito:
+    # init_db pode rodar antes de safe_log existir.
+    try:
+        _jm = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        print(f"[STORAGE] journal_mode={_jm}" + ("" if str(_jm).lower() == "wal" else "  <<< NAO E WAL: leitura bloqueia escrita"), flush=True)
+    except Exception as _je:
+        print(f"[STORAGE] journal_mode: erro ao definir WAL: {_je}", flush=True)
     db.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2089,6 +2097,22 @@ def start_db_lock_sentinel():
                 if "locked" in str(e).lower():
                     falhas += 1
                     safe_log(f"[DB-SENTINELA] write de teste travado ({falhas}/5)", level="ERROR")
+                    # (09/09/2026) DIAGNOSTICO: quem esta segurando a transacao? Mostra a pilha de
+                    # cada thread deste worker (so quadros do app.py). O culpado aparece parado em
+                    # sleep/requests com o caminho do app.py logo acima.
+                    try:
+                        import sys as _sys, traceback as _tb
+                        _nomes = {t.ident: t.name for t in threading.enumerate()}
+                        _lins = []
+                        for _tid, _fr in _sys._current_frames().items():
+                            _pts = [f"{_f.name}:{_f.lineno}" for _f in _tb.extract_stack(_fr)
+                                    if _f.filename.endswith("app.py")]
+                            if _pts and not (len(_pts) == 1 and _pts[0].startswith("loop:")):
+                                _lins.append(_nomes.get(_tid, str(_tid)) + "=" + ">".join(_pts[-7:]))
+                        safe_log("[DB-SENTINELA] pilhas deste worker: " + (" | ".join(_lins) or "(nenhuma thread no app.py)")[:1900],
+                                 level="ERROR")
+                    except Exception as _de:
+                        safe_log(f"[DB-SENTINELA] pilhas: erro {_de}", level="ERROR")
                     if falhas >= 5:
                         safe_log("[DB-SENTINELA] banco preso ha 5 min — reiniciando este worker pra soltar a trava", level="ERROR")
                         os._exit(1)

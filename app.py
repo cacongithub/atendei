@@ -372,7 +372,7 @@ PLANS = {
 # ─── DATABASE ──────────────────────────────────────────────────
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE)
+        g.db = sqlite3.connect(DATABASE, timeout=30)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA journal_mode=WAL")
         g.db.execute("PRAGMA foreign_keys=ON")
@@ -384,7 +384,7 @@ def close_db(exc):
     if db: db.close()
 
 def init_db():
-    db = sqlite3.connect(DATABASE)
+    db = sqlite3.connect(DATABASE, timeout=30)
     db.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1188,7 +1188,7 @@ def log_admin_action(action, target_type="", target_id="", details=""):
     try:
         ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()[:45]
         ua = (request.headers.get('User-Agent') or '')[:200]
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.execute(
             """INSERT INTO admin_audit_log (action, target_type, target_id, ip_address, user_agent, details)
                VALUES (?,?,?,?,?,?)""",
@@ -1836,7 +1836,7 @@ def perform_database_backup():
         backup_path = os.path.join(BACKUP_DIR, backup_filename)
 
         # 1. Backup consistente via API SQLite (não copia arquivo bruto)
-        src = sqlite3.connect(DATABASE)
+        src = sqlite3.connect(DATABASE, timeout=30)
         dst = sqlite3.connect(backup_path)
         with dst:
             src.backup(dst)
@@ -1959,7 +1959,7 @@ def perform_retention_cleanup():
     Retorna dict com estatísticas ou None em caso de falha.
     """
     try:
-        db = sqlite3.connect(DATABASE)
+        db = sqlite3.connect(DATABASE, timeout=30)
         db.row_factory = sqlite3.Row
         total_msgs_deleted = 0
         total_convs_deleted = 0
@@ -2341,7 +2341,7 @@ def migrate_encrypt_user_tokens():
     """Migra tokens por usuário em texto puro para formato Fernet criptografado.
     Roda uma vez no startup — identifica linhas não-criptografadas e criptografa."""
     try:
-        db = sqlite3.connect(DATABASE)
+        db = sqlite3.connect(DATABASE, timeout=30)
         db.row_factory = sqlite3.Row
         rows = db.execute(f"SELECT id, {', '.join(USER_ENCRYPTED_FIELDS)} FROM users").fetchall()
         fernet = _get_fernet()
@@ -2412,7 +2412,7 @@ SENSITIVE_SETTINGS = {
 def get_setting(key, default=""):
     """Busca config do banco, se não existir usa variável de ambiente"""
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         row = db_conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
         db_conn.close()
         if row and row[0]:
@@ -2430,7 +2430,7 @@ def set_setting(key, value):
     """Salva config no banco. Criptografa se for campo sensível."""
     # Criptografa campos sensíveis antes de salvar
     stored_value = _encrypt_value(value) if key in SENSITIVE_SETTINGS else value
-    db_conn = sqlite3.connect(DATABASE)
+    db_conn = sqlite3.connect(DATABASE, timeout=30)
     db_conn.execute("INSERT OR REPLACE INTO system_settings (key, value) VALUES (?, ?)", (key, stored_value))
     db_conn.commit()
     db_conn.close()
@@ -2483,7 +2483,7 @@ def send_verification_code(email):
     expires = (datetime.now() + timedelta(minutes=30)).isoformat()
     code_hash = hash_verification_code(code)
 
-    db_conn = sqlite3.connect(DATABASE)
+    db_conn = sqlite3.connect(DATABASE, timeout=30)
     db_conn.execute("DELETE FROM verification_codes WHERE email=?", (email,))
     db_conn.execute("INSERT INTO verification_codes (email, code, expires_at) VALUES (?,?,?)", (email, code_hash, expires))
     db_conn.commit()
@@ -2511,7 +2511,7 @@ def verify_code(email, code):
     """Verifica se o código é válido. Compara hash, não texto puro."""
     if not email or not code:
         return False
-    db_conn = sqlite3.connect(DATABASE)
+    db_conn = sqlite3.connect(DATABASE, timeout=30)
     db_conn.row_factory = sqlite3.Row
     code_hash = hash_verification_code(code)
     row = db_conn.execute(
@@ -2562,7 +2562,7 @@ def log_webhook_error(source, user_id, error_type, error_message, payload=None):
     Não falha se o DB estiver down — só imprime no log."""
     try:
         preview = _safe_payload_preview(payload)
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.execute(
             """INSERT INTO webhook_errors
                (user_id, source, error_type, error_message, payload_preview)
@@ -3059,6 +3059,20 @@ def process_whatsapp_media(msg, token):
         result["type"] = "text"
         result["content"] = titulo or "[botão sem título]"
         result["description"] = f"Cliente tocou no botão: {titulo}"
+
+    elif msg_type == "unsupported":
+        # (09/09/2026) A Meta NAO entregou o conteudo (erro 131051): vem so a casca com o tipo
+        # original (button, interactive, edit, poll...). Mostrar esse tipo diz ao dono o que o
+        # remetente usou — e o que pedir para ele trocar. O texto nunca chega: nao ha o que exibir.
+        _sub = ((msg.get("unsupported") or {}).get("type") or "").strip()
+        _errs = msg.get("errors") or []
+        _e0 = _errs[0] if (_errs and isinstance(_errs[0], dict)) else {}
+        _cod = _e0.get("code") or ""
+        _det = ((_e0.get("error_data") or {}).get("details") or "").strip()
+        result["content"] = ("[unsupported%s] A Meta não entrega este formato para número de API%s. "
+                             "O conteúdo não chegou — peça ao remetente para enviar como texto simples."
+                             % ((": " + _sub) if _sub else "", (" (erro %s)" % _cod) if _cod else ""))
+        result["description"] = result["content"] + ((" " + _det) if _det else "")
 
     else:
         result["content"] = f"[{msg_type}] Tipo de mensagem não suportado"
@@ -5075,7 +5089,7 @@ def resend_code():
 
     # Cooldown 60s por email: evita flood do mesmo destinatário
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
         recent = db_conn.execute(
             """SELECT created_at FROM verification_codes
@@ -6258,7 +6272,7 @@ def mp_webhook():
                     log_webhook_error("mercadopago", uid, "InvalidPaymentData", f"amount={amount} currency={currency} ref={ext}", {"payment_id": pid})
                     return jsonify({"status":"invalid_payment_data"}), 200
 
-                db_c = sqlite3.connect(DATABASE)
+                db_c = sqlite3.connect(DATABASE, timeout=30)
                 db_c.row_factory = sqlite3.Row
                 user_row = db_c.execute("SELECT id FROM users WHERE id=?", (uid,)).fetchone()
                 if not user_row:
@@ -6675,7 +6689,7 @@ def whatsapp_webhook(user_id=None):
                                         sender_phone,
                                         commerce_msg
                                     )
-                                    db_conn = sqlite3.connect(DATABASE)
+                                    db_conn = sqlite3.connect(DATABASE, timeout=30)
                                     db_conn.row_factory = sqlite3.Row
                                     db_conn.execute(
                                         "INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
@@ -6685,7 +6699,7 @@ def whatsapp_webhook(user_id=None):
                                     db_conn.commit()
                                     commerce_triggered = True
                                 else:
-                                    db_conn = sqlite3.connect(DATABASE)
+                                    db_conn = sqlite3.connect(DATABASE, timeout=30)
                                     db_conn.row_factory = sqlite3.Row
 
                     if commerce_triggered:
@@ -6802,7 +6816,7 @@ def webhook_instagram(user_id):
 
     data = request.json or {}
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
         raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not raw_user:
@@ -6959,7 +6973,7 @@ def webhook_messenger(user_id):
 
     data = request.json or {}
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
         raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not raw_user:
@@ -7220,7 +7234,7 @@ def describe_image_for_caption(image_path):
 def create_social_post(user_id, media_id=None):
     """Cria um post: escolhe mídia, gera legenda, envia para Telegram aprovar"""
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
 
         raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
@@ -7858,7 +7872,7 @@ def run_social_scheduler():
     Usa UPDATE condicional como lock atômico — garante que apenas 1 worker dispara
     o post mesmo com múltiplas instâncias Gunicorn."""
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
 
         now = datetime.now()
@@ -8165,7 +8179,7 @@ def create_order_from_intent(user, conversation_id, customer_phone, purchase_dat
         MIN_ORDER_TOTAL = 1.00
         MAX_ITEMS_PER_ORDER = 20
 
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
 
         # Anti-duplicidade: checa se criou pedido similar recentemente
@@ -8388,7 +8402,7 @@ def mp_commerce_webhook(user_id):
         # Determina qual secret usar — tenant primeiro, global como fallback
         tenant_secret = ""
         try:
-            db_lookup = sqlite3.connect(DATABASE)
+            db_lookup = sqlite3.connect(DATABASE, timeout=30)
             db_lookup.row_factory = sqlite3.Row
             row = db_lookup.execute("SELECT mp_webhook_secret FROM users WHERE id=?", (user_id,)).fetchone()
             db_lookup.close()
@@ -8413,7 +8427,7 @@ def mp_commerce_webhook(user_id):
         if not register_processed_webhook_event("mercadopago_commerce", event_key, user_id, {"id": payment_id}):
             return jsonify({"status": "duplicate"}), 200
 
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
 
         raw_user = db_conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
@@ -8852,7 +8866,7 @@ def run_campaign(campaign_id):
     """Processa uma campanha enviando mensagens com rate limit"""
     try:
         import time as t_mod
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
 
         campaign = db_conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
@@ -8887,6 +8901,7 @@ def run_campaign(campaign_id):
                     "UPDATE campaign_contacts SET status='failed', error=? WHERE id=?",
                     (window_error[:200], contact["id"])
                 )
+                db_conn.commit()   # (09/09/2026) nao deixar transacao aberta ate o proximo envio
                 failed += 1
                 continue
 
@@ -8937,6 +8952,11 @@ def run_campaign(campaign_id):
                 )
                 db_conn.commit()
 
+            # (09/09/2026) COMMIT antes de dormir e antes da proxima chamada de rede. Sem isto o
+            # UPDATE acima deixava a transacao de escrita ABERTA durante o sleep e o envio seguinte,
+            # por ate 10 contatos (commit so a cada 10) = trava de escrita continua por minutos,
+            # webhook e vigia sem conseguir gravar ("database is locked" de 24/08, 01/09 e 09/09).
+            db_conn.commit()
             # Rate limit: 1 mensagem a cada 2 segundos (30/min)
             t_mod.sleep(2)
 
@@ -9538,6 +9558,7 @@ REGRAS:
                 cost = (tokens_in * 3 / 1000000) + (tokens_out * 15 / 1000000)
                 db_conn.execute("INSERT INTO api_usage_log (user_id,api_name,tokens_in,tokens_out,cost_estimate) VALUES (?,?,?,?,?)",
                     (user["id"],"anthropic",tokens_in,tokens_out,cost))
+                db_conn.commit()   # (09/09/2026) solta a trava de escrita antes de devolver
                 return result["content"][0]["text"]
             else:
                 safe_log(f"Claude error: {resp.status_code} {_short_resp_text(resp)}", level="ERROR")
@@ -9563,6 +9584,7 @@ REGRAS:
                 db_conn.execute("INSERT INTO api_usage_log (user_id,api_name,tokens_in,tokens_out,cost_estimate) VALUES (?,?,?,?,?)",
                     (user["id"],"anthropic",u.get("input_tokens",0),u.get("output_tokens",0),
                      (u.get("input_tokens",0)*3/1000000)+(u.get("output_tokens",0)*15/1000000)))
+                db_conn.commit()   # (09/09/2026) a tool do Einstein (ngrok) e a 2a chamada vem a seguir: nao segurar a trava
                 if result.get("stop_reason") == "tool_use":
                     msgs.append({"role":"assistant","content":result["content"]})
                     tr = []
@@ -9601,6 +9623,7 @@ REGRAS:
                 cost = (tokens_in * 0.15 / 1000000) + (tokens_out * 0.6 / 1000000)
                 db_conn.execute("INSERT INTO api_usage_log (user_id,api_name,tokens_in,tokens_out,cost_estimate) VALUES (?,?,?,?,?)",
                     (user["id"],"openai",tokens_in,tokens_out,cost))
+                db_conn.commit()   # (09/09/2026)
                 return result["choices"][0]["message"]["content"]
             else:
                 safe_log(f"OpenAI error: {resp.status_code} {_short_resp_text(resp)}", level="ERROR")
@@ -9793,7 +9816,7 @@ def send_whatsapp_image(phone_id, token, to, image_path, caption=""):
 def find_matching_product(user_id, message):
     """Encontra produto na galeria que combina com a mensagem do cliente"""
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
         products = db_conn.execute(
             "SELECT * FROM product_gallery WHERE user_id=?", (user_id,)
@@ -11342,7 +11365,7 @@ open("atendeia-backup.db", "wb").write(Fernet(key).decrypt(ct))</pre>
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         tmp_path = tmp.name
         tmp.close()
-        src = sqlite3.connect(DATABASE)
+        src = sqlite3.connect(DATABASE, timeout=30)
         dst = sqlite3.connect(tmp_path)
         with dst:
             src.backup(dst)
@@ -11917,7 +11940,7 @@ def migrate_recrypt_to_new_data_key():
     }
 
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
 
         # ─── (1) USERS: campos criptografados ───
@@ -12014,7 +12037,7 @@ def migrate_encrypt_existing_secrets():
         safe_log("[MIGRATION] ⚠️ DEV: criptografia indisponível, migração pulada", level="WARN")
         return
     try:
-        db_conn = sqlite3.connect(DATABASE)
+        db_conn = sqlite3.connect(DATABASE, timeout=30)
         db_conn.row_factory = sqlite3.Row
         migrated = 0
         for key in SENSITIVE_SETTINGS:

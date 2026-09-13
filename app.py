@@ -725,6 +725,7 @@ def init_db():
         ("users", "mp_public_key", "TEXT DEFAULT ''"),
         ("users", "commerce_enabled", "INTEGER DEFAULT 0"),
         ("users", "auto_payment_enabled", "INTEGER DEFAULT 1"),
+        ("users", "cv_email", "TEXT DEFAULT ''"),          # (13/09/2026) e-mail que recebe curriculos do WhatsApp
         ("product_gallery", "price", "REAL DEFAULT 0"),
         ("product_gallery", "stock", "INTEGER DEFAULT -1"),
         ("product_gallery", "sku", "TEXT DEFAULT ''"),
@@ -2460,9 +2461,143 @@ def set_setting(key, value):
     db_conn.close()
 
 
+# ─── CURRÍCULOS PELO WHATSAPP (13/09/2026) ─────────────────────
+# Candidato manda o currículo (PDF/Word/foto) na conversa; se o negócio tem users.cv_email, o
+# arquivo vai em anexo por e-mail e o bot responde sem IA. Detecção conservadora: só trata como
+# currículo quando há sinal claro (nome do arquivo, texto do PDF, legenda ou conversa falando em
+# vaga/currículo). Caso contrário o documento segue o fluxo normal.
+# nome do arquivo: "Curriculo Joao.pdf", "CV_Joao.pdf", "resume.pdf" (nao "Matriz_Curricular.pdf")
+_CV_RE_ARQ = re.compile(r"curr[ií]cul[oa]s?(?![a-z])|curriculum|(?<![a-z])cv(?![a-z])|(?<![a-z])resume(?![a-z])|vitae", re.I)
+# legenda e historico da conversa: so termos inequivocos ("vaga pra sabado?" e "contratar o plano" NAO contam)
+_CV_RE_CTX = re.compile(r"curr[ií]cul[oa]s?(?![a-z])|curriculum|vitae|candidat|recrut|vagas? (de|para) (emprego|trabalho|est[áa]gio)|"
+                        r"oportunidade de (emprego|trabalho)|banco de talentos", re.I)
+# texto extraido do PDF / descricao da foto
+_CV_RE_DOC = re.compile(r"curr[ií]cul[oa]s?(?![a-z])|curriculum|vitae|experi[êe]ncias? profissiona|forma[çc][ãa]o (acad|escolar)|"
+                        r"escolaridade|objetivo profissional", re.I)
+_CV_MAX_BYTES = 8 * 1024 * 1024         # base64+JSON no webhook sincrono: 8 MB de arquivo ja e folga (curriculo tem < 2 MB)
+_CV_EXT_OK = (".pdf", ".doc", ".docx", ".odt", ".rtf", ".txt", ".jpg", ".jpeg", ".png")
+_CV_RESPOSTAS_BOT = ("Recebi seu currículo", "não consegui encaminhá-lo", "Já recebemos seu currículo")
+
+
+def _cv_email_do_usuario(user):
+    try:
+        v = user["cv_email"] if ("cv_email" in user.keys()) else ""
+    except Exception:
+        v = ""
+    v = (v or "").strip()
+    return v if (v and _EMAIL_RE.fullmatch(v)) else ""
+
+
+def _cv_parece_curriculo(media_result, msg, db_conn, conversation_id):
+    """True se o documento/imagem recebido parece um currículo."""
+    tipo = media_result.get("type", "")
+    if tipo == "document":
+        nome = msg.get("document", {}).get("filename", "") or ""
+        if _CV_RE_ARQ.search(nome):
+            return True
+    legenda = (msg.get(tipo, {}) or {}).get("caption", "") if isinstance(msg.get(tipo), dict) else ""
+    texto = (media_result.get("description") or "")[:3000]
+    if _CV_RE_CTX.search(legenda or "") or (tipo == "document" and _CV_RE_DOC.search(texto)):
+        return True
+    if tipo == "image" and _CV_RE_DOC.search(texto):
+        return True
+    # contexto: o que o candidato disse antes, ou o bot ja falou de vaga/curriculo nesta conversa
+    try:
+        rows = db_conn.execute(
+            "SELECT sender, content FROM messages WHERE conversation_id=? ORDER BY created_at DESC, id DESC LIMIT 7",
+            (conversation_id,)).fetchall()
+    except Exception:
+        rows = []
+    for r in rows[1:]:      # rows[0] e a propria mensagem do arquivo, ja gravada
+        c = r["content"] or ""
+        if r["sender"] == "bot" and any(t in c for t in _CV_RESPOSTAS_BOT):
+            break           # a propria resposta de curriculo do bot nao pode disparar outro envio
+        if r["sender"] in ("customer", "bot") and _CV_RE_CTX.search(c):
+            return True
+    return False
+
+
+def _cv_encaminhar(user, conv, sender_phone, media_result, msg):
+    """Manda o arquivo em anexo para cv_email. Devolve True/False. Nunca levanta exceção."""
+    destino = _cv_email_do_usuario(user)
+    caminho = media_result.get("media_path") or ""
+    if not destino or not caminho or not os.path.exists(caminho):
+        return False
+    try:
+        tam = os.path.getsize(caminho)
+        if tam > _CV_MAX_BYTES:
+            safe_log(f"[CV] arquivo de {tam // 1024} KB acima do limite; nao encaminhado", level="WARN")
+            return False
+        with open(caminho, "rb") as f:
+            conteudo = base64.b64encode(f.read()).decode("ascii")
+        tipo = media_result.get("type", "")
+        nome_arq = (msg.get("document", {}).get("filename", "") if tipo == "document" else "") or ""
+        if not nome_arq:
+            nome_arq = "curriculo" + (os.path.splitext(caminho)[1] or ".bin")
+        nome_arq = re.sub(r"[^A-Za-z0-9._ -]", "_", nome_arq)
+        _b, _x = os.path.splitext(nome_arq); nome_arq = _b[:110] + _x[:10]
+        if _x.lower() not in _CV_EXT_OK:
+            safe_log(f"[CV] extensao recusada ({_x.lower()[:10]}); nao encaminhado", level="WARN")
+            return False
+        quem = (conv["customer_name"] or "").strip() if ("customer_name" in conv.keys()) else ""
+        legenda = (msg.get(tipo, {}) or {}).get("caption", "") if isinstance(msg.get(tipo), dict) else ""
+        trecho = (media_result.get("description") or "")[:1500] if tipo == "document" else ""
+        e = lambda t: str(t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        html = (f"<p>Currículo recebido pelo WhatsApp do atendente.</p>"
+                f"<p><b>Nome:</b> {e(quem) or '(sem nome no WhatsApp)'}<br>"
+                f"<b>WhatsApp:</b> +{e(sender_phone)}<br>"
+                f"<b>Recebido em:</b> {datetime.now(BRAZIL_TZ).strftime('%d/%m/%Y %H:%M')}<br>"
+                f"<b>Arquivo:</b> {e(nome_arq)}</p>"
+                + (f"<p><b>Mensagem do candidato:</b> {e(legenda)}</p>" if legenda else "")
+                + (f"<p><b>Início do texto do currículo:</b><br>{e(trecho).replace(chr(10), '<br>')}</p>" if trecho else "")
+                + "<p style='color:#888;font-size:12px'>Responda ao candidato pelo WhatsApp acima. Dados pessoais: use só para o processo seletivo.</p>")
+        assunto = "Currículo recebido pelo WhatsApp: " + (quem or ("+" + str(sender_phone)))
+        record_login_attempt(f"{user['id']}:{sender_phone}", window=86400, scope="cv")
+        record_login_attempt(str(user["id"]), window=86400, scope="cv_tenant")
+        ok = send_email(destino, assunto, html, attachments=[{"filename": nome_arq, "content": conteudo}])
+        safe_log(f"[CV] curriculo de {mask_phone(sender_phone)} -> {mask_email(destino)}: {'enviado' if ok else 'FALHOU'}")
+        return bool(ok)
+    except Exception as ex:
+        safe_log(f"[CV] erro ao encaminhar curriculo de {mask_phone(sender_phone)}: {ex}", level="ERROR")
+        return False
+
+
+def _cv_tratar(user, conv, sender_phone, media_result, msg, db_conn):
+    """Se a midia recebida for um curriculo, encaminha e devolve a resposta pronta para o candidato.
+    Devolve None quando nao e curriculo (ou o recurso esta desligado) -> segue o fluxo normal."""
+    destino = _cv_email_do_usuario(user)
+    if not destino or media_result.get("type") not in ("document", "image"):
+        return None
+    if not _cv_parece_curriculo(media_result, msg, db_conn, conv["id"]):
+        return None
+    nome = ((conv["customer_name"] or "").strip().split(" ")[0] if ("customer_name" in conv.keys()) else "")
+    if not nome.isalpha():
+        nome = ""           # emoji, iniciais, numeros: melhor sem nome
+    ola = f"Obrigado, {nome}! " if nome else "Obrigado! "
+    # limite: 3 curriculos por contato/dia e 30 por negocio/dia — a cota do Resend e compartilhada
+    # com os codigos de login/cadastro de toda a plataforma
+    _chave = f"{user['id']}:{sender_phone}"
+    if (not check_rate_limit(_chave, max_attempts=3, window=86400, scope="cv")
+            or not check_rate_limit(str(user["id"]), max_attempts=30, window=86400, scope="cv_tenant")):
+        safe_log(f"[CV] limite diario atingido para {mask_phone(sender_phone)}", level="WARN")
+        return ola + f"Já recebemos seu currículo. Se precisar atualizar, envie para o e-mail {destino}. 🙂"
+    if _cv_encaminhar(user, conv, sender_phone, media_result, msg):
+        try:
+            db_conn.execute("INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
+                            (conv["id"], "system", f"[Currículo encaminhado por e-mail para {destino}]", "system"))
+            db_conn.commit()
+        except Exception:
+            pass
+        return (ola + "Recebi seu currículo e já encaminhei para a nossa equipe. "
+                "Ele fica no nosso banco de talentos e, se surgir uma oportunidade compatível, entramos em contato por aqui. 🙂")
+    return (ola + "Recebi seu arquivo, mas não consegui encaminhá-lo automaticamente agora. "
+            f"Por favor, envie seu currículo para o e-mail {destino} — a equipe recebe por lá. 🙂")
+
+
 # ─── EMAIL ─────────────────────────────────────────────────────
-def send_email(to_email, subject, html_body):
-    """Envia email via Resend API. Logs mascarados (LGPD)."""
+def send_email(to_email, subject, html_body, attachments=None):
+    """Envia email via Resend API. Logs mascarados (LGPD).
+    attachments (opcional): lista de {"filename": str, "content": base64 str} — formato do Resend."""
     resend_key = get_setting("RESEND_API_KEY", "")
     from_email = get_setting("RESEND_FROM_EMAIL", "atendente.online <onboarding@resend.dev>")
     masked = mask_email(to_email) if to_email else "(empty)"
@@ -2475,8 +2610,9 @@ def send_email(to_email, subject, html_body):
         import requests as req
         resp = req.post("https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
-            json={"from": from_email, "to": [to_email], "subject": subject, "html": html_body},
-            timeout=15)
+            json=dict({"from": from_email, "to": [to_email], "subject": subject, "html": html_body},
+                      **({"attachments": attachments} if attachments else {})),
+            timeout=40 if attachments else 15)
         if resp.status_code == 200:
             # Loga só o tipo do email (primeira palavra do subject), nunca código nem email completo
             subject_kind = (subject or "").split(":")[0][:50]
@@ -5619,9 +5755,14 @@ def training():
                 db.execute("INSERT INTO knowledge_base (user_id,title,content,category) VALUES (?,?,?,?)", (user["id"],title,ct,cat))
                 db.commit(); msg = '<div class="alert alert-success">Item adicionado!</div>'
         elif action == "update_prompt":
-            db.execute("UPDATE users SET ai_system_prompt=?,ai_tone=?,ai_greeting=? WHERE id=?",
-                (request.form.get("system_prompt",""), request.form.get("tone","profissional"), request.form.get("greeting",""), user["id"]))
+            _cv_mail = (request.form.get("cv_email", "") or "").strip()
+            if _cv_mail and not _EMAIL_RE.fullmatch(_cv_mail):
+                _cv_mail = ""       # e-mail invalido = recurso desligado (a tela avisa)
+            db.execute("UPDATE users SET ai_system_prompt=?,ai_tone=?,ai_greeting=?,cv_email=? WHERE id=?",
+                (request.form.get("system_prompt",""), request.form.get("tone","profissional"), request.form.get("greeting",""), _cv_mail, user["id"]))
             db.commit(); msg = '<div class="alert alert-success">IA atualizada!</div>'
+            if (request.form.get("cv_email", "") or "").strip() and not _cv_mail:
+                msg = '<div class="alert alert-error">E-mail de currículos inválido — recurso desligado. Os outros campos foram salvos.</div>'
             user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         elif action == "delete_kb":
             db.execute("DELETE FROM knowledge_base WHERE id=? AND user_id=?", (request.form.get("kb_id"), user["id"]))
@@ -5693,6 +5834,9 @@ def training():
                 <option value="formal" {'selected' if user['ai_tone']=='formal' else ''}>Formal</option>
                 <option value="amigavel" {'selected' if user['ai_tone']=='amigavel' else ''}>Amigável</option></select></div>
             <div class="form-group"><label class="form-label">Saudação</label><input type="text" name="greeting" class="form-input" value="{user['ai_greeting']}"></div>
+            <div class="form-group"><label class="form-label">📎 E-mail para receber currículos</label>
+                <input type="email" name="cv_email" class="form-input" placeholder="vazio = desligado" value="{esc(_cv_email_do_usuario(user))}">
+                <small style="color:#888">Quem mandar currículo (PDF, Word ou foto) pela conversa recebe confirmação e o arquivo chega neste e-mail em anexo. Se o envio falhar, o bot pede para mandar direto para este e-mail.</small></div>
             <button type="submit" class="btn btn-primary">Salvar</button></form></div>
         <div class="card fade-in fade-in-2"><div class="card-header"><span class="card-title">Adicionar conhecimento</span></div>
             <form method="POST">{csrf_field()}<input type="hidden" name="action" value="add_knowledge">
@@ -6686,6 +6830,18 @@ def whatsapp_webhook(user_id=None):
                                 "INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
                                 (conv["id"], "bot", _resp_btn, "text"))
                             db_conn.commit()
+                            continue
+
+                    # (13/09/2026) Currículo (PDF/Word/foto) -> e-mail do negócio, resposta pronta, sem IA
+                    if media_result["type"] in ("document", "image") and _cv_email_do_usuario(user):
+                        _resp_cv = _cv_tratar(user, conv, sender_phone, media_result, msg, db_conn)
+                        if _resp_cv:
+                            db_conn.execute(
+                                "INSERT INTO messages (conversation_id,sender,content,msg_type) VALUES (?,?,?,?)",
+                                (conv["id"], "bot", _resp_cv, "text"))
+                            db_conn.execute("UPDATE users SET msgs_used=msgs_used+1 WHERE id=?", (resolved_user_id,))
+                            db_conn.commit()
+                            send_whatsapp_message(user["whatsapp_phone_id"], user["whatsapp_token"], sender_phone, _resp_cv)
                             continue
 
                     ai_input = media_result.get("description", media_result["content"])
@@ -9524,6 +9680,23 @@ REGRAS DE VENDA:
 - Exemplo: "Ótimo! Vou gerar seu PIX agora mesmo, só um instante..."
 - Se o cliente perguntar se aceita cartão/PIX: SIM, aceitamos ambos."""
 
+    # (13/09/2026) currículos: a IA orienta a mandar o arquivo aqui mesmo (o sistema encaminha por e-mail)
+    cv_note = ""
+    if _cv_email_do_usuario(user):
+        try:
+            _canal = db_conn.execute("SELECT channel FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+            _canal = (_canal["channel"] if _canal else "") or "whatsapp"
+        except Exception:
+            _canal = "whatsapp"
+        if _canal == "whatsapp":       # Instagram/Messenger nao recebem arquivo por aqui: sem promessa
+            cv_note = ("\n\n📎 CURRÍCULOS E VAGAS: se a pessoa quiser trabalhar aqui, se candidatar ou enviar currículo, "
+                       "diga que ela pode ENVIAR O ARQUIVO (PDF, Word ou foto) AQUI MESMO nesta conversa, de preferência com a "
+                       "legenda 'currículo' — o sistema encaminha automaticamente para a equipe responsável. Não peça para mandar "
+                       "por e-mail. Não invente vagas abertas: diga que o currículo fica no banco de talentos e que a equipe entra "
+                       "em contato se houver oportunidade. Só diga que um currículo FOI encaminhado se aparecer na conversa a "
+                       "mensagem automática 'Recebi seu currículo e já encaminhei'; se a pessoa disser que já mandou e essa "
+                       "confirmação não apareceu, peça para REENVIAR o arquivo com a legenda 'currículo'.")
+
     system_prompt = f"""{user['ai_system_prompt']}
 
 Tom: {tone_map.get(user['ai_tone'],'Profissional.')}
@@ -9535,7 +9708,7 @@ RESPOSTAS RÁPIDAS DISPONÍVEIS:
 {qr_context or 'Nenhuma.'}
 
 FOTOS DE PRODUTOS DISPONÍVEIS (enviadas automaticamente quando o cliente pedir):
-{gallery_context or 'Nenhuma foto cadastrada.'}{commerce_note}
+{gallery_context or 'Nenhuma foto cadastrada.'}{commerce_note}{cv_note}
 
 REGRAS:
 - Responda de forma breve (máx 3 parágrafos curtos)

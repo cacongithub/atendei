@@ -934,7 +934,10 @@ EINSTEIN_RESERVA_TOOLS = [
                     "com confirmar=true e os MESMOS itens. Se voltar 'precisa_esclarecer', pergunte ao hóspede qual "
                     "das opções ele quer. Se voltar 'numero_nao_cadastrado', explique com gentileza que só o número "
                     "informado no check-in pode pedir pelo WhatsApp e que a recepção pode cadastrar outro número. "
-                    "Comida é cobrada na conta do quarto (paga no check-out).",
+                    "Comida é cobrada na conta do quarto (paga no check-out). IMPORTANTE: chame esta ferramenta "
+                    "SEMPRE que o hóspede pedir algo, mesmo que antes na conversa ela tenha recusado o número — o "
+                    "check-in ou o cadastro do número podem ter sido feitos depois. Nunca responda que o número não "
+                    "está cadastrado sem ter acabado de consultar a ferramenta.",
      "input_schema": {"type": "object", "properties": {
          "itens": {"type": "array", "items": {"type": "object", "properties": {
              "item": {"type": "string", "description": "prato ou item de serviço, como o hóspede pediu"},
@@ -9798,6 +9801,14 @@ REGRAS:
             _ctx_einstein = einstein_contexto(user)
             if _ctx_einstein:
                 system_prompt = system_prompt + "\n\n==== CONHECIMENTO DA POUSADA (Einstein, ao vivo) ====\n" + _ctx_einstein
+            # (24/09/2026) pedido de quarto: a resposta vem SEMPRE da ferramenta, nunca do histórico
+            system_prompt += ("\n\n==== PEDIDOS DE QUARTO ====\nQuando o hóspede pedir comida, bebida ou algo para o quarto "
+                              "(toalha, travesseiro, amenidades), use a ferramenta pedido_quarto nesta mesma resposta — "
+                              "o sistema identifica o hóspede pelo número desta conversa. Não peça nome, quarto ou senha. "
+                              "Se antes a ferramenta recusou o número, consulte de novo: o check-in pode ter sido feito depois. "
+                              "Esta regra SUBSTITUI qualquer instrução anterior (do treino do bot ou do conhecimento da pousada) que "
+                              "diga que pelo WhatsApp só se informa o cardápio, que pedidos são só pelo Echo ou pela recepção, "
+                              "ou que o hóspede precisa se identificar.")
             msgs = list(api_messages)
             for _rodada in range(4):
                 resp = req.post("https://api.anthropic.com/v1/messages",

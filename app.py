@@ -925,10 +925,27 @@ EINSTEIN_RESERVA_TOOLS = [
          "tipo": {"type": "string", "enum": ["casal", "solteiros", "casal_solteiro", "quadruplo"]},
          "pessoas": {"type": "integer"}},
          "required": ["nome", "entrada", "saida", "tipo"]}},
+    {"name": "pedido_quarto",
+     "description": "Pedido de comida (restaurante ou cafeteria) ou de serviço de quarto (toalha, travesseiro, "
+                    "amenidades) para o HÓSPEDE QUE JÁ ESTÁ HOSPEDADO. A identificação do hóspede e do quarto é "
+                    "AUTOMÁTICA pelo número de WhatsApp desta conversa: NUNCA peça nome, número do quarto, CPF ou "
+                    "senha para validar. Fluxo obrigatório: 1) chame com confirmar=false para ver itens, preços e "
+                    "total; 2) mostre o resumo ao hóspede e pergunte se confirma; 3) só depois do 'sim' chame de novo "
+                    "com confirmar=true e os MESMOS itens. Se voltar 'precisa_esclarecer', pergunte ao hóspede qual "
+                    "das opções ele quer. Se voltar 'numero_nao_cadastrado', explique com gentileza que só o número "
+                    "informado no check-in pode pedir pelo WhatsApp e que a recepção pode cadastrar outro número. "
+                    "Comida é cobrada na conta do quarto (paga no check-out).",
+     "input_schema": {"type": "object", "properties": {
+         "itens": {"type": "array", "items": {"type": "object", "properties": {
+             "item": {"type": "string", "description": "prato ou item de serviço, como o hóspede pediu"},
+             "quantidade": {"type": "integer"}}, "required": ["item"]}},
+         "confirmar": {"type": "boolean", "description": "false = só prévia; true = registrar (só após o sim do hóspede)"}},
+         "required": ["itens", "confirmar"]}},
 ]
 
-def einstein_reserva_tool(user, name, inp):
-    """Executa uma tool de reserva chamando a API do Einstein DAQUELE cliente (nunca global)."""
+def einstein_reserva_tool(user, name, inp, telefone=None):
+    """Executa uma tool de reserva chamando a API do Einstein DAQUELE cliente (nunca global).
+    telefone: número de quem conversa, tirado da CONVERSA (só canal whatsapp) — nunca do modelo."""
     import requests as req
     base = (user.get("einstein_url") or "").rstrip("/")
     tok = user.get("einstein_token") or ""
@@ -943,6 +960,18 @@ def einstein_reserva_tool(user, name, inp):
         if name == "criar_reserva":
             return req.post(base + "/api/reserva-externa",
                             json={**inp, "origem": "whatsapp"}, headers=headers, timeout=20).json()
+        if name == "pedido_quarto":
+            # (24/09/2026) o Einstein valida pelo número: só hóspede com hospedagem ativa e número cadastrado
+            if not (telefone or "").replace("+", "").isdigit():
+                return {"ok": False, "erro": "canal_sem_telefone",
+                        "mensagem": "Pedidos de quarto só podem ser feitos pelo WhatsApp do hóspede."}
+            r = req.post(base + "/api/atendente/pedido-quarto",
+                         json={"telefone": telefone, "itens": inp.get("itens") or [],
+                               "confirmar": bool(inp.get("confirmar"))}, headers=headers, timeout=25)
+            if r.status_code == 404:
+                return {"ok": False, "erro": "indisponivel",
+                        "mensagem": "Pedidos pelo WhatsApp ainda não estão ativos na pousada. Oriente o hóspede a pedir pela recepção ou pela Alexa do quarto."}
+            return r.json()
     except Exception as e:
         return {"erro": str(e)}
     return {"erro": "ferramenta desconhecida"}
@@ -9785,9 +9814,15 @@ REGRAS:
                 if result.get("stop_reason") == "tool_use":
                     msgs.append({"role":"assistant","content":result["content"]})
                     tr = []
+                    # (24/09/2026) número de quem conversa, direto da conversa (só WhatsApp) — base da validação do pedido_quarto
+                    try:
+                        _cv = db_conn.execute("SELECT customer_phone, channel FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+                        _tel_conv = (_cv["customer_phone"] if (_cv and (_cv["channel"] or "whatsapp") == "whatsapp") else "") or ""
+                    except Exception:
+                        _tel_conv = ""
                     for b in result["content"]:
                         if b.get("type") == "tool_use":
-                            _tres = einstein_reserva_tool(user, b["name"], b.get("input",{}))
+                            _tres = einstein_reserva_tool(user, b["name"], b.get("input",{}), telefone=_tel_conv)
                             # Reserva criada com sucesso -> envia o CARD DE CHEGADA
                             # (imagem + botões). Falha no card jamais afeta a reserva.
                             if b["name"] == "criar_reserva" and isinstance(_tres, dict) and _tres.get("ok"):
